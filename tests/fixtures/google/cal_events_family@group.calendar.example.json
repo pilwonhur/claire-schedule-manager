@@ -1,0 +1,1 @@
+{"items": [{"id": "f1", "etag": "e1", "status": "confirmed", "summary": "\uac00\uc871 \uc800\ub141", "updated": "2026-09-10T01:00:00.000Z", "start": {"dateTime": "2026-09-11T15:00:00+09:00"}, "end": {"dateTime": "2026-09-11T16:00:00+09:00"}, "organizer": {"email": "spouse@example.com"}, "htmlLink": "https://cal/x"}], "nextSyncToken": "tokF"}

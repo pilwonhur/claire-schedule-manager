@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+.DS_Store
+
+# 데이터는 저장소에 들어가지 않는다 (~/ClaireData). 실험용 디렉터리도 마찬가지.
+ClaireData/
+*.db
+*.db-wal
+*.db-shm
+secrets/

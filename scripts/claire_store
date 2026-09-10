@@ -1,0 +1,766 @@
+#!/usr/bin/env python3
+"""claire_store — 결정론적 저장 (PRD §7, §11).
+
+  propose --run ID --file proposals.json   제안 JSON 검증·반영 (create / ignore / update / complete / cancel / relate)
+  update   --item CLR --set k=v ... --reason   교수님 지시로 필드 변경
+  complete --item CLR | --find "문구"  --evidence user_report|tasks_checked|criteria_evidence:<id> [--note]
+  reopen | cancel | hold --item CLR --reason
+  wait     --item CLR --waiting-on "김 교수" [--next-check YYYY-MM-DD]   (기본 +3영업일, D6)
+  progress --item CLR --note "절반 했어" [--next-action ...]
+  answer   --question Q-0007 --answer "..." [--resolve '{"start_at": "..."}']   | --auto (열린 질문 1건일 때만)
+  relate --from CLR --to CLR --type prep_for|subtask_of|blocks|follow_up_of|related|same_thread
+  link   --item CLR --system calendar|obsidian_task|obsidian_note|ledger --key ...
+  merge  --into CLR --from CLR --reason     |  split --item CLR --title ... --kind ...
+  redact --source-event ID --confirm
+  undo   --action-id ID
+  maintain [--run ID]                       질문 생애 정리 (withdrawn/expired)
+
+규칙 (§7.1): 모든 제안은 source_event_ids 가 있고 그 이벤트는 triage='new' 여야 한다. 아니면 전체 거부.
+한 트랜잭션. 반환 전에 Claire 는 번호를 말하지 않는다. 삭제 명령은 없다 (§7.5).
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import sys
+from datetime import datetime
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from claire_core import (  # noqa: E402
+    ClaireError, ITEM_KINDS, OWNERS, PRIORITIES, OPEN_STATUSES, connect, get_item, get_question, get_run,
+    hits, log_activity, next_item_ref, next_question_ref, now_dt, now_iso, reindex_item, run_cli, tokenize,
+    tx, tz_of,
+)
+import claire_ops as ops  # noqa: E402
+
+ALLOWED_OPS = {"create", "ignore", "update", "complete", "cancel", "relate"}
+CREATE_FIELDS = {"kind", "title", "project", "priority", "owner", "next_action", "done_criteria",
+                 "start_at", "end_at", "all_day", "due_at", "scheduled_on", "tentative", "confidence",
+                 "waiting_on", "next_check_at", "canonical_note", "ledger_note", "series_key", "occurrence_at"}
+ISO_DT = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2})?([+-]\d{2}:\d{2}|Z)$")
+ISO_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+DEFAULT_CRITERIA = {"deadline": "제출·발송 완료", "reply": "회신 발송", "prep": "자료 준비 완료",
+                    "waiting": "상대 회신 수신", "task": None, "meeting": None}
+
+
+def _bad(msg, **extra):
+    raise ClaireError("proposal_rejected", msg, **extra)
+
+
+def _norm_dt(value, field: str, cfg, end_of_day: bool):
+    """날짜만이면 T23:59:59(+오프셋) 또는 T00:00:00. 오프셋 없는 시각은 거부."""
+    if value in (None, ""):
+        return None
+    if not isinstance(value, str):
+        _bad(f"{field} 는 문자열이어야 합니다", value=value)
+    if ISO_DATE.match(value):
+        off = datetime.now(tz_of(cfg)).strftime("%z")
+        off = off[:3] + ":" + off[3:]
+        return f"{value}T23:59:59{off}" if end_of_day else f"{value}T00:00:00{off}"
+    if ISO_DT.match(value):
+        try:
+            dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            _bad(f"{field} 시각이 잘못되었습니다", value=value)
+        return dt.replace(microsecond=0).isoformat()
+    _bad(f"{field} 는 ISO8601(오프셋 포함) 또는 YYYY-MM-DD 여야 합니다", value=value)
+
+
+def _validate_create(p: dict, idx: int, cfg, evs=None) -> dict:
+    kind = p.get("kind")
+    if kind not in ITEM_KINDS:
+        _bad(f"제안 {idx}: kind 가 잘못되었습니다", kind=kind, allowed=ITEM_KINDS)
+    title = (p.get("title") or "").strip()
+    if not title:
+        _bad(f"제안 {idx}: title 이 비어 있습니다")
+    unknown = list(p.get("unknown_fields") or [])
+    questions = list(p.get("questions") or [])
+    conf = p.get("confidence")
+    if conf is not None and not (isinstance(conf, (int, float)) and 0.0 <= conf <= 1.0):
+        _bad(f"제안 {idx}: confidence 는 0.0~1.0", confidence=conf)
+    evidence = p.get("evidence") or []
+    if not isinstance(evidence, list) or not evidence:
+        _bad(f"제안 {idx}: evidence(근거 문장 목록)가 필요합니다")
+    fields = {
+        "kind": kind, "title": title, "project": p.get("project"),
+        "priority": p.get("priority") or "normal", "owner": p.get("owner") or "user",
+        "next_action": p.get("next_action"), "done_criteria": p.get("done_criteria") or DEFAULT_CRITERIA[kind],
+        "start_at": _norm_dt(p.get("start_at"), "start_at", cfg, False),
+        "end_at": _norm_dt(p.get("end_at"), "end_at", cfg, False),
+        "all_day": 1 if p.get("all_day") else 0,
+        "due_at": _norm_dt(p.get("due_at"), "due_at", cfg, True),
+        "scheduled_on": p.get("scheduled_on"),
+        "tentative": 1 if p.get("tentative", True) else 0,
+        "confidence": conf, "waiting_on": p.get("waiting_on"),
+        "next_check_at": _norm_dt(p.get("next_check_at"), "next_check_at", cfg, True),
+        "canonical_note": p.get("canonical_note"), "ledger_note": p.get("ledger_note"),
+        "series_key": p.get("series_key"), "occurrence_at": p.get("occurrence_at"),
+    }
+    # Calendar 원문이면 이벤트 값이 원본이다(§5.1). 제안에 없으면 이벤트에서 채운다.
+    cal_evs = [e for e in (evs or []) if e["platform"] == "calendar"]
+    if cal_evs:
+        h = json.loads(cal_evs[0]["headers"] or "{}")
+        if not fields["start_at"] and h.get("start"):
+            fields["start_at"] = _norm_dt(h["start"], "start_at", cfg, False)
+            fields["end_at"] = _norm_dt(h.get("end"), "end_at", cfg, False) if h.get("end") else fields["end_at"]
+            fields["all_day"] = 1 if h.get("all_day") else 0
+        if p.get("tentative") is None:
+            fields["tentative"] = 0
+    if fields["priority"] not in PRIORITIES:
+        _bad(f"제안 {idx}: priority 가 잘못되었습니다", priority=fields["priority"])
+    if fields["owner"] not in OWNERS:
+        _bad(f"제안 {idx}: owner 가 잘못되었습니다", owner=fields["owner"])
+    if fields["scheduled_on"] and not ISO_DATE.match(str(fields["scheduled_on"])):
+        _bad(f"제안 {idx}: scheduled_on 은 YYYY-MM-DD", value=fields["scheduled_on"])
+    extra = set(p) - CREATE_FIELDS - {"op", "source_event_ids", "evidence", "unknown_fields", "questions",
+                                      "relations", "link", "note", "series"}
+    if extra:
+        _bad(f"제안 {idx}: 알 수 없는 필드", fields=sorted(extra))
+
+    # §5.4 kind 별 필수 필드 (unknown_fields 에 있으면 질문으로 넘긴다)
+    def need(*names):
+        if not any(fields.get(n) for n in names) and not any(n in unknown for n in names):
+            _bad(f"제안 {idx}: {kind} 에는 {' 또는 '.join(names)} 가 필요합니다. "
+                 f"모르면 unknown_fields 에 넣고 질문을 붙이세요")
+    if kind == "meeting":
+        need("start_at")
+    elif kind == "deadline":
+        need("due_at")
+    elif kind == "reply":
+        need("due_at", "next_check_at")
+    elif kind == "prep":
+        need("due_at")
+    elif kind == "waiting":
+        need("waiting_on"); need("next_check_at")
+
+    # unknown_fields 는 질문과 짝을 이룬다
+    q_fields = {q.get("field") for q in questions}
+    for u in unknown:
+        if u not in q_fields:
+            _bad(f"제안 {idx}: unknown_fields '{u}' 에 대한 질문이 없습니다")
+        if fields.get(u):
+            _bad(f"제안 {idx}: '{u}' 를 모른다면서 값을 넣었습니다. 추측값을 넣지 마세요", value=fields.get(u))
+    for q in questions:
+        if not (q.get("question") or "").strip():
+            _bad(f"제안 {idx}: 질문 문장이 비어 있습니다")
+    return {"fields": fields, "unknown": unknown, "questions": questions, "evidence": evidence,
+            "relations": p.get("relations") or [], "note": p.get("note")}
+
+
+def _load_events(conn, ids, idx):
+    if not isinstance(ids, list) or not ids:
+        _bad(f"제안 {idx}: source_event_ids 가 비어 있습니다")
+    out = []
+    for sid in ids:
+        row = conn.execute("SELECT * FROM source_event WHERE id=?", (sid,)).fetchone()
+        if row is None:
+            _bad(f"제안 {idx}: source_event {sid} 가 없습니다")
+        if row["triage"] != "new":
+            _bad(f"제안 {idx}: source_event {sid} 는 이미 {row['triage']} 상태입니다 (부분 저장 없음)",
+                 source_event_id=sid)
+        out.append(row)
+    return out
+
+
+def _link_key_for(ev) -> tuple[str, str] | None:
+    if ev["platform"] == "calendar":
+        return "calendar", f"{ev['account']}:{ev['external_id']}"
+    if ev["platform"] == "obsidian":
+        return "obsidian_task", ev["external_id"]
+    return None
+
+
+def cmd_propose(args, cfg):
+    conn = connect(create=False)
+    now_s = now_iso(cfg)
+    payload = json.loads(Path(args.file).read_text(encoding="utf-8")) if args.file else json.load(sys.stdin)
+    run_id = args.run if args.run is not None else payload.get("run_id")
+    if run_id is not None:
+        get_run(conn, run_id)
+    proposals = payload.get("proposals")
+    if not isinstance(proposals, list) or not proposals:
+        _bad("proposals 배열이 비어 있습니다")
+
+    # 1차: 전체 검증 (DB 무변경)
+    plans = []
+    seen_events: dict[int, int] = {}
+    link_keys: dict[tuple, int] = {}
+    for idx, p in enumerate(proposals, 1):
+        op = p.get("op")
+        if op not in ALLOWED_OPS:
+            _bad(f"제안 {idx}: op '{op}' 는 이 단계에서 허용되지 않습니다", allowed=sorted(ALLOWED_OPS))
+        if op == "relate":
+            a, b = get_item(conn, p.get("from") or ""), get_item(conn, p.get("to") or "")
+            if p.get("type") not in ops.REL_TYPES:
+                _bad(f"제안 {idx}: relate type 이 잘못되었습니다", allowed=ops.REL_TYPES)
+            plans.append({"op": "relate", "from": a, "to": b, "type": p["type"]})
+            continue
+        evs = _load_events(conn, p.get("source_event_ids"), idx)
+        if op in ("update", "complete", "cancel"):
+            item = get_item(conn, p.get("item_ref") or "")
+            if not (p.get("evidence") or []):
+                _bad(f"제안 {idx}: {op} 에는 evidence(근거 문장)가 필요합니다")
+            # 스레드·시리즈 일치 검증 (§7.1 3)
+            same = conn.execute(
+                "SELECT 1 FROM item_source s JOIN source_event e ON e.id=s.source_event_id "
+                "WHERE s.item_id=? AND ((e.platform='gmail' AND e.thread_id IS NOT NULL AND e.thread_id IN (%s)) "
+                "OR (e.platform='calendar' AND e.thread_id IS NOT NULL AND e.thread_id IN (%s)) "
+                "OR e.id IN (%s))" % (",".join("?" * len(evs)), ",".join("?" * len(evs)), ",".join("?" * len(evs))),
+                (item["id"], *[e["thread_id"] for e in evs], *[e["thread_id"] for e in evs], *[e["id"] for e in evs])
+            ).fetchone()
+            linked = any(_link_key_for(e) and conn.execute(
+                "SELECT 1 FROM link WHERE item_id=? AND system=? AND external_key=?", (item["id"], *_link_key_for(e))).fetchone()
+                for e in evs)
+            if not same and not linked and not args.force_cross_thread:
+                _bad(f"제안 {idx}: {item['ref']} 는 이 원문과 같은 스레드·시리즈가 아닙니다. "
+                     f"정말 같은 업무면 --force-cross-thread 와 reason 이 필요합니다", item_ref=item["ref"])
+            if op == "update":
+                changes = p.get("changes") or {}
+                if not isinstance(changes, dict) or not changes:
+                    _bad(f"제안 {idx}: update 에는 changes 가 필요합니다")
+                for k, v in changes.items():
+                    ops.norm_value(k, v, cfg)    # 형식만 미리 검증
+                plans.append({"op": "update", "item": item, "events": evs, "changes": changes,
+                              "reason": p.get("reason") or "원문 변경 반영", "evidence": p["evidence"]})
+            elif op == "complete":
+                ev_code = p.get("evidence_code") or f"criteria_evidence:{evs[0]['id']}"
+                from claire_core import validate_evidence
+                validate_evidence(ev_code)
+                plans.append({"op": "complete", "item": item, "events": evs, "evidence_code": ev_code,
+                              "reason": p.get("reason") or "완료 근거 발견", "evidence": p["evidence"]})
+            else:
+                plans.append({"op": "cancel", "item": item, "events": evs,
+                              "reason": p.get("reason") or "취소 원문", "evidence": p["evidence"]})
+            for ev in evs:
+                seen_events.setdefault(ev["id"], idx)
+            continue
+        if op == "ignore":
+            if not (p.get("reason") or "").strip():
+                _bad(f"제안 {idx}: ignore 에는 reason 이 필요합니다")
+            for ev in evs:
+                if ev["id"] in seen_events:
+                    _bad(f"제안 {idx}: source_event {ev['id']} 가 다른 제안({seen_events[ev['id']]})에서 이미 처리됩니다")
+                seen_events[ev["id"]] = idx
+            plans.append({"op": "ignore", "events": evs, "reason": p["reason"].strip(), "note": p.get("note")})
+            continue
+        v = _validate_create(p, idx, cfg, evs)
+        v["series"] = bool(p.get("series"))
+        if v["series"]:
+            if any(e["platform"] != "calendar" or not e["thread_id"] for e in evs):
+                _bad(f"제안 {idx}: series:true 는 같은 반복 시리즈의 calendar 원문에만 쓸 수 있습니다")
+            if len({e["thread_id"] for e in evs}) != 1:
+                _bad(f"제안 {idx}: series:true 의 원문들이 서로 다른 시리즈입니다")
+            if v["unknown"]:
+                _bad(f"제안 {idx}: 시리즈 확장에는 unknown_fields 를 쓸 수 없습니다")
+        elif len([e for e in evs if e["platform"] == "calendar"]) > 1:
+            _bad(f"제안 {idx}: calendar 원문 여러 개로 항목 하나를 만들 수 없습니다. 반복이면 series:true 를 쓰세요")
+        for ev in evs:
+            key = _link_key_for(ev)
+            if key:
+                if key in link_keys:
+                    _bad(f"제안 {idx}: 같은 {ev['platform']} 원문으로 항목을 두 개 만들 수 없습니다 "
+                         f"(제안 {link_keys[key]} 와 중복)")
+                link_keys[key] = idx
+                dup = conn.execute("SELECT i.ref FROM link l JOIN item i ON i.id=l.item_id WHERE l.system=? AND l.external_key=?",
+                                   key).fetchone()
+                if dup:
+                    _bad(f"제안 {idx}: 이 {ev['platform']} 원문은 이미 {dup['ref']} 에 연결되어 있습니다. "
+                         f"새 항목을 만들지 않습니다", existing=dup["ref"])
+        plans.append({"op": "create", "events": evs, **v})
+
+    # 2차: 한 트랜잭션으로 반영
+    created, questions, ignored, captured = [], [], [], []
+    updated, completed, cancelled, related = [], [], [], []
+    min_conf = float(cfg["min_confidence"])
+    with tx(conn):
+        for plan in plans:
+            if plan["op"] == "relate":
+                ok = ops.add_relation(conn, plan["from"]["id"], plan["to"]["id"], plan["type"], "claire", now_s)
+                log_activity(conn, item_id=plan["from"]["id"], action="link", actor="claire", ts=now_s, field="relation",
+                             new_value=f"{plan['type']}:{plan['to']['ref']}", run_id=run_id)
+                related.append({"from": plan["from"]["ref"], "to": plan["to"]["ref"], "type": plan["type"], "new": ok})
+                continue
+            if plan["op"] in ("update", "complete", "cancel"):
+                item = conn.execute("SELECT * FROM item WHERE id=?", (plan["item"]["id"],)).fetchone()
+                sid = plan["events"][0]["id"]
+                if plan["op"] == "update":
+                    applied = ops.apply_update(conn, cfg, item, plan["changes"], actor="claire", ts=now_s,
+                                               reason=plan["reason"], evidence_sid=sid, run_id=run_id)
+                    updated.append({"ref": item["ref"], "changes": applied, "reason": plan["reason"]})
+                elif plan["op"] == "complete":
+                    r = ops.complete_item(conn, cfg, item, plan["evidence_code"], actor="claire", ts=now_s,
+                                          note=plan["reason"], run_id=run_id)
+                    completed.append(r)
+                else:
+                    r = ops.set_status(conn, cfg, item, "cancelled", actor="claire", ts=now_s, reason=plan["reason"],
+                                       action="cancel", evidence_sid=sid, run_id=run_id)
+                    cancelled.append({"ref": item["ref"], **r})
+                for ev in plan["events"]:
+                    conn.execute("UPDATE source_event SET triage='proposed' WHERE id=?", (ev["id"],))
+                continue
+            if plan["op"] == "ignore":
+                for ev in plan["events"]:
+                    conn.execute("UPDATE source_event SET triage='ignored', ignore_reason=? WHERE id=?",
+                                 (plan["reason"], ev["id"]))
+                ignored.append({"source_event_ids": [e["id"] for e in plan["events"]], "reason": plan["reason"]})
+                continue
+            if plan.get("series"):
+                refs = _create_series(conn, cfg, plan, now_s, run_id, min_conf)
+                created.append({"series": plan["events"][0]["thread_id"], "title": plan["fields"]["title"],
+                                "kind": plan["fields"]["kind"], "occurrences": len(refs), "refs": refs,
+                                "first_ref": refs[0], "last_ref": refs[-1],
+                                "source_event_ids": [e["id"] for e in plan["events"]]})
+                continue
+            f = plan["fields"]
+            conf = f["confidence"]
+            if conf is not None and conf < min_conf:
+                status = "captured"
+            elif plan["unknown"]:
+                status = "needs_info"
+            else:
+                status = "todo"
+            ref = next_item_ref(conn, cfg)
+            cols = list(f.keys()) + ["ref", "status", "created_at", "updated_at"]
+            vals = list(f.values()) + [ref, status, now_s, now_s]
+            iid = conn.execute(f"INSERT INTO item({','.join(cols)}) VALUES({','.join('?' * len(cols))})", vals).lastrowid
+            for ev in plan["events"]:
+                conn.execute("INSERT OR IGNORE INTO item_source(item_id,source_event_id,role) VALUES(?,?,'origin')",
+                             (iid, ev["id"]))
+                conn.execute("UPDATE source_event SET triage='proposed' WHERE id=?", (ev["id"],))
+                key = _link_key_for(ev)
+                if key:
+                    conn.execute("INSERT INTO link(item_id,system,external_key,version,last_seen_at,last_synced_at,sync_status) "
+                                 "VALUES(?,?,?,?,?,?,'ok')", (iid, key[0], key[1], ev["version"], now_s, now_s))
+            log_activity(conn, item_id=iid, action="create", actor="claire", ts=now_s, field="status",
+                         new_value=status, reason=plan.get("note") or "제안 반영",
+                         evidence_source_event_id=plan["events"][0]["id"], run_id=run_id,
+                         payload={"evidence": plan["evidence"], "confidence": conf, "unknown_fields": plan["unknown"]})
+            q_refs = []
+            if status == "needs_info":
+                for q in plan["questions"]:
+                    qref = next_question_ref(conn, cfg)
+                    conn.execute(
+                        "INSERT INTO question(ref,item_id,field,question,options,reason,status,created_at) "
+                        "VALUES(?,?,?,?,?,?,'open',?)",
+                        (qref, iid, q.get("field"), q["question"].strip(),
+                         json.dumps(q.get("options"), ensure_ascii=False) if q.get("options") else None,
+                         q.get("reason"), now_s))
+                    log_activity(conn, item_id=iid, action="question", actor="claire", ts=now_s, field=q.get("field"),
+                                 new_value=qref, reason=q.get("reason"), run_id=run_id)
+                    q_refs.append(qref)
+                    questions.append({"ref": qref, "item_ref": ref, "field": q.get("field"),
+                                      "question": q["question"].strip(), "options": q.get("options")})
+            reindex_item(conn, iid)
+            new_item = conn.execute("SELECT * FROM item WHERE id=?", (iid,)).fetchone()
+            planned = ops.plan_external(conn, cfg, new_item, now_s)
+            entry = {"ref": ref, "title": f["title"], "kind": f["kind"], "status": status,
+                     "due_at": f["due_at"], "start_at": f["start_at"], "confidence": conf, "questions": q_refs,
+                     "source_event_ids": [e["id"] for e in plan["events"]], "planned": planned}
+            (captured if status == "captured" else created).append(entry)
+
+    summary = {"created": sum(c.get("occurrences", 1) for c in created), "series": sum(1 for c in created if "series" in c),
+               "captured": len(captured), "questions": len(questions),
+               "ignored_events": sum(len(i["source_event_ids"]) for i in ignored),
+               "updated": len(updated), "completed": len(completed), "cancelled": len(cancelled), "related": len(related)}
+    return {"run_id": run_id, "created": created, "captured": captured, "questions": questions, "ignored": ignored,
+            "updated": updated, "completed": completed, "cancelled": cancelled, "related": related,
+            "summary": summary,
+            "message": f"항목 {summary['created']}건 생성, 변경 {summary['updated']}건, 완료 {summary['completed']}건, "
+                       f"취소 {summary['cancelled']}건, 참고 {summary['captured']}건, 질문 {summary['questions']}건, "
+                       f"제외 {summary['ignored_events']}건. 이제 번호를 말해도 됩니다."}
+
+
+def _create_series(conn, cfg, plan, now_s, run_id, min_conf) -> list[str]:
+    """반복 시리즈: 회차마다 독립 항목 (§5.3, §9). 시각·제목은 회차 이벤트 값, 나머지는 제안 값."""
+    base = plan["fields"]
+    conf = base["confidence"]
+    status = "captured" if (conf is not None and conf < min_conf) else "todo"
+    refs = []
+    for ev in sorted(plan["events"], key=lambda e: json.loads(e["headers"] or "{}").get("start") or ""):
+        h = json.loads(ev["headers"] or "{}")
+        f = dict(base)
+        f["start_at"] = _norm_dt(h.get("start"), "start_at", cfg, False) if h.get("start") else None
+        f["end_at"] = _norm_dt(h.get("end"), "end_at", cfg, False) if h.get("end") else None
+        f["all_day"] = 1 if h.get("all_day") else 0
+        f["series_key"] = ev["thread_id"]
+        f["occurrence_at"] = f["start_at"]
+        f["tentative"] = 0
+        if not f["start_at"]:
+            _bad(f"시리즈 회차 source_event {ev['id']} 에 시작 시각이 없습니다")
+        ref = next_item_ref(conn, cfg)
+        cols = list(f.keys()) + ["ref", "status", "created_at", "updated_at"]
+        vals = list(f.values()) + [ref, status, now_s, now_s]
+        iid = conn.execute(f"INSERT INTO item({','.join(cols)}) VALUES({','.join('?' * len(cols))})", vals).lastrowid
+        conn.execute("INSERT OR IGNORE INTO item_source(item_id,source_event_id,role) VALUES(?,?,'origin')", (iid, ev["id"]))
+        conn.execute("UPDATE source_event SET triage='proposed' WHERE id=?", (ev["id"],))
+        key = _link_key_for(ev)
+        conn.execute("INSERT INTO link(item_id,system,external_key,version,last_seen_at,last_synced_at,sync_status) "
+                     "VALUES(?,?,?,?,?,?,'ok')", (iid, key[0], key[1], ev["version"], now_s, now_s))
+        log_activity(conn, item_id=iid, action="create", actor="claire", ts=now_s, field="status", new_value=status,
+                     reason=plan.get("note") or f"반복 시리즈 회차 ({ev['thread_id']})",
+                     evidence_source_event_id=ev["id"], run_id=run_id,
+                     payload={"evidence": plan["evidence"], "confidence": conf, "series": True})
+        reindex_item(conn, iid)
+        refs.append(ref)
+    return refs
+
+
+# --------------------------------------------------------------------------
+# 개별 명령 (교수님 지시·답변·완료) — §7.3, §7.4
+# --------------------------------------------------------------------------
+
+def _kv(pairs: list[str]) -> dict:
+    out = {}
+    for kv in pairs or []:
+        if "=" not in kv:
+            _bad(f"--set 은 key=value 형식이어야 합니다: {kv}")
+        k, v = kv.split("=", 1)
+        out[k.strip()] = v
+    return out
+
+
+def _item_by_ref_or_find(conn, cfg, ref: str | None, find: str | None, open_only=True):
+    """번호가 있으면 그 항목. --find 면 열린 항목 중 후보를 찾아 1건일 때만 돌려준다 (TC8)."""
+    if ref:
+        return get_item(conn, ref)
+    if not find:
+        _bad("--item 또는 --find 가 필요합니다")
+    toks = tokenize(find)
+    cands = []
+    sql = "SELECT * FROM item WHERE deleted_at IS NULL" + (" AND status IN (%s)" % ",".join(f"'{x}'" for x in OPEN_STATUSES) if open_only else "")
+    for r in conn.execute(sql + " ORDER BY id DESC"):
+        hay = " ".join(x for x in (r["title"], r["project"], r["next_action"]) if x)
+        n = sum(1 for t in toks if hits(t, hay))
+        if toks and n == len(toks):
+            cands.append(r)
+    if len(cands) == 1:
+        return cands[0]
+    if not cands:
+        raise ClaireError("no_candidate", f"'{find}' 에 맞는 열린 항목이 없습니다. 새 항목으로 만들지 물어보세요", candidates=[])
+    raise ClaireError("ambiguous_item", f"'{find}' 후보가 {len(cands)}건입니다. 어느 것인지 확인하세요",
+                      candidates=[{"ref": c["ref"], "title": c["title"], "status": c["status"], "due_at": c["due_at"]} for c in cands[:5]])
+
+
+def cmd_update(args, cfg):
+    conn = connect(create=False); now_s = now_iso(cfg)
+    with tx(conn):
+        item = get_item(conn, args.item)
+        applied = ops.apply_update(conn, cfg, item, _kv(args.set), actor=args.actor, ts=now_s, reason=args.reason,
+                                   run_id=args.run)
+    deferred = [c for c in applied if c.get("deferred")]
+    msg = "변경했습니다." if applied else "바뀐 값이 없습니다."
+    if deferred:
+        msg += " 캘린더가 원본인 시각 필드는 Calendar 반영 후 동기화로 돌아옵니다 (claire_apply 대기)."
+    with tx(conn):
+        item = get_item(conn, args.item)
+        planned = ops.plan_external(conn, cfg, item, now_s, directed=True)
+    return {"ref": item["ref"], "changes": applied, "planned": planned, "message": msg}
+
+
+def cmd_complete(args, cfg):
+    conn = connect(create=False); now_s = now_iso(cfg)
+    with tx(conn):
+        item = _item_by_ref_or_find(conn, cfg, args.item, args.find)
+        r = ops.complete_item(conn, cfg, item, args.evidence, actor=args.actor, ts=now_s, note=args.note,
+                              completed_at=args.completed_at, run_id=args.run)
+    r["message"] = f"{r['ref']} 완료 처리했습니다." + (f" 질문 {', '.join(r['questions_withdrawn'])} 닫음." if r.get("questions_withdrawn") else "")
+    return r
+
+
+def _status_cmd(args, cfg, target: str, action: str, extra=None):
+    conn = connect(create=False); now_s = now_iso(cfg)
+    with tx(conn):
+        item = get_item(conn, args.item)
+        r = ops.set_status(conn, cfg, item, target, actor=args.actor, ts=now_s, reason=args.reason, action=action,
+                           run_id=args.run, extra_fields=extra(conn, item, now_s) if extra else None)
+    return {"ref": item["ref"], **r}
+
+
+def cmd_reopen(args, cfg):
+    return _status_cmd(args, cfg, "todo", "reopen")
+
+
+def cmd_cancel(args, cfg):
+    if not (args.reason or "").strip():
+        _bad("cancel 에는 --reason 이 필요합니다")
+    return _status_cmd(args, cfg, "cancelled", "cancel")
+
+
+def cmd_hold(args, cfg):
+    return _status_cmd(args, cfg, "on_hold", "hold",
+                       extra=lambda conn, item, ts: {"blocked_reason": args.reason})
+
+
+def cmd_wait(args, cfg):
+    if not (args.waiting_on or "").strip():
+        _bad("wait 에는 --waiting-on 이 필요합니다")
+
+    def extra(conn, item, ts):
+        if args.next_check:
+            nxt = ops.norm_value("next_check_at", args.next_check, cfg)
+        else:
+            nxt = ops.business_days_after(now_dt(cfg), int(cfg["followup"]["waiting_business_days"])) \
+                .replace(hour=int(cfg["run"]["daily_hour"]), minute=0, second=0).isoformat()
+        return {"waiting_on": args.waiting_on.strip(), "next_check_at": nxt}
+    return _status_cmd(args, cfg, "waiting", "wait", extra=extra)
+
+
+def cmd_resume(args, cfg):
+    """waiting / on_hold → todo (상대 답이 왔거나 보류 해제)."""
+    conn = connect(create=False); now_s = now_iso(cfg)
+    with tx(conn):
+        item = get_item(conn, args.item)
+        if item["status"] not in ("waiting", "on_hold"):
+            _bad(f"{item['ref']} 는 {item['status']} 상태라 재개할 것이 없습니다")
+        r = ops.set_status(conn, cfg, item, "todo", actor=args.actor, ts=now_s, reason=args.reason or "대기 해제",
+                           action="status", run_id=args.run,
+                           extra_fields={"waiting_on": None, "next_check_at": None, "blocked_reason": None})
+    return {"ref": item["ref"], **r, "message": f"{item['ref']} 를 다시 할 일로 돌렸습니다."}
+
+
+def cmd_ignore_sender(args, cfg):
+    """교수님 지시로 발신자·도메인을 사전 필터 제외 목록에 추가한다 (config.json 갱신, 비밀값 없음)."""
+    from claire_core import data_dir, atomic_write_text
+    path = data_dir() / "config.json"
+    user = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    g = user.setdefault("gmail", {})
+    key = "ignore_domains" if args.domain else "ignore_senders"
+    value = (args.domain or args.address).strip().lower()
+    lst = g.setdefault(key, list(cfg["gmail"].get(key, [])))
+    added = value not in lst
+    if added:
+        lst.append(value)
+        atomic_write_text(path, json.dumps(user, ensure_ascii=False, indent=2) + "\n")
+    return {"key": key, "value": value, "added": added, "list": lst,
+            "message": f"{value} 를 {key} 에 추가했습니다. 다음 수집부터 제외됩니다." if added else f"{value} 는 이미 제외 목록에 있습니다."}
+
+
+def cmd_progress(args, cfg):
+    conn = connect(create=False); now_s = now_iso(cfg)
+    with tx(conn):
+        item = get_item(conn, args.item)
+        r = {"changed": False}
+        if item["status"] in ("captured", "needs_info", "todo", "waiting", "on_hold"):
+            r = ops.set_status(conn, cfg, item, "in_progress", actor=args.actor, ts=now_s, reason=args.note,
+                               action="progress", run_id=args.run)
+            item = get_item(conn, args.item)
+        changes = {}
+        if args.next_action:
+            changes["next_action"] = args.next_action
+        applied = ops.apply_update(conn, cfg, item, changes, actor=args.actor, ts=now_s, reason=args.note,
+                                   run_id=args.run) if changes else []
+        log_activity(conn, item_id=item["id"], action="note", actor=args.actor, ts=now_s, field="progress",
+                     new_value=args.note, reason="진행 보고", run_id=args.run)
+    return {"ref": item["ref"], **r, "changes": applied, "message": "진행 상황을 기록했습니다. 완료로 바꾸지 않았습니다."}
+
+
+def cmd_answer(args, cfg):
+    conn = connect(create=False); now_s = now_iso(cfg)
+    resolve = None
+    if args.resolve:
+        try:
+            resolve = json.loads(args.resolve)
+        except json.JSONDecodeError:
+            _bad("--resolve 는 JSON 객체여야 합니다")
+        if not isinstance(resolve, dict):
+            _bad("--resolve 는 JSON 객체여야 합니다")
+    with tx(conn):
+        if args.question:
+            q = get_question(conn, args.question)
+        else:
+            open_qs = conn.execute("SELECT q.*, i.ref AS item_ref FROM question q LEFT JOIN item i ON i.id=q.item_id "
+                                   "WHERE q.status='open' ORDER BY q.id").fetchall()
+            if len(open_qs) != 1:
+                raise ClaireError("ambiguous_question",
+                                  f"열린 질문이 {len(open_qs)}건이라 자동 매칭하지 않습니다. 어느 질문인지 되물으세요 (TC7)",
+                                  candidates=[{"ref": x["ref"], "item_ref": x["item_ref"], "question": x["question"]} for x in open_qs])
+            q = open_qs[0]
+        r = ops.answer_question(conn, cfg, q, args.answer, resolve, actor=args.actor, ts=now_s, run_id=args.run)
+    r["message"] = f"{r['question']} 답변을 반영했습니다." + (f" {r['item_ref']} → {r['transition']['status']}." if r.get("transition") and r["transition"].get("changed") else "")
+    return r
+
+
+def cmd_relate(args, cfg):
+    conn = connect(create=False); now_s = now_iso(cfg)
+    with tx(conn):
+        a, b = get_item(conn, getattr(args, "from_ref")), get_item(conn, args.to)
+        new = ops.add_relation(conn, a["id"], b["id"], args.type, args.actor if args.actor in ("user", "claire") else "user", now_s)
+        log_activity(conn, item_id=a["id"], action="link", actor=args.actor, ts=now_s, field="relation",
+                     new_value=f"{args.type}:{b['ref']}", run_id=args.run)
+    return {"from": a["ref"], "to": b["ref"], "type": args.type, "new": new}
+
+
+def cmd_link(args, cfg):
+    conn = connect(create=False); now_s = now_iso(cfg)
+    with tx(conn):
+        item = get_item(conn, args.item)
+        new = ops.add_link(conn, item["id"], args.system, args.key, now_s)
+        log_activity(conn, item_id=item["id"], action="link", actor=args.actor, ts=now_s, field=args.system,
+                     new_value=args.key, run_id=args.run)
+    return {"ref": item["ref"], "system": args.system, "key": args.key, "new": new}
+
+
+def cmd_merge(args, cfg):
+    """--from 항목의 출처·질문·관계·연결을 --into 로 옮기고 --from 은 cancelled(merged) 로 둔다."""
+    conn = connect(create=False); now_s = now_iso(cfg)
+    with tx(conn):
+        into, frm = get_item(conn, args.into), get_item(conn, getattr(args, "from_ref"))
+        if into["id"] == frm["id"]:
+            _bad("같은 항목입니다")
+        moved = {"sources": 0, "questions": 0, "links": 0, "relations": 0}
+        for r in conn.execute("SELECT source_event_id, role FROM item_source WHERE item_id=?", (frm["id"],)).fetchall():
+            conn.execute("INSERT OR IGNORE INTO item_source(item_id,source_event_id,role) VALUES(?,?,?)",
+                         (into["id"], r["source_event_id"], r["role"]))
+            moved["sources"] += 1
+        moved["questions"] = conn.execute("UPDATE question SET item_id=? WHERE item_id=? AND status='open'",
+                                          (into["id"], frm["id"])).rowcount
+        for l in conn.execute("SELECT * FROM link WHERE item_id=?", (frm["id"],)).fetchall():
+            if conn.execute("SELECT 1 FROM link WHERE item_id=? AND system=? AND external_key=?",
+                            (into["id"], l["system"], l["external_key"])).fetchone() is None:
+                conn.execute("UPDATE link SET item_id=? WHERE id=?", (into["id"], l["id"]))
+                moved["links"] += 1
+        for r in conn.execute("SELECT * FROM relation WHERE from_item_id=? OR to_item_id=?", (frm["id"], frm["id"])).fetchall():
+            a = into["id"] if r["from_item_id"] == frm["id"] else r["from_item_id"]
+            b = into["id"] if r["to_item_id"] == frm["id"] else r["to_item_id"]
+            if a != b:
+                conn.execute("INSERT OR IGNORE INTO relation(from_item_id,to_item_id,rel_type,created_by,created_at) "
+                             "VALUES(?,?,?,?,?)", (a, b, r["rel_type"], r["created_by"], now_s))
+                moved["relations"] += 1
+            conn.execute("DELETE FROM relation WHERE id=?", (r["id"],))
+        if frm["status"] not in ("done", "cancelled"):
+            ops.set_status(conn, cfg, frm, "cancelled", actor=args.actor, ts=now_s,
+                           reason=f"{into['ref']} 로 통합: {args.reason or ''}", action="merge", run_id=args.run)
+        log_activity(conn, item_id=into["id"], action="merge", actor=args.actor, ts=now_s, field="merged_from",
+                     new_value=frm["ref"], reason=args.reason, run_id=args.run, payload={"moved": moved})
+        reindex_item(conn, into["id"]); reindex_item(conn, frm["id"])
+    return {"into": into["ref"], "from": frm["ref"], "moved": moved}
+
+
+def cmd_split(args, cfg):
+    """기존 항목에서 새 항목을 떼어낸다. 원문은 공유(mention)하고 subtask_of 관계를 둔다."""
+    conn = connect(create=False); now_s = now_iso(cfg)
+    with tx(conn):
+        src = get_item(conn, args.item)
+        if args.kind not in ITEM_KINDS:
+            _bad(f"kind 가 잘못되었습니다: {args.kind}")
+        ref = next_item_ref(conn, cfg)
+        iid = conn.execute(
+            "INSERT INTO item(ref,title,kind,status,project,owner,due_at,tentative,created_at,updated_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?)",
+            (ref, args.title, args.kind, "todo", src["project"], src["owner"],
+             ops.norm_value("due_at", args.due_at, cfg) if args.due_at else None, 0, now_s, now_s)).lastrowid
+        for r in conn.execute("SELECT source_event_id FROM item_source WHERE item_id=?", (src["id"],)).fetchall():
+            conn.execute("INSERT OR IGNORE INTO item_source(item_id,source_event_id,role) VALUES(?,?,'origin')",
+                         (iid, r["source_event_id"]))
+        ops.add_relation(conn, iid, src["id"], "subtask_of", "user", now_s)
+        log_activity(conn, item_id=iid, action="split", actor=args.actor, ts=now_s, field="split_from",
+                     new_value=src["ref"], reason=args.reason, run_id=args.run)
+        reindex_item(conn, iid)
+    return {"ref": ref, "from": src["ref"], "title": args.title, "kind": args.kind}
+
+
+def cmd_redact(args, cfg):
+    """민감 원문 제거 (§10). --confirm 없이는 아무것도 하지 않는다."""
+    conn = connect(create=False); now_s = now_iso(cfg)
+    ev = conn.execute("SELECT * FROM source_event WHERE id=?", (args.source_event,)).fetchone()
+    if ev is None:
+        _bad(f"source_event {args.source_event} 가 없습니다")
+    if not args.confirm:
+        return {"source_event_id": ev["id"], "platform": ev["platform"], "excerpt": ev["excerpt"],
+                "would_remove": ["excerpt", "raw file", "attachment files"], "confirmed": False,
+                "message": "정말 제거하려면 --confirm 을 붙이세요. 항목·이력·fingerprint 는 남습니다."}
+    from claire_core import data_dir
+    removed = []
+    with tx(conn):
+        conn.execute("UPDATE source_event SET excerpt='[redacted]', headers=?, redacted_at=? WHERE id=?",
+                     (json.dumps({"redacted": True}, ensure_ascii=False), now_s, ev["id"]))
+        if ev["raw_path"] and (data_dir() / ev["raw_path"]).exists():
+            (data_dir() / ev["raw_path"]).unlink(); removed.append(ev["raw_path"])
+        for a in conn.execute("SELECT * FROM attachment WHERE source_event_id=? AND redacted_at IS NULL", (ev["id"],)).fetchall():
+            p = data_dir() / a["stored_path"]
+            if p.exists():
+                p.unlink(); removed.append(a["stored_path"])
+            conn.execute("UPDATE attachment SET redacted_at=? WHERE id=?", (now_s, a["id"]))
+        for r in conn.execute("SELECT item_id FROM item_source WHERE source_event_id=?", (ev["id"],)).fetchall():
+            log_activity(conn, item_id=r["item_id"], action="redact", actor=args.actor, ts=now_s, field="source_event",
+                         new_value=str(ev["id"]), reason=args.reason, run_id=args.run)
+            reindex_item(conn, r["item_id"])
+    return {"source_event_id": ev["id"], "redacted_at": now_s, "removed_files": removed, "confirmed": True}
+
+
+def cmd_undo(args, cfg):
+    conn = connect(create=False); now_s = now_iso(cfg)
+    with tx(conn):
+        if args.action_id:
+            act = conn.execute("SELECT * FROM activity_log WHERE id=?", (args.action_id,)).fetchone()
+            if act is None:
+                _bad(f"이력 {args.action_id} 가 없습니다")
+        else:
+            act = conn.execute(
+                "SELECT * FROM activity_log WHERE undone_at IS NULL AND actor IN ('user','claire') "
+                "AND action IN ('update','status','complete','reopen','cancel','hold','wait','progress','answer') "
+                "AND payload LIKE '%\"before\"%' ORDER BY id DESC LIMIT 1").fetchone()
+            if act is None:
+                _bad("되돌릴 작업이 없습니다")
+        r = ops.undo_action(conn, cfg, act, ts=now_s, actor=args.actor)
+    r["message"] = f"{r['ref']} 의 {r['action']} 을 되돌렸습니다."
+    return r
+
+
+def cmd_maintain(args, cfg):
+    conn = connect(create=False); now_s = now_iso(cfg)
+    with tx(conn):
+        r = ops.expire_and_withdraw(conn, cfg, now_s)
+    return {**r, "run_id": args.run}
+
+
+def _common(sp):
+    sp.add_argument("--run", type=int)
+    sp.add_argument("--actor", choices=["user", "claire"], default="user")
+    return sp
+
+
+def build_parser():
+    p = argparse.ArgumentParser(prog="claire_store", description="Claire 결정론적 저장 (PRD §7)")
+    sub = p.add_subparsers(dest="cmd")
+    pr = sub.add_parser("propose", help="제안 JSON 반영")
+    pr.add_argument("--run", type=int); pr.add_argument("--file")
+    pr.add_argument("--force-cross-thread", action="store_true")
+    pr.set_defaults(fn=cmd_propose)
+    u = _common(sub.add_parser("update")); u.add_argument("--item", required=True)
+    u.add_argument("--set", action="append", required=True, help="key=value (반복 가능)"); u.add_argument("--reason")
+    u.set_defaults(fn=cmd_update)
+    c = _common(sub.add_parser("complete")); c.add_argument("--item"); c.add_argument("--find")
+    c.add_argument("--evidence", required=True); c.add_argument("--note"); c.add_argument("--completed-at")
+    c.set_defaults(fn=cmd_complete)
+    for name, fn in (("reopen", cmd_reopen), ("cancel", cmd_cancel), ("hold", cmd_hold)):
+        x = _common(sub.add_parser(name)); x.add_argument("--item", required=True); x.add_argument("--reason")
+        x.set_defaults(fn=fn)
+    w = _common(sub.add_parser("wait")); w.add_argument("--item", required=True); w.add_argument("--waiting-on", required=True)
+    w.add_argument("--next-check"); w.add_argument("--reason"); w.set_defaults(fn=cmd_wait)
+    rs = _common(sub.add_parser("resume")); rs.add_argument("--item", required=True); rs.add_argument("--reason"); rs.set_defaults(fn=cmd_resume)
+    ig = sub.add_parser("ignore-sender"); ig.add_argument("--address"); ig.add_argument("--domain"); ig.set_defaults(fn=cmd_ignore_sender)
+    g = _common(sub.add_parser("progress")); g.add_argument("--item", required=True); g.add_argument("--note", required=True)
+    g.add_argument("--next-action"); g.set_defaults(fn=cmd_progress)
+    a = _common(sub.add_parser("answer")); a.add_argument("--question"); a.add_argument("--answer", required=True)
+    a.add_argument("--resolve"); a.set_defaults(fn=cmd_answer)
+    r = _common(sub.add_parser("relate")); r.add_argument("--from", dest="from_ref", required=True)
+    r.add_argument("--to", required=True); r.add_argument("--type", required=True); r.set_defaults(fn=cmd_relate)
+    l = _common(sub.add_parser("link")); l.add_argument("--item", required=True); l.add_argument("--system", required=True)
+    l.add_argument("--key", required=True); l.set_defaults(fn=cmd_link)
+    m = _common(sub.add_parser("merge")); m.add_argument("--into", required=True); m.add_argument("--from", dest="from_ref", required=True)
+    m.add_argument("--reason"); m.set_defaults(fn=cmd_merge)
+    s = _common(sub.add_parser("split")); s.add_argument("--item", required=True); s.add_argument("--title", required=True)
+    s.add_argument("--kind", default="task"); s.add_argument("--due-at"); s.add_argument("--reason"); s.set_defaults(fn=cmd_split)
+    rd = _common(sub.add_parser("redact")); rd.add_argument("--source-event", type=int, required=True)
+    rd.add_argument("--confirm", action="store_true"); rd.add_argument("--reason"); rd.set_defaults(fn=cmd_redact)
+    un = _common(sub.add_parser("undo")); un.add_argument("--action-id", type=int); un.set_defaults(fn=cmd_undo)
+    mt = sub.add_parser("maintain"); mt.add_argument("--run", type=int); mt.set_defaults(fn=cmd_maintain)
+    return p
+
+
+if __name__ == "__main__":
+    run_cli(build_parser, lambda args, cfg: args.fn(args, cfg))

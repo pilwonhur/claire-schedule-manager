@@ -1,0 +1,359 @@
+#!/usr/bin/env python3
+"""claire_apply — outbox 실행 (PRD §6.2 쓰기, §6.3 쓰기, §9 원자성, D5).
+
+  claire_apply [--run ID] [--dry-run] [--op calendar.create ...]   대기 중 op 실행 (승인 필요한 것은 건너뜀)
+  claire_apply --list [--status pending|awaiting_confirm|failed|done]
+  claire_apply --confirm <outbox id | CLR-0045 | all>              브리핑에서 "등록" 승인
+  claire_apply --cancel <outbox id | CLR-0045>
+
+op
+  obsidian.assign_id   연결된 Tasks 줄에 🆔 clrNNNN 부여 (D12)
+  obsidian.check_task  완료 시 [x] + ✅ 완료일
+  obsidian.add_task    Daily `## Tasks` 에 `- [ ] #tasks [[정본]]: 제목 📅 마감 🆔 clrNNNN`
+  calendar.create      Prof. Hur 에 이벤트 생성 (extendedProperties.private.claire_ref)
+  calendar.update      교수님 지시로 시각 변경 → Calendar patch → 항목 미러링
+  discord.notice       Claire 가 채널에 전달할 문구 (실행은 하지 않고 to_deliver 로 돌려준다)
+
+실패는 지수 백오프(1·5·15·60·240분)로 최대 5회 재시도 뒤 failed. 볼트 파일이 읽은 뒤 바뀌면 쓰지 않고 다음으로 미룬다 (TC19).
+쓰기 토큰이 없으면 calendar.* 은 시도 횟수를 늘리지 않고 건너뛴다.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from datetime import timedelta
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "connectors"))
+from claire_core import (  # noqa: E402
+    ClaireError, connect, get_item, log_activity, now_dt, now_iso, parse_iso, reindex_item, run_cli, tx,
+)
+import google_api  # noqa: E402
+import obsidian_tasks  # noqa: E402
+
+OPS = ("obsidian.assign_id", "obsidian.check_task", "obsidian.add_task", "calendar.create", "calendar.update",
+       "discord.notice", "discord.brief")
+
+
+# --------------------------------------------------------------------------
+# 개별 op
+# --------------------------------------------------------------------------
+
+def _rel(cfg, external_key: str):
+    file_rel = external_key.split("#", 1)[0]
+    return obsidian_tasks.vault_path(cfg) / file_rel, file_rel
+
+
+def op_assign_id(conn, cfg, row, payload, ts):
+    path, file_rel = _rel(cfg, payload["external_key"])
+    if not path.exists():
+        raise ClaireError("file_missing", f"노트가 없습니다: {file_rel}")
+    t = obsidian_tasks.find_task_by_key(path, cfg, payload["external_key"])
+    if t is None:
+        raise ClaireError("line_missing", f"연결된 Tasks 줄을 찾지 못했습니다: {payload['external_key']}")
+    if t.get("id"):
+        new_key = f"{file_rel}#{t['id']}"
+    else:
+        new_line = obsidian_tasks.line_with_id(t["raw"], payload["ref"])
+        obsidian_tasks.replace_line_atomic(path, t["line"], t["raw"], new_line, t["file_mtime"])
+        new_key = f"{file_rel}#{obsidian_tasks.format_id(payload['ref'])}"
+    conn.execute("UPDATE link SET external_key=?, version=?, last_synced_at=?, sync_status='ok' "
+                 "WHERE item_id=? AND system='obsidian_task' AND external_key=?",
+                 (new_key, None, ts, row["item_id"], payload["external_key"]))
+    return {"file": file_rel, "line": t["line"], "external_key": new_key}
+
+
+def op_check_task(conn, cfg, row, payload, ts):
+    path, file_rel = _rel(cfg, payload["external_key"])
+    if not path.exists():
+        raise ClaireError("file_missing", f"노트가 없습니다: {file_rel}")
+    t = obsidian_tasks.find_task_by_key(path, cfg, payload["external_key"])
+    if t is None:
+        raise ClaireError("line_missing", f"연결된 Tasks 줄을 찾지 못했습니다: {payload['external_key']}")
+    if t["state"] == "done":
+        return {"file": file_rel, "line": t["line"], "already_checked": True}
+    new_line = obsidian_tasks.line_checked(t["raw"], payload.get("completed_on") or ts[:10])
+    ref = conn.execute("SELECT ref FROM item WHERE id=?", (row["item_id"],)).fetchone()["ref"]
+    new_line = obsidian_tasks.line_with_id(new_line, ref)
+    obsidian_tasks.replace_line_atomic(path, t["line"], t["raw"], new_line, t["file_mtime"])
+    conn.execute("UPDATE link SET last_synced_at=?, sync_status='ok' WHERE item_id=? AND system='obsidian_task'",
+                 (ts, row["item_id"]))
+    return {"file": file_rel, "line": t["line"], "checked": True}
+
+
+def op_add_task(conn, cfg, row, payload, ts):
+    day = payload.get("day") or ts[:10]
+    line = obsidian_tasks.format_task_line(payload["title"], payload.get("due"), payload["ref"], payload.get("note"),
+                                           cfg["obsidian"].get("tag", "#tasks"))
+    res = obsidian_tasks.add_task_to_daily(cfg, day, line)
+    file_rel = str(Path(res["path"]).relative_to(obsidian_tasks.vault_path(cfg)))
+    key = f"{file_rel}#{obsidian_tasks.format_id(payload['ref'])}"
+    if conn.execute("SELECT 1 FROM link WHERE system='obsidian_task' AND external_key=?", (key,)).fetchone() is None:
+        conn.execute("INSERT INTO link(item_id,system,external_key,version,last_seen_at,last_synced_at,sync_status) "
+                     "VALUES(?,?,?,?,?,?,'ok')", (row["item_id"], "obsidian_task", key, None, ts, ts))
+    return {"file": file_rel, "added": res["added"], "created_daily": res["created"], "external_key": key}
+
+
+def _event_body(cfg, payload: dict) -> dict:
+    tz = cfg["timezone"]
+    body = {"summary": payload["title"],
+            "extendedProperties": {"private": {"claire_ref": payload["ref"]}},
+            "reminders": {"useDefault": False,
+                          "overrides": [{"method": "popup", "minutes": int(cfg["apply"].get("calendar_reminder_minutes", 30))}]}}
+    if payload.get("all_day") or (payload.get("start_at") and len(payload["start_at"]) == 10):
+        body["start"] = {"date": payload["start_at"][:10]}
+        end = payload.get("end_at") or payload["start_at"]
+        body["end"] = {"date": end[:10]}
+    else:
+        start = payload["start_at"]
+        end = payload.get("end_at") or (parse_iso(start) + timedelta(hours=1)).isoformat()
+        body["start"] = {"dateTime": start, "timeZone": tz}
+        body["end"] = {"dateTime": end, "timeZone": tz}
+    desc = f"[Claire {payload['ref']}]"
+    if payload.get("note"):
+        desc = f"{payload['note']}\n{desc}"
+    body["description"] = desc
+    return body
+
+
+def op_calendar_create(conn, cfg, row, payload, ts):
+    if not google_api.write_token_available(payload["account"]):
+        raise _Skip("쓰기 토큰 없음: python3 connectors/google_api.py authorize "
+                    f"{payload['account']} --kind write")
+    ev = google_api.calendar_event_insert(cfg, payload["account"], payload["calendar_id"], _event_body(cfg, payload))
+    key = f"{payload['calendar_id']}:{ev['id']}"
+    if conn.execute("SELECT 1 FROM link WHERE system='calendar' AND external_key=?", (key,)).fetchone() is None:
+        conn.execute("INSERT INTO link(item_id,system,external_key,version,last_seen_at,last_synced_at,sync_status) "
+                     "VALUES(?,?,?,?,?,?,'ok')", (row["item_id"], "calendar", key, ev.get("etag"), ts, ts))
+    conn.execute("UPDATE item SET tentative=0, updated_at=? WHERE id=?", (ts, row["item_id"]))
+    return {"event_id": ev["id"], "html_link": ev.get("htmlLink"), "external_key": key}
+
+
+def op_calendar_update(conn, cfg, row, payload, ts):
+    acct = next((c["account"] for c in cfg["calendars"] if c["id"] == payload["calendar_id"]), None)
+    if not acct or not google_api.write_token_available(acct):
+        raise _Skip(f"쓰기 토큰 없음: python3 connectors/google_api.py authorize {acct} --kind write")
+    fields = payload["fields"]
+    tz = cfg["timezone"]
+    body = {}
+    if "start_at" in fields and fields["start_at"]:
+        body["start"] = {"date": fields["start_at"][:10]} if fields.get("all_day") else {"dateTime": fields["start_at"], "timeZone": tz}
+    if "end_at" in fields and fields["end_at"]:
+        body["end"] = {"date": fields["end_at"][:10]} if fields.get("all_day") else {"dateTime": fields["end_at"], "timeZone": tz}
+    if "start_at" in fields and "end_at" not in fields and fields.get("start_at"):
+        item = conn.execute("SELECT start_at, end_at FROM item WHERE id=?", (row["item_id"],)).fetchone()
+        if item["start_at"] and item["end_at"]:
+            dur = parse_iso(item["end_at"]) - parse_iso(item["start_at"])
+            body["end"] = {"dateTime": (parse_iso(fields["start_at"]) + dur).isoformat(), "timeZone": tz}
+    ev = google_api.calendar_event_patch(cfg, acct, payload["calendar_id"], payload["event_id"], body)
+    # 미러링: Calendar 가 받아들인 값을 항목에 쓴다
+    sets = {}
+    if "start" in body:
+        sets["start_at"] = fields["start_at"]
+    if "end" in body:
+        sets["end_at"] = body["end"].get("dateTime") or body["end"].get("date")
+    if sets:
+        cols = ", ".join(f"{k}=?" for k in sets)
+        item = conn.execute("SELECT * FROM item WHERE id=?", (row["item_id"],)).fetchone()
+        for k, v in sets.items():
+            log_activity(conn, item_id=row["item_id"], action="update", actor="apply", ts=ts, field=k, old_value=item[k],
+                         new_value=v, reason="Calendar 반영 후 미러링", payload={"before": {k: item[k]}})
+        conn.execute(f"UPDATE item SET {cols}, updated_at=? WHERE id=?", (*sets.values(), ts, row["item_id"]))
+        reindex_item(conn, row["item_id"])
+    conn.execute("UPDATE link SET version=?, last_synced_at=?, sync_status='ok' WHERE item_id=? AND system='calendar' "
+                 "AND external_key=?", (ev.get("etag"), ts, row["item_id"], f"{payload['calendar_id']}:{payload['event_id']}"))
+    return {"event_id": payload["event_id"], "etag": ev.get("etag"), "mirrored": sets}
+
+
+class _Skip(Exception):
+    """시도 횟수를 늘리지 않고 이번 실행에서만 건너뛴다."""
+
+
+HANDLERS = {"obsidian.assign_id": op_assign_id, "obsidian.check_task": op_check_task, "obsidian.add_task": op_add_task,
+            "calendar.create": op_calendar_create, "calendar.update": op_calendar_update}
+
+
+# --------------------------------------------------------------------------
+# 실행 루프
+# --------------------------------------------------------------------------
+
+def _backoff(cfg, attempts: int) -> int:
+    steps = cfg["apply"].get("backoff_minutes", [1, 5, 15, 60, 240])
+    return int(steps[min(attempts, len(steps)) - 1])
+
+
+def cmd_run(args, cfg):
+    conn = connect(create=False)
+    now = now_dt(cfg); now_s = now.isoformat()
+    rows = conn.execute(
+        "SELECT * FROM outbox WHERE status='pending' AND (not_before IS NULL OR not_before <= ?) ORDER BY id", (now_s,)).fetchall()
+    if args.op:
+        rows = [r for r in rows if r["op"] in args.op]
+    done, failed, retry, skipped, deliver = [], [], [], [], []
+    max_attempts = int(cfg["apply"].get("max_attempts", 5))
+    for row in rows:
+        payload = json.loads(row["payload"])
+        ref = conn.execute("SELECT ref FROM item WHERE id=?", (row["item_id"],)).fetchone()["ref"] if row["item_id"] else None
+        if row["op"].startswith("discord."):
+            deliver.append({"outbox_id": row["id"], "op": row["op"], "text": payload.get("text"), "item_ref": ref})
+            if not args.dry_run:
+                with tx(conn):
+                    conn.execute("UPDATE outbox SET status='done', done_at=?, result=? WHERE id=?",
+                                 (now_s, json.dumps({"delivered_by": "claire"}), row["id"]))
+            continue
+        handler = HANDLERS.get(row["op"])
+        if handler is None:
+            failed.append({"outbox_id": row["id"], "op": row["op"], "error": "unknown op"})
+            with tx(conn):
+                conn.execute("UPDATE outbox SET status='failed', last_error='unknown op', done_at=? WHERE id=?", (now_s, row["id"]))
+            continue
+        if args.dry_run:
+            skipped.append({"outbox_id": row["id"], "op": row["op"], "item_ref": ref, "dry_run": True, "payload": payload})
+            continue
+        try:
+            with tx(conn):
+                result = handler(conn, cfg, row, payload, now_s)
+                conn.execute("UPDATE outbox SET status='done', done_at=?, result=?, attempts=attempts+1, last_error=NULL WHERE id=?",
+                             (now_s, json.dumps(result, ensure_ascii=False), row["id"]))
+                if row["item_id"]:
+                    log_activity(conn, item_id=row["item_id"], action="apply", actor="apply", ts=now_s, field=row["op"],
+                                 new_value=json.dumps(result, ensure_ascii=False)[:500], run_id=args.run,
+                                 payload={"outbox_id": row["id"]})
+            done.append({"outbox_id": row["id"], "op": row["op"], "item_ref": ref, "result": result})
+        except _Skip as e:
+            skipped.append({"outbox_id": row["id"], "op": row["op"], "item_ref": ref, "reason": str(e)})
+            with tx(conn):
+                conn.execute("UPDATE outbox SET last_error=? WHERE id=?", (str(e)[:300], row["id"]))
+        except Exception as e:  # noqa: BLE001
+            msg = e.message if isinstance(e, ClaireError) else f"{type(e).__name__}: {e}"
+            attempts = row["attempts"] + 1
+            with tx(conn):
+                if attempts >= max_attempts:
+                    conn.execute("UPDATE outbox SET status='failed', attempts=?, last_error=?, done_at=? WHERE id=?",
+                                 (attempts, msg[:500], now_s, row["id"]))
+                    failed.append({"outbox_id": row["id"], "op": row["op"], "item_ref": ref, "error": msg, "attempts": attempts})
+                else:
+                    nb = (now + timedelta(minutes=_backoff(cfg, attempts))).isoformat()
+                    conn.execute("UPDATE outbox SET attempts=?, last_error=?, not_before=? WHERE id=?",
+                                 (attempts, msg[:500], nb, row["id"]))
+                    retry.append({"outbox_id": row["id"], "op": row["op"], "item_ref": ref, "error": msg, "attempts": attempts,
+                                  "not_before": nb})
+    awaiting = [_row(conn, r) for r in conn.execute("SELECT * FROM outbox WHERE status='awaiting_confirm' ORDER BY id")]
+    return {"run_id": args.run, "done": done, "retry": retry, "failed": failed, "skipped": skipped, "to_deliver": deliver,
+            "awaiting_confirm": awaiting, "dry_run": bool(args.dry_run),
+            "summary": {"done": len(done), "retry": len(retry), "failed": len(failed), "skipped": len(skipped),
+                        "awaiting_confirm": len(awaiting), "to_deliver": len(deliver)}}
+
+
+def _row(conn, r) -> dict:
+    ref = conn.execute("SELECT ref, title FROM item WHERE id=?", (r["item_id"],)).fetchone() if r["item_id"] else None
+    p = json.loads(r["payload"])
+    return {"outbox_id": r["id"], "op": r["op"], "item_ref": ref["ref"] if ref else None, "title": ref["title"] if ref else None,
+            "status": r["status"], "requires_confirm": bool(r["requires_confirm"]), "attempts": r["attempts"],
+            "not_before": r["not_before"], "last_error": r["last_error"], "created_at": r["created_at"],
+            "summary": _describe(r["op"], p)}
+
+
+def _describe(op: str, p: dict) -> str:
+    if op == "calendar.create":
+        return f"Calendar 등록: {p.get('title')} {p.get('start_at', '')[:16].replace('T', ' ')}"
+    if op == "calendar.update":
+        return f"Calendar 변경: {p.get('ref')} {p.get('fields')}"
+    if op == "obsidian.add_task":
+        return f"Daily {p.get('day')} 에 Tasks 줄 추가: {p.get('title')} (📅 {p.get('due')})"
+    if op == "obsidian.check_task":
+        return f"Tasks 체크: {p.get('external_key')}"
+    if op == "obsidian.assign_id":
+        return f"🆔 부여: {p.get('external_key')}"
+    return op
+
+
+def _select(conn, target: str):
+    if target == "all":
+        return conn.execute("SELECT * FROM outbox WHERE status='awaiting_confirm'").fetchall()
+    if target.isdigit():
+        r = conn.execute("SELECT * FROM outbox WHERE id=?", (int(target),)).fetchone()
+        return [r] if r else []
+    it = get_item(conn, target)
+    return conn.execute("SELECT * FROM outbox WHERE item_id=? AND status IN ('awaiting_confirm','pending')", (it["id"],)).fetchall()
+
+
+def cmd_confirm(args, cfg):
+    conn = connect(create=False); now_s = now_iso(cfg)
+    rows = _select(conn, args.confirm)
+    if not rows:
+        raise ClaireError("nothing_to_confirm", f"승인할 대기 항목이 없습니다: {args.confirm}")
+    out = []
+    with tx(conn):
+        for r in rows:
+            if r["status"] != "awaiting_confirm":
+                out.append({"outbox_id": r["id"], "status": r["status"], "note": "승인 대상 아님"})
+                continue
+            conn.execute("UPDATE outbox SET status='pending', confirmed_at=?, not_before=NULL WHERE id=?", (now_s, r["id"]))
+            if r["item_id"]:
+                log_activity(conn, item_id=r["item_id"], action="apply", actor="user", ts=now_s, field=r["op"],
+                             new_value="confirmed", reason="교수님 승인", payload={"outbox_id": r["id"]})
+            out.append({"outbox_id": r["id"], "op": r["op"], "status": "pending"})
+    return {"confirmed": out, "message": "승인했습니다. 다음 claire_apply 실행 때 반영됩니다 (지금 바로: claire_apply --run <id>)."}
+
+
+def cmd_cancel(args, cfg):
+    conn = connect(create=False); now_s = now_iso(cfg)
+    rows = _select(conn, args.cancel)
+    if not rows:
+        raise ClaireError("nothing_to_cancel", f"취소할 대기 항목이 없습니다: {args.cancel}")
+    out = []
+    with tx(conn):
+        for r in rows:
+            if r["status"] not in ("awaiting_confirm", "pending"):
+                out.append({"outbox_id": r["id"], "status": r["status"], "note": "취소 대상 아님"})
+                continue
+            conn.execute("UPDATE outbox SET status='cancelled', done_at=? WHERE id=?", (now_s, r["id"]))
+            if r["op"] == "calendar.update" and r["item_id"]:
+                conn.execute("UPDATE link SET sync_status='ok' WHERE item_id=? AND system='calendar' AND sync_status='pending'",
+                             (r["item_id"],))
+            out.append({"outbox_id": r["id"], "op": r["op"], "status": "cancelled"})
+    return {"cancelled": out}
+
+
+def cmd_list(args, cfg):
+    conn = connect(create=False)
+    sql = "SELECT * FROM outbox"
+    params = []
+    if args.status:
+        sql += " WHERE status=?"; params.append(args.status)
+    else:
+        sql += " WHERE status IN ('pending','awaiting_confirm','failed')"
+    rows = [_row(conn, r) for r in conn.execute(sql + " ORDER BY id", params)]
+    counts = {r["status"]: r["c"] for r in conn.execute("SELECT status, COUNT(*) c FROM outbox GROUP BY status")}
+    return {"outbox": rows, "counts": counts}
+
+
+def build_parser():
+    p = argparse.ArgumentParser(prog="claire_apply", description="Claire outbox 실행·승인 (PRD 4단계)")
+    p.add_argument("--run", type=int)
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--op", action="append", choices=OPS)
+    p.add_argument("--confirm", help="outbox id | CLR-ref | all")
+    p.add_argument("--cancel", help="outbox id | CLR-ref")
+    p.add_argument("--list", action="store_true")
+    p.add_argument("--status")
+    p.set_defaults(cmd="apply")
+    return p
+
+
+def dispatch(args, cfg):
+    if args.confirm:
+        return cmd_confirm(args, cfg)
+    if args.cancel:
+        return cmd_cancel(args, cfg)
+    if args.list:
+        return cmd_list(args, cfg)
+    return cmd_run(args, cfg)
+
+
+if __name__ == "__main__":
+    run_cli(build_parser, dispatch)

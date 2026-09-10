@@ -1,0 +1,677 @@
+#!/usr/bin/env python3
+"""claire_check — 초기화·무결성·백업·복구·연결 진단 (PRD §10, §11, §13 1단계).
+
+  init                      데이터 디렉터리·스키마·config.json 생성 (멱등)
+  integrity [--strict]      무결성 검사 (§10)
+  backup [--out] [--no-mirror]
+  restore-test --from <backup dir 또는 db 파일>   건수·해시 대조 (TC20)
+  doctor [--offline] [--format text]              §4.3 확인 사항 실측
+  calibrate                 5단계 (표본이 없으면 근거 부족만 보고)
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import platform
+import shutil
+import sqlite3
+import subprocess
+import sys
+from datetime import datetime
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "connectors"))
+from claire_core import (  # noqa: E402
+    CLAIRE_VERSION, COUNT_TABLES, DB_NAME, DEFAULT_CONFIG, EVIDENCE_CODES, EVIDENCE_CRITERIA_RE,
+    SCHEMA_VERSION, ClaireError, atomic_write_text, connect, content_hash, data_dir, db_path,
+    hours_between, is_synced_location, now_iso, run_cli, sha256_file, table_counts, tz_of,
+)
+
+DATA_SUBDIRS = ("secrets", "raw", "attachments", "exports", "backups", "logs")
+
+
+def _open(path) -> sqlite3.Connection:
+    conn = sqlite3.connect(path)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+# --------------------------------------------------------------------------
+# init
+# --------------------------------------------------------------------------
+
+def _merge_config_file(path: Path) -> list[str]:
+    """config.json 이 없으면 기본값으로 만들고, 있으면 새 키만 채운다. 사용자 값은 보존."""
+    if not path.exists():
+        atomic_write_text(path, json.dumps(DEFAULT_CONFIG, ensure_ascii=False, indent=2) + "\n")
+        return ["<created>"]
+    user = json.loads(path.read_text(encoding="utf-8"))
+    added: list[str] = []
+
+    def merge(defaults, current, prefix=""):
+        for k, v in defaults.items():
+            if k not in current:
+                current[k] = v
+                added.append(prefix + k)
+            elif isinstance(v, dict) and isinstance(current[k], dict):
+                merge(v, current[k], prefix + k + ".")
+
+    merge(DEFAULT_CONFIG, user)
+    if added:
+        atomic_write_text(path, json.dumps(user, ensure_ascii=False, indent=2) + "\n")
+    return added
+
+
+def cmd_init(args, cfg):
+    """데이터베이스와 디렉터리를 만든다. 이미 있으면 그대로 둔다 (멱등)."""
+    d = data_dir()
+    existed = db_path().exists()
+    d.mkdir(parents=True, exist_ok=True)
+    for sub in DATA_SUBDIRS:
+        (d / sub).mkdir(parents=True, exist_ok=True)
+    os.chmod(d / "secrets", 0o700)
+    added = _merge_config_file(d / "config.json")
+    conn = connect(create=True)
+    version = conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
+    synced = is_synced_location(d)
+    return {
+        "data_dir": str(d), "db": str(db_path()), "created": not existed,
+        "schema_version": int(version["value"]), "claire_version": CLAIRE_VERSION,
+        "config_added_keys": added, "counts": table_counts(conn),
+        "warning": (f"데이터 디렉터리가 {synced} 동기화 폴더 안에 있습니다. §4.2 위반입니다."
+                    if synced else None),
+        "message": "데이터베이스를 만들었습니다." if not existed else "이미 초기화되어 있습니다. 변경 없음.",
+    }
+
+
+# --------------------------------------------------------------------------
+# integrity (§10)
+# --------------------------------------------------------------------------
+
+def run_integrity(conn, cfg=None) -> dict:
+    problems = []
+
+    def add(kind, detail):
+        problems.append({"check": kind, "detail": detail})
+
+    orphan_sql = {
+        "item_source.item": "SELECT COUNT(*) c FROM item_source s LEFT JOIN item i ON i.id=s.item_id WHERE i.id IS NULL",
+        "item_source.source_event": "SELECT COUNT(*) c FROM item_source s LEFT JOIN source_event e ON e.id=s.source_event_id WHERE e.id IS NULL",
+        "link.item": "SELECT COUNT(*) c FROM link l LEFT JOIN item i ON i.id=l.item_id WHERE i.id IS NULL",
+        "attachment.source_event": "SELECT COUNT(*) c FROM attachment a LEFT JOIN source_event e ON e.id=a.source_event_id WHERE e.id IS NULL",
+        "question.item": "SELECT COUNT(*) c FROM question q WHERE q.item_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM item i WHERE i.id=q.item_id)",
+        "relation.from": "SELECT COUNT(*) c FROM relation r LEFT JOIN item i ON i.id=r.from_item_id WHERE i.id IS NULL",
+        "relation.to": "SELECT COUNT(*) c FROM relation r LEFT JOIN item i ON i.id=r.to_item_id WHERE i.id IS NULL",
+        "activity_log.item": "SELECT COUNT(*) c FROM activity_log a WHERE a.item_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM item i WHERE i.id=a.item_id)",
+    }
+    for name, sql in orphan_sql.items():
+        n = conn.execute(sql).fetchone()["c"]
+        if n:
+            add("orphan", f"{name} 고아 레코드 {n}건")
+
+    # done 항목의 근거 누락 (G5)
+    for r in conn.execute("SELECT id, ref FROM item WHERE status='done'"):
+        ev = conn.execute(
+            "SELECT reason FROM activity_log WHERE item_id=? AND action='complete' AND undone_at IS NULL "
+            "ORDER BY id DESC LIMIT 1", (r["id"],)).fetchone()
+        code = ev["reason"] if ev else None
+        if not code or not (code in EVIDENCE_CODES or EVIDENCE_CRITERIA_RE.match(code)):
+            add("done_without_evidence", f"{r['ref']} 가 근거 코드 없이 done 입니다")
+
+    # needs_info 인데 열린 질문이 없음
+    for r in conn.execute(
+        "SELECT i.ref FROM item i WHERE i.status='needs_info' AND NOT EXISTS "
+        "(SELECT 1 FROM question q WHERE q.item_id=i.id AND q.status='open')"):
+        add("needs_info_without_question", f"{r['ref']} 는 needs_info 인데 열린 질문이 없습니다")
+
+    # outbox 실패 잔량
+    n = conn.execute("SELECT COUNT(*) c FROM outbox WHERE status='failed'").fetchone()["c"]
+    if n:
+        add("outbox_failed", f"outbox 실패 {n}건")
+
+    # sync_state 오래된 커서 (마지막 성공이 48시간 이전)
+    if cfg:
+        now_s = now_iso(cfg)
+        for r in conn.execute("SELECT * FROM sync_state"):
+            if r["last_success_at"] and hours_between(r["last_success_at"], now_s) > 48:
+                add("sync_stale", f"{r['platform']}/{r['account']} 마지막 성공 {r['last_success_at']}")
+            if r["full_sync_needed"]:
+                add("sync_full_needed", f"{r['platform']}/{r['account']} 전체 재동기화 필요")
+
+    # 첨부 sha256
+    for r in conn.execute("SELECT * FROM attachment WHERE redacted_at IS NULL"):
+        p = data_dir() / r["stored_path"]
+        if not p.exists():
+            add("attachment_missing", f"첨부 파일 없음: {r['stored_path']}")
+        elif sha256_file(p) != r["sha256"]:
+            add("attachment_hash", f"첨부 해시 불일치: {r['stored_path']}")
+
+    # ref 중복·공백
+    for table, label in (("item", "항목"), ("question", "질문")):
+        refs = [r["ref"] for r in conn.execute(f"SELECT ref FROM {table}")]
+        if len(refs) != len(set(refs)):
+            add("ref_duplicate", f"{label} 번호가 중복되었습니다")
+        nums = sorted(int(x.rsplit("-", 1)[1]) for x in refs if "-" in x)
+        if nums:
+            missing = sorted(set(range(1, nums[-1] + 1)) - set(nums))
+            if missing:
+                add("ref_gap", f"{label} 번호 공백 {len(missing)}건: {missing[:10]}")
+
+    # FTS 재생성 필요 여부
+    n_items = conn.execute("SELECT COUNT(*) c FROM item WHERE deleted_at IS NULL").fetchone()["c"]
+    try:
+        n_fts = conn.execute("SELECT COUNT(*) c FROM search_fts").fetchone()["c"]
+        if n_fts != n_items:
+            add("fts_stale", f"검색 색인 {n_fts}건 ≠ 항목 {n_items}건. rebuild 가 필요합니다")
+    except sqlite3.OperationalError as e:
+        add("fts_error", str(e))
+
+    # 실행 잠금 누수
+    n = conn.execute("SELECT COUNT(*) c FROM run WHERE status='running'").fetchone()["c"]
+    if n > 1:
+        add("run_lock", f"running 상태의 실행이 {n}건입니다")
+
+    pragma = conn.execute("PRAGMA integrity_check").fetchone()[0]
+    if pragma != "ok":
+        add("sqlite", pragma)
+
+    return {"healthy": not problems, "problem_count": len(problems), "problems": problems,
+            "counts": table_counts(conn), "claire_version": CLAIRE_VERSION}
+
+
+def cmd_integrity(args, cfg):
+    conn = connect(create=False)
+    result = run_integrity(conn, cfg)
+    if not result["healthy"] and args.strict:
+        raise ClaireError("integrity_failed", f"무결성 문제 {result['problem_count']}건",
+                          problems=result["problems"])
+    return result
+
+
+# --------------------------------------------------------------------------
+# backup / restore-test (§10, TC20)
+# --------------------------------------------------------------------------
+
+def _snapshot(src_conn, dest: Path):
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    target = sqlite3.connect(dest)
+    try:
+        src_conn.backup(target)
+    finally:
+        target.close()
+
+
+def _copy_tree(src: Path, dst: Path) -> int:
+    if not src.exists():
+        return 0
+    n = 0
+    for p in src.rglob("*"):
+        if p.is_file() and ".incoming" not in p.parts:
+            rel = p.relative_to(src)
+            out = dst / rel
+            out.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                os.link(p, out)
+            except OSError:
+                shutil.copy2(p, out)
+            n += 1
+    return n
+
+
+def _prune(backup_root: Path, cfg) -> list[str]:
+    dirs = sorted([d for d in backup_root.iterdir() if d.is_dir() and d.name[0].isdigit()],
+                  reverse=True)
+    keep, seen_w, seen_m = set(), set(), set()
+    ret = cfg["backup_retention"]
+    for i, d in enumerate(dirs):
+        try:
+            when = datetime.strptime(d.name[:15], "%Y%m%dT%H%M%S")
+        except ValueError:
+            keep.add(d)
+            continue
+        if i < ret["daily"]:
+            keep.add(d)
+        wk = when.strftime("%G-W%V")
+        if wk not in seen_w and len(seen_w) < ret["weekly"]:
+            seen_w.add(wk); keep.add(d)
+        mo = when.strftime("%Y-%m")
+        if mo not in seen_m and len(seen_m) < ret["monthly"]:
+            seen_m.add(mo); keep.add(d)
+    removed = []
+    for d in dirs:
+        if d not in keep:
+            shutil.rmtree(d, ignore_errors=True)
+            removed.append(d.name)
+    return removed
+
+
+def _redaction_manifest(conn, backup_root: Path, ts: str) -> int:
+    path = backup_root / "redaction_manifest.json"
+    items = [{"kind": "source_event", "id": r["id"], "redacted_at": r["redacted_at"],
+              "fingerprint": r["fingerprint"]}
+             for r in conn.execute("SELECT id, redacted_at, fingerprint FROM source_event "
+                                   "WHERE redacted_at IS NOT NULL")]
+    items += [{"kind": "attachment", "id": r["id"], "redacted_at": r["redacted_at"], "sha256": r["sha256"]}
+              for r in conn.execute("SELECT id, redacted_at, sha256 FROM attachment "
+                                    "WHERE redacted_at IS NOT NULL")]
+    atomic_write_text(path, json.dumps({"updated_at": ts, "entries": items},
+                                       ensure_ascii=False, indent=2))
+    return len(items)
+
+
+def cmd_backup(args, cfg):
+    conn = connect(create=False)
+    ts = now_iso(cfg)
+    stamp = datetime.fromisoformat(ts).strftime("%Y%m%dT%H%M%S")
+    root = Path(args.out).expanduser() if args.out else data_dir() / "backups"
+    dest = root / stamp
+    dest.mkdir(parents=True, exist_ok=True)
+
+    _snapshot(conn, dest / DB_NAME)
+    here = Path(__file__).resolve().parent
+    env = dict(os.environ, CLAIRE_DATA_DIR=str(data_dir()))
+    subprocess.run([sys.executable, str(here / "claire_export"), "json",
+                    "--out", str(dest / "claire-export.json")], check=True,
+                   capture_output=True, env=env)
+    subprocess.run([sys.executable, str(here / "claire_export"), "md",
+                    "--out", str(dest / "markdown")], check=True, capture_output=True, env=env)
+    n_att = _copy_tree(data_dir() / "attachments", dest / "attachments")
+    n_raw = _copy_tree(data_dir() / "raw", dest / "raw")
+    n_red = _redaction_manifest(conn, root, ts)
+    # config 사본 (비밀값 없음). secrets/ 는 복사하지 않는다.
+    cfg_path = data_dir() / "config.json"
+    if cfg_path.exists():
+        shutil.copy2(cfg_path, dest / "config.json")
+
+    snap = _open(dest / DB_NAME)
+    verify = run_integrity(snap)
+    counts = table_counts(snap)
+    chash = content_hash(snap)
+    snap.close()
+    manifest = {"created_at": ts, "claire_version": CLAIRE_VERSION, "schema_version": SCHEMA_VERSION,
+                "counts": counts, "content_hash": chash, "attachments": n_att, "raw_files": n_raw,
+                "db_sha256": sha256_file(dest / DB_NAME), "snapshot_healthy": verify["healthy"],
+                "excludes": ["secrets/"]}
+    atomic_write_text(dest / "manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2))
+
+    removed = _prune(root, cfg)
+    mirrored = None
+    if not args.no_mirror and cfg.get("backup_mirror"):
+        mirror = Path(cfg["backup_mirror"]).expanduser()
+        try:
+            mirror.mkdir(parents=True, exist_ok=True)
+            mdest = mirror / stamp
+            if mdest.exists():
+                shutil.rmtree(mdest)
+            shutil.copytree(dest, mdest)
+            shutil.copy2(root / "redaction_manifest.json", mirror / "redaction_manifest.json")
+            _prune(mirror, cfg)
+            mirrored = str(mdest)
+        except OSError as e:
+            mirrored = f"실패: {e}"
+    return {"backup_dir": str(dest), "manifest": manifest, "pruned": removed, "mirror": mirrored,
+            "redaction_entries": n_red}
+
+
+def cmd_restore_test(args, cfg):
+    """백업만으로 새 DB를 만들고 건수·해시가 일치하는지 대조한다 (TC20)."""
+    src = Path(getattr(args, "from_path")).expanduser()
+    db_file = src / DB_NAME if src.is_dir() else src
+    if not db_file.exists():
+        raise ClaireError("backup_missing", f"백업 DB가 없습니다: {db_file}")
+    manifest = None
+    if src.is_dir() and (src / "manifest.json").exists():
+        manifest = json.loads((src / "manifest.json").read_text(encoding="utf-8"))
+    # secrets 가 백업에 섞여 있지 않은지
+    secrets_leaked = src.is_dir() and any(p.name == "secrets" for p in src.rglob("secrets"))
+
+    restored = _open(":memory:")
+    src_conn = sqlite3.connect(db_file)
+    src_conn.backup(restored)
+    src_conn.close()
+    r_counts = table_counts(restored)
+    r_hash = content_hash(restored)
+    integ = run_integrity(restored)
+
+    live = {}
+    if db_path().exists():
+        lconn = connect(create=False)
+        live = {"counts": table_counts(lconn), "content_hash": content_hash(lconn)}
+    diff = {t: {"live": live["counts"][t], "restored": r_counts[t]}
+            for t in COUNT_TABLES if live and live["counts"][t] != r_counts[t]}
+    manifest_match = None
+    if manifest:
+        manifest_match = (manifest.get("counts") == r_counts and manifest.get("content_hash") == r_hash)
+    return {
+        "source": str(db_file), "restored_counts": r_counts, "restored_content_hash": r_hash,
+        "restored_healthy": integ["healthy"], "restored_problems": integ["problems"],
+        "manifest_match": manifest_match,
+        "live_match": (not diff and live.get("content_hash") == r_hash) if live else None,
+        "live_diff": diff, "secrets_included": bool(secrets_leaked),
+        "db_in_synced_folder": is_synced_location(db_path()),
+        "note": "live 차이는 백업 이후 추가된 기록일 수 있습니다. manifest_match 가 복구 성공의 기준입니다.",
+    }
+
+
+# --------------------------------------------------------------------------
+# doctor (§4.3 확인 사항 실측, §11)
+# --------------------------------------------------------------------------
+
+class Doctor:
+    def __init__(self, cfg, offline: bool):
+        self.cfg = cfg
+        self.offline = offline
+        self.checks: list[dict] = []
+
+    def add(self, area, name, status, detail="", fix=None, **extra):
+        row = {"area": area, "name": name, "status": status, "detail": detail}
+        if fix:
+            row["fix"] = fix
+        row.update(extra)
+        self.checks.append(row)
+
+    # -- 환경 ---------------------------------------------------------------
+    def check_env(self):
+        v = sys.version_info
+        self.add("env", "python", "ok" if v >= (3, 11) else "fail",
+                 f"{platform.python_version()} ({sys.executable})",
+                 None if v >= (3, 11) else "Python 3.11 이상이 필요합니다")
+        try:
+            c = sqlite3.connect(":memory:")
+            c.execute("CREATE VIRTUAL TABLE t USING fts5(a)")
+            self.add("env", "sqlite_fts5", "ok", f"SQLite {sqlite3.sqlite_version}")
+        except sqlite3.OperationalError as e:
+            self.add("env", "sqlite_fts5", "fail", str(e))
+        try:
+            tz_of(self.cfg)
+            self.add("env", "timezone", "ok", self.cfg["timezone"])
+        except Exception as e:  # noqa: BLE001
+            self.add("env", "timezone", "fail", str(e))
+        gog = shutil.which("gog")
+        self.add("env", "gog_cli", "ok" if gog else "warn",
+                 f"{gog} (참고용. 증분 동기화 API가 없어 커넥터는 REST 직접 호출)" if gog
+                 else "gog 미설치 (없어도 됨)")
+
+    # -- 데이터 디렉터리 -----------------------------------------------------
+    def check_data(self):
+        d = data_dir()
+        synced = is_synced_location(d)
+        self.add("data", "data_dir", "fail" if synced else ("ok" if d.exists() else "warn"),
+                 f"{d}" + (f" — {synced} 동기화 폴더 안" if synced else ""),
+                 "claire_check init" if not d.exists() else
+                 ("CLAIRE_DATA_DIR 을 동기화 폴더 밖으로 옮기세요 (§4.2)" if synced else None))
+        if db_path().exists():
+            try:
+                conn = connect(create=False)
+                ver = conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()["value"]
+                integ = run_integrity(conn, self.cfg)
+                self.add("data", "database", "ok" if integ["healthy"] else "warn",
+                         f"schema v{ver}, 무결성 {'이상 없음' if integ['healthy'] else integ['problems'][:3]}",
+                         counts=integ["counts"])
+            except Exception as e:  # noqa: BLE001
+                self.add("data", "database", "fail", str(e))
+        else:
+            self.add("data", "database", "fail", f"{db_path()} 없음", "claire_check init")
+        for sub in DATA_SUBDIRS:
+            p = d / sub
+            if not p.is_dir():
+                self.add("data", f"dir:{sub}", "fail", f"{p} 없음", "claire_check init")
+                continue
+            if sub == "secrets":
+                mode = p.stat().st_mode & 0o777
+                bad = [f.name for f in p.iterdir() if f.is_file() and (f.stat().st_mode & 0o077)]
+                ok = mode == 0o700 and not bad
+                self.add("data", "dir:secrets", "ok" if ok else "fail",
+                         f"mode {oct(mode)}" + (f", 느슨한 파일 {bad}" if bad else ""),
+                         None if ok else "chmod 700 secrets; chmod 600 secrets/*")
+            else:
+                self.add("data", f"dir:{sub}", "ok" if os.access(p, os.W_OK) else "fail", str(p))
+        cfg_path = d / "config.json"
+        self.add("data", "config", "ok" if cfg_path.exists() else "warn",
+                 str(cfg_path) if cfg_path.exists() else "config.json 없음 (기본값 사용)",
+                 None if cfg_path.exists() else "claire_check init")
+        missing = []
+        if not self.cfg["gmail"].get("accounts"):
+            missing.append("gmail.accounts")
+        if not self.cfg["gmail"].get("user_addresses"):
+            missing.append("gmail.user_addresses")
+        if not self.cfg.get("calendars"):
+            missing.append("calendars")
+        elif sum(1 for c in self.cfg["calendars"] if c.get("write")) != 1:
+            missing.append("calendars[write=true] 정확히 1개")
+        self.add("data", "config_values", "fail" if missing else "ok",
+                 ("비어 있음: " + ", ".join(missing)) if missing else "계정·캘린더 설정 있음",
+                 f"{cfg_path} 에 config.example.json 을 참고해 채우세요" if missing else None)
+        mirror = Path(self.cfg["backup_mirror"]).expanduser()
+        self.add("data", "backup_mirror", "ok" if (mirror.exists() or mirror.parent.exists()) else "warn",
+                 f"{mirror} ({'있음' if mirror.exists() else '첫 백업 때 생성'})")
+
+    # -- Google -------------------------------------------------------------
+    def check_google(self):
+        import google_api  # noqa: WPS433
+        cs = google_api.client_summary(self.cfg)
+        if not cs.get("present"):
+            self.add("google", "oauth_client", "fail", f"{cs['path']} 없음",
+                     "gog 를 설치·설정하거나 config.google.oauth_client_file 을 지정하세요")
+        elif cs.get("error"):
+            self.add("google", "oauth_client", "fail", cs["error"])
+        else:
+            self.add("google", "oauth_client", "ok", f"{cs['kind']} 클라이언트 …{cs['client_id_suffix'][-8:]}")
+
+        write_cal = [c for c in self.cfg["calendars"] if c.get("write")]
+        for email in self.cfg["gmail"]["accounts"]:
+            ts = google_api.token_summary(self.cfg, email, "read")
+            name = f"token:{email}:read"
+            if not ts["present"]:
+                self.add("google", name, "fail", "읽기 전용 토큰 없음",
+                         f"python3 connectors/google_api.py authorize {email} --kind read")
+                self.add("google", f"gmail:{email}", "skip", "토큰 없음")
+                continue
+            problems = []
+            if not ts["mode_ok"]:
+                problems.append(f"권한 {ts['mode']} (600 이어야 함)")
+            if not ts["scopes_ok"]:
+                problems.append(f"범위 부족 {ts['missing_scopes']}")
+            if ts["has_write_scope"]:
+                problems.append("쓰기 범위가 섞여 있음 (D1 위반)")
+            if ts.get("email") and ts["email"].lower() != email.lower():
+                problems.append(f"토큰 계정 {ts['email']} ≠ {email}")
+            self.add("google", name, "fail" if problems else "ok",
+                     "; ".join(problems) if problems else f"scopes {len(ts['scopes'])}개, 발급 {ts['obtained_at']}",
+                     f"python3 connectors/google_api.py authorize {email} --kind read" if problems else None)
+            if self.offline:
+                self.add("google", f"gmail:{email}", "skip", "--offline")
+                continue
+            try:
+                prof = google_api.ping_gmail(self.cfg, email)
+                ok = (prof.get("emailAddress") or "").lower() == email.lower()
+                self.add("google", f"gmail:{email}", "ok" if ok else "fail",
+                         f"profile {prof.get('emailAddress')} historyId={prof.get('historyId')} "
+                         f"messages={prof.get('messagesTotal')}",
+                         None if ok else "토큰이 다른 계정으로 발급되었습니다. 다시 authorize 하세요")
+            except ClaireError as e:
+                self.add("google", f"gmail:{email}", "fail", e.message,
+                         f"python3 connectors/google_api.py authorize {email} --kind read")
+
+        for cal in self.cfg["calendars"]:
+            name = f"calendar:{cal['name']}"
+            email = cal["account"]
+            if email not in self.cfg["gmail"]["accounts"]:
+                self.add("google", name, "warn", f"계정 {email} 이 gmail.accounts 에 없음")
+            tp = google_api.token_path(email, "read")
+            if not tp.exists():
+                self.add("google", name, "skip", f"{email} 토큰 없음")
+                continue
+            if self.offline:
+                self.add("google", name, "skip", "--offline", id=cal["id"], mode=cal["mode"])
+                continue
+            try:
+                info = google_api.ping_calendar(self.cfg, email, cal["id"])
+                role = info.get("accessRole")
+                need_write = bool(cal.get("write"))
+                ok = role in ("owner", "writer") if need_write else role in ("owner", "writer", "reader")
+                self.add("google", name, "ok" if ok else "fail",
+                         f"{info.get('summary')} · {role} · mode={cal['mode']}"
+                         + (" · write" if need_write else ""), None if ok else "캘린더 공유 권한을 확인하세요",
+                         id=cal["id"])
+            except ClaireError as e:
+                self.add("google", name, "fail", e.message, id=cal["id"])
+        for cal in write_cal:
+            tp = google_api.token_path(cal["account"], "write")
+            self.add("google", f"token:{cal['account']}:write", "ok" if tp.exists() else "warn",
+                     "쓰기 토큰 있음" if tp.exists() else "쓰기 토큰 없음 — 4단계(외부 반영)에서 발급",
+                     None if tp.exists() else
+                     f"(4단계) python3 connectors/google_api.py authorize {cal['account']} --kind write")
+
+    # -- Obsidian -----------------------------------------------------------
+    def check_obsidian(self):
+        import obsidian_tasks
+        root = obsidian_tasks.vault_path(self.cfg)
+        if not root.is_dir():
+            self.add("obsidian", "vault", "fail", f"{root} 없음", "config.obsidian.vault 를 확인하세요")
+            return
+        self.add("obsidian", "vault", "ok", f"{root} ({'iCloud' if is_synced_location(root) else '로컬'})")
+        daily = root / self.cfg["obsidian"]["daily_folder"]
+        self.add("obsidian", "daily_folder", "ok" if daily.is_dir() else "warn", str(daily))
+        guide = root / self.cfg["obsidian"].get("navigation_guide", "Vault_Navigation_Guide.md")
+        self.add("obsidian", "navigation_guide", "ok" if guide.exists() else "warn", str(guide))
+        for ex in self.cfg["obsidian"]["exclude_folders"]:
+            p = root / ex
+            if not ex.startswith("."):
+                self.add("obsidian", f"exclude:{ex}", "ok" if p.is_dir() else "warn",
+                         "제외 대상 존재" if p.is_dir() else "폴더 없음 (제외 규칙만 유지)")
+        try:
+            res = obsidian_tasks.scan_vault(self.cfg)
+            self.add("obsidian", "tasks_scan", "ok" if res["tasks"] else "warn",
+                     f"파일 {res['files_seen']}개, {self.cfg['obsidian']['tag']} 줄 {res['tasks']}건 "
+                     f"{res['by_state']}, 🆔 있음 {res['with_id']}건",
+                     None if res["tasks"] else "#tasks 줄이 하나도 없습니다. 태그·볼트 경로를 확인하세요")
+            files_with_tasks = {t["file"] for t in res["items"]}
+            self.add("obsidian", "write_access", "ok" if os.access(root, os.W_OK) else "fail",
+                     f"쓰기 가능 여부 (4단계용). Tasks 있는 파일 {len(files_with_tasks)}개")
+        except ClaireError as e:
+            self.add("obsidian", "tasks_scan", "fail", e.message)
+
+    # -- Discord ------------------------------------------------------------
+    def check_discord(self):
+        import discord_files
+        s = discord_files.inbound_summary(self.cfg)
+        if not s["present"]:
+            self.add("discord", "inbound_media_dir", "fail", f"{s['path']} 없음",
+                     "OpenClaw 첨부 저장 경로를 config.discord.inbound_media_dir 에 지정하세요")
+        else:
+            self.add("discord", "inbound_media_dir", "ok" if s["readable"] else "fail",
+                     f"{s['path']} · 파일 {s['files']}개 (이미지 {s['images']}개)",
+                     recent=s["recent"])
+        tok = Path("~/.openclaw/claire-discord-token.txt").expanduser()
+        self.add("discord", "claire_agent_token", "ok" if tok.exists() else "warn",
+                 "OpenClaw Claire 에이전트 토큰 파일 있음 (내용은 읽지 않음)" if tok.exists()
+                 else "OpenClaw 에 Claire 에이전트 토큰이 없음")
+        self.add("discord", "message_id_passthrough", "warn",
+                 "브리지가 message_id·첨부 경로·원 시각을 넘기는지는 실제 메시지로 확인해야 합니다. "
+                 "없어도 sha256·fingerprint 2단 멱등성으로 동작합니다 (§6.4)",
+                 "2단계 첫 이미지 입력 때 claire_sync ingest-discord 인자를 확인")
+
+    # -- OpenClaw (2단계: 에이전트 연결·cron) -------------------------------
+    def check_openclaw(self):
+        ws = Path("~/.openclaw/workspace-claire").expanduser()
+        if not ws.is_dir():
+            self.add("openclaw", "workspace", "warn", f"{ws} 없음 (OpenClaw Claire 에이전트 미구성)")
+            return
+        sk = ws / "skills" / "claire-schedule-manager" / "SKILL.md"
+        here = Path(__file__).resolve().parent.parent / "SKILL.md"
+        same = sk.exists() and here.exists() and sk.read_bytes() == here.read_bytes()
+        self.add("openclaw", "workspace_skill", "ok" if same else ("warn" if sk.exists() else "fail"),
+                 f"{sk} ({'최신' if same else '설치본과 다름' if sk.exists() else '없음'})",
+                 None if same else "install.sh 를 다시 실행하세요")
+        if self.offline or not shutil.which("openclaw"):
+            self.add("openclaw", "cron_daily", "skip", "--offline 또는 openclaw 미설치")
+            return
+        try:
+            out = subprocess.run(["openclaw", "cron", "list", "--json"], capture_output=True, text=True, timeout=30)
+            data = json.loads(out.stdout)
+            jobs = data if isinstance(data, list) else data.get("jobs") or data.get("automations") or []
+            job = next((j for j in jobs if j.get("agentId") == "claire" and
+                        (j.get("declarationKey") == "claire-daily-check" or "일일 점검" in (j.get("name") or ""))), None)
+            if job is None:
+                self.add("openclaw", "cron_daily", "fail", "Claire 06:00 cron 없음",
+                         "references/doctor.md 의 cron 등록 명령을 실행하세요")
+            else:
+                sch = job.get("schedule") or {}
+                ok = job.get("enabled", True) and sch.get("expr") == "0 6 * * *" and sch.get("tz") == "Asia/Seoul"
+                self.add("openclaw", "cron_daily", "ok" if ok else "warn",
+                         f"{job.get('name')} · {sch.get('expr')} @ {sch.get('tz')} · enabled={job.get('enabled')} · "
+                         f"last={job.get('lastRunStatus') or job.get('state', {}).get('lastRunStatus')}")
+        except (subprocess.TimeoutExpired, json.JSONDecodeError, OSError) as e:
+            self.add("openclaw", "cron_daily", "warn", f"cron 목록을 읽지 못함: {e}")
+
+    def run(self) -> dict:
+        self.check_env()
+        self.check_data()
+        self.check_google()
+        self.check_obsidian()
+        self.check_discord()
+        self.check_openclaw()
+        tally = {s: sum(1 for c in self.checks if c["status"] == s) for s in ("ok", "warn", "fail", "skip")}
+        blocking = [c for c in self.checks if c["status"] == "fail"]
+        return {"claire_version": CLAIRE_VERSION, "offline": self.offline, "checked_at": now_iso(self.cfg),
+                "all_green": not blocking and tally["skip"] == 0 and not self.offline,
+                "tally": tally, "checks": self.checks,
+                "next_steps": [c["fix"] for c in self.checks if c.get("fix")],
+                "text": self.render()}
+
+    def render(self) -> str:
+        icon = {"ok": "✅", "warn": "⚠️ ", "fail": "❌", "skip": "⏭️ "}
+        w = max(len(c["name"]) for c in self.checks) + 2
+        lines = [f"Claire doctor — {CLAIRE_VERSION} · {'offline' if self.offline else 'live'}"]
+        area = None
+        for c in self.checks:
+            if c["area"] != area:
+                area = c["area"]
+                lines.append(f"\n[{area}]")
+            lines.append(f"  {icon[c['status']]} {c['name']:<{w}} {c['detail']}")
+            if c.get("fix"):
+                lines.append(f"     ↳ {c['fix']}")
+        return "\n".join(lines)
+
+
+def cmd_doctor(args, cfg):
+    return Doctor(cfg, offline=args.offline).run()
+
+
+def cmd_calibrate(args, cfg):
+    conn = connect(create=False)
+    n = conn.execute("SELECT COUNT(*) c FROM outbox WHERE op LIKE 'calendar.%' AND requires_confirm=1").fetchone()["c"]
+    return {"samples": n, "current_auto_merge_threshold": cfg["auto_merge_threshold"],
+            "verdict": "근거 부족. 5단계 재검토 조건(§15.1)을 채우기 전에는 임계값을 낮추지 않습니다."}
+
+
+def build_parser():
+    p = argparse.ArgumentParser(prog="claire_check", description="Claire 초기화·무결성·백업·진단")
+    sub = p.add_subparsers(dest="cmd")
+    n = sub.add_parser("init", help="데이터 디렉터리와 스키마 생성 (멱등)")
+    n.set_defaults(fn=cmd_init)
+    i = sub.add_parser("integrity", help="무결성 검사 (§10)")
+    i.add_argument("--strict", action="store_true")
+    i.set_defaults(fn=cmd_integrity)
+    b = sub.add_parser("backup", help="백업 생성 (§10)")
+    b.add_argument("--out")
+    b.add_argument("--no-mirror", action="store_true")
+    b.set_defaults(fn=cmd_backup)
+    r = sub.add_parser("restore-test", help="백업 복구 시험 (TC20)")
+    r.add_argument("--from", dest="from_path", required=True)
+    r.set_defaults(fn=cmd_restore_test)
+    d = sub.add_parser("doctor", help="연결 진단 (§4.3 확인 사항 실측)")
+    d.add_argument("--offline", action="store_true", help="네트워크 호출 없이 파일·설정만 검사")
+    d.add_argument("--format", choices=["json", "text"], default="json")
+    d.set_defaults(fn=cmd_doctor)
+    c = sub.add_parser("calibrate", help="임계값 조정 근거 (5단계)")
+    c.set_defaults(fn=cmd_calibrate)
+    return p
+
+
+if __name__ == "__main__":
+    run_cli(build_parser, lambda args, cfg: args.fn(args, cfg))

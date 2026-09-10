@@ -1,0 +1,328 @@
+#!/usr/bin/env python3
+"""claire_run — 실행 관리 (PRD §8).
+
+  begin  --kind daily|on_demand|source_only|apply|backup --trigger <who>
+         잠금 획득(BEGIN IMMEDIATE + run 행). 진행 중 실행이 있으면 그 run_id를 돌려주고
+         joined=true 로 표시한다 (S11, TC13). 마지막 성공 daily가 missed_hours(26h) 이전이면
+         delayed=1 (S13, TC22).
+  step   --run <id> --name <step> --status ok|failed|skipped [--detail ...] [--error ...]
+         단계별 상태를 run.steps 에 누적한다.
+  brief  --run <id> --file briefing.md [--kind morning|on_demand|answer_ack]
+         content_hash 로 중복 발송을 막고 briefing 행을 남긴다. 질문 asked_count 갱신은
+         3단계에서 붙는다.
+  end    --run <id> [--status ...] [--summary <json>] [--reason ...]
+         필수 단계(sync·propose·brief)가 빠졌거나 실패한 단계가 있으면 partial 로 닫는다.
+  status 진행 중 실행, 마지막 daily, 미실행 여부.
+  missed [--notify]
+         마지막 성공 daily가 missed_hours 이전인지 판정. --notify 면 outbox 에 안내문을
+         하루 1건만 남긴다 (§8.4).
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from datetime import timedelta
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from claire_core import (  # noqa: E402
+    ClaireError, RUN_KINDS, connect, get_run, hours_between, now_dt, now_iso, parse_iso,
+    run_cli, sha256_text, tx,
+)
+
+STEP_STATUSES = ["ok", "failed", "skipped"]
+
+
+def _steps(row) -> list:
+    return json.loads(row["steps"]) if row["steps"] else []
+
+
+def _last_daily(conn):
+    return conn.execute(
+        "SELECT * FROM run WHERE kind='daily' AND status IN ('ok','partial') "
+        "ORDER BY id DESC LIMIT 1").fetchone()
+
+
+def _missed_eval(conn, cfg, now_s: str) -> dict:
+    last = _last_daily(conn)
+    limit = float(cfg["run"]["missed_hours"])
+    if last is None:
+        return {"missed": False, "reason": "성공한 daily 실행이 아직 없습니다", "last_daily_at": None,
+                "hours_since": None, "limit_hours": limit}
+    hrs = hours_between(last["started_at"], now_s)
+    return {"missed": hrs > limit, "last_daily_at": last["started_at"], "last_daily_run_id": last["id"],
+            "hours_since": round(hrs, 1), "limit_hours": limit}
+
+
+def cmd_begin(args, cfg):
+    conn = connect(create=False)
+    now_s = now_iso(cfg)
+    stale_min = int(cfg["run"]["stale_run_minutes"])
+    with tx(conn):
+        running = conn.execute(
+            "SELECT * FROM run WHERE status='running' ORDER BY id DESC LIMIT 1").fetchone()
+        if running is not None:
+            age_min = hours_between(running["started_at"], now_s) * 60
+            if age_min <= stale_min:
+                return {"run_id": running["id"], "joined": True, "kind": running["kind"],
+                        "trigger": running["trigger"], "started_at": running["started_at"],
+                        "delayed": bool(running["delayed"]), "steps": _steps(running),
+                        "message": "진행 중인 실행에 합류했습니다. 결과만 전달하세요 (S11)."}
+            conn.execute(
+                "UPDATE run SET status='aborted', finished_at=?, summary=? WHERE id=?",
+                (now_s, json.dumps({"reason": f"stale: {int(age_min)}분 동안 종료되지 않음"},
+                                   ensure_ascii=False), running["id"]))
+        missed = _missed_eval(conn, cfg, now_s)
+        delayed = 1 if (args.kind in ("daily", "on_demand") and missed["missed"]) else 0
+        cur = conn.execute(
+            "INSERT INTO run(kind,trigger,started_at,status,delayed,steps) VALUES(?,?,?,?,?,?)",
+            (args.kind, args.trigger, now_s, "running", delayed, "[]"))
+        run_id = cur.lastrowid
+    out = {"run_id": run_id, "joined": False, "kind": args.kind, "trigger": args.trigger,
+           "started_at": now_s, "delayed": bool(delayed)}
+    if delayed:
+        sched = now_dt(cfg).replace(hour=int(cfg["run"]["daily_hour"]), minute=0, second=0)
+        out["delayed_note"] = (f"지연 실행(예정 {sched.strftime('%H:%M')}, "
+                               f"실제 {now_dt(cfg).strftime('%H:%M')}) — 마지막 daily "
+                               f"{missed['last_daily_at']} 이후 {missed['hours_since']}시간")
+    return out
+
+
+def cmd_step(args, cfg):
+    conn = connect(create=False)
+    now_s = now_iso(cfg)
+    with tx(conn):
+        run = get_run(conn, args.run)
+        if run["status"] != "running":
+            raise ClaireError("run_not_running", f"실행 {args.run}은 이미 {run['status']} 상태입니다.")
+        steps = _steps(run)
+        entry = {"name": args.name, "status": args.status, "at": now_s}
+        if args.detail:
+            try:
+                entry["detail"] = json.loads(args.detail)
+            except json.JSONDecodeError:
+                entry["detail"] = args.detail
+        if args.error:
+            entry["error"] = args.error
+        steps.append(entry)
+        conn.execute("UPDATE run SET steps=? WHERE id=?",
+                     (json.dumps(steps, ensure_ascii=False), run["id"]))
+    return {"run_id": run["id"], "step": entry, "step_count": len(steps)}
+
+
+def cmd_brief(args, cfg):
+    conn = connect(create=False)
+    now_s = now_iso(cfg)
+    text = Path(args.file).read_text(encoding="utf-8") if args.file else (sys.stdin.read())
+    if not text.strip():
+        raise ClaireError("empty_briefing", "브리핑 본문이 비어 있습니다.")
+    h = sha256_text(text.strip())
+    with tx(conn):
+        run = get_run(conn, args.run)
+        if run["status"] != "running":
+            raise ClaireError("run_not_running", f"실행 {args.run}은 이미 {run['status']} 상태입니다.")
+        dup = conn.execute(
+            "SELECT b.id, b.run_id, b.sent_at FROM briefing b WHERE b.content_hash=? "
+            "AND substr(b.sent_at,1,10)=? ORDER BY b.id DESC LIMIT 1", (h, now_s[:10])).fetchone()
+        if dup is not None:
+            return {"run_id": run["id"], "duplicate": True, "briefing_id": dup["id"],
+                    "message": "같은 내용의 브리핑이 오늘 이미 기록되어 있습니다. 다시 보내지 마세요."}
+        import re
+        item_refs = sorted(set(re.findall(r"\bCLR-\d+\b", text)))
+        q_refs = sorted(set(re.findall(r"\bQ-\d+\b", text)))
+        cur = conn.execute(
+            "INSERT INTO briefing(run_id,kind,content_hash,item_refs,question_refs,sent_at,delivery) "
+            "VALUES(?,?,?,?,?,?,?)",
+            (run["id"], args.kind, h, json.dumps(item_refs), json.dumps(q_refs), now_s, "sent"))
+        asked = _mark_questions_asked(conn, cfg, q_refs, now_s)
+        steps = _steps(run)
+        steps.append({"name": "brief", "status": "ok", "at": now_s,
+                      "detail": {"briefing_id": cur.lastrowid, "chars": len(text), "questions_asked": asked}})
+        conn.execute("UPDATE run SET steps=? WHERE id=?",
+                     (json.dumps(steps, ensure_ascii=False), run["id"]))
+    return {"run_id": run["id"], "duplicate": False, "briefing_id": cur.lastrowid,
+            "content_hash": h, "item_refs": item_refs, "question_refs": q_refs, "questions_asked": asked,
+            "message": "브리핑을 기록했습니다. 채널에 전송하세요."}
+
+
+WEEKDAYS = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6}
+
+
+def _next_ask(cfg, now, asked_count: int, due_at: str | None) -> str:
+    """D6: 첫 질문 뒤 두 번의 아침까지 매일, 이후 주 1회(월). 마감 48h 이내면 매일."""
+    fu = cfg["followup"]
+    tomorrow = (now + timedelta(days=1)).replace(hour=int(cfg["run"]["daily_hour"]), minute=0, second=0)
+    urgent = False
+    if due_at:
+        try:
+            urgent = (parse_iso(due_at) - now).total_seconds() <= fu["reask_urgent_hours"] * 3600
+        except ValueError:
+            urgent = False
+    if urgent or asked_count <= int(fu["reask_daily_days"]):
+        return tomorrow.isoformat()
+    wd = WEEKDAYS.get(str(fu.get("reask_weekday", "mon")).lower(), 0)
+    days = (wd - now.weekday()) % 7 or 7
+    return (now + timedelta(days=days)).replace(hour=int(cfg["run"]["daily_hour"]), minute=0, second=0).isoformat()
+
+
+def _mark_questions_asked(conn, cfg, q_refs: list[str], now_s: str) -> list[dict]:
+    """같은 질문을 하루에 두 번 보내지 않는다. 오늘 이미 물었으면 카운트하지 않는다."""
+    now = now_dt(cfg)
+    out = []
+    for ref in q_refs:
+        q = conn.execute("SELECT q.*, i.due_at FROM question q LEFT JOIN item i ON i.id=q.item_id WHERE q.ref=?",
+                         (ref,)).fetchone()
+        if q is None or q["status"] != "open":
+            continue
+        if q["last_asked_at"] and q["last_asked_at"][:10] == now_s[:10]:
+            out.append({"ref": ref, "asked_count": q["asked_count"], "note": "오늘 이미 질문함"})
+            continue
+        count = q["asked_count"] + 1
+        nxt = _next_ask(cfg, now, count, q["due_at"])
+        conn.execute("UPDATE question SET asked_count=?, first_asked_at=COALESCE(first_asked_at,?), "
+                     "last_asked_at=?, next_ask_at=? WHERE id=?", (count, now_s, now_s, nxt, q["id"]))
+        out.append({"ref": ref, "asked_count": count, "next_ask_at": nxt})
+    return out
+
+
+def _compute_status(cfg, run, steps) -> tuple[str, list[str]]:
+    reasons = []
+    failed = [s["name"] for s in steps if s.get("status") == "failed"]
+    if failed:
+        reasons.append("실패 단계: " + ", ".join(failed))
+    if run["kind"] in ("daily", "on_demand"):
+        done = {s["name"] for s in steps if s.get("status") == "ok"}
+        missing = [s for s in cfg["run"]["required_steps"] if s not in done]
+        if missing:
+            reasons.append("누락 단계: " + ", ".join(missing))
+    return ("partial" if reasons else "ok"), reasons
+
+
+def cmd_end(args, cfg):
+    conn = connect(create=False)
+    now_s = now_iso(cfg)
+    backup = None
+    if args.backup:
+        import subprocess, os
+        here = Path(__file__).resolve().parent
+        proc = subprocess.run([sys.executable, str(here / "claire_check"), "backup"], capture_output=True, text=True,
+                              env=dict(os.environ))
+        try:
+            b = json.loads(proc.stdout)
+        except json.JSONDecodeError:
+            b = {"ok": False, "error": {"message": proc.stderr[-300:]}}
+        backup = {"ok": bool(b.get("ok")), "dir": b.get("backup_dir"), "error": (b.get("error") or {}).get("message")}
+        with tx(conn):
+            run = get_run(conn, args.run)
+            steps = _steps(run)
+            steps.append({"name": "backup", "status": "ok" if backup["ok"] else "failed", "at": now_iso(cfg),
+                          "detail": backup})
+            conn.execute("UPDATE run SET steps=? WHERE id=?", (json.dumps(steps, ensure_ascii=False), run["id"]))
+    with tx(conn):
+        run = get_run(conn, args.run)
+        if run["status"] != "running":
+            raise ClaireError("run_not_running", f"실행 {args.run}은 이미 {run['status']} 상태입니다.")
+        steps = _steps(run)
+        status, reasons = _compute_status(cfg, run, steps)
+        if args.status:
+            if args.status == "ok" and reasons:
+                raise ClaireError("cannot_close_ok",
+                                  "필수 단계가 빠졌거나 실패한 단계가 있어 ok 로 닫을 수 없습니다.",
+                                  reasons=reasons)
+            status = args.status
+        if args.reason:
+            reasons.append(args.reason)
+        summary = {}
+        if args.summary:
+            try:
+                summary = json.loads(args.summary)
+            except json.JSONDecodeError:
+                raise ClaireError("bad_summary", "--summary 는 JSON 이어야 합니다.")
+        summary["reasons"] = reasons
+        summary["duration_seconds"] = int((parse_iso(now_s) - parse_iso(run["started_at"])).total_seconds())
+        conn.execute("UPDATE run SET status=?, finished_at=?, summary=? WHERE id=?",
+                     (status, now_s, json.dumps(summary, ensure_ascii=False), run["id"]))
+    return {"run_id": run["id"], "status": status, "finished_at": now_s, "reasons": reasons,
+            "steps": steps, "summary": summary, "backup": backup}
+
+
+def cmd_status(args, cfg):
+    conn = connect(create=False)
+    now_s = now_iso(cfg)
+    running = conn.execute("SELECT * FROM run WHERE status='running' ORDER BY id DESC LIMIT 1").fetchone()
+    last_by_kind = {}
+    for k in RUN_KINDS:
+        r = conn.execute("SELECT * FROM run WHERE kind=? ORDER BY id DESC LIMIT 1", (k,)).fetchone()
+        if r:
+            last_by_kind[k] = {"run_id": r["id"], "status": r["status"], "started_at": r["started_at"],
+                               "finished_at": r["finished_at"], "delayed": bool(r["delayed"])}
+    sync = [dict(r) for r in conn.execute("SELECT * FROM sync_state ORDER BY platform, account")]
+    return {"now": now_s,
+            "running": None if running is None else {
+                "run_id": running["id"], "kind": running["kind"], "trigger": running["trigger"],
+                "started_at": running["started_at"], "steps": _steps(running)},
+            "last_by_kind": last_by_kind, "missed": _missed_eval(conn, cfg, now_s),
+            "sync_state": sync}
+
+
+def cmd_missed(args, cfg):
+    conn = connect(create=False)
+    now_s = now_iso(cfg)
+    res = _missed_eval(conn, cfg, now_s)
+    hour = int(cfg["run"]["daily_hour"])
+    res["message"] = (f"{hour:02d}:00 점검이 실행되지 않았습니다 (마지막 성공 {res['last_daily_at']}). "
+                      "'지금 전체 점검'으로 요청해 주세요." if res["missed"] else None)
+    if res["missed"] and args.notify:
+        key = f"discord.notice:missed:{now_s[:10]}"
+        with tx(conn):
+            exists = conn.execute("SELECT id, status FROM outbox WHERE dedupe_key=?", (key,)).fetchone()
+            if exists is None:
+                conn.execute(
+                    "INSERT INTO outbox(op,item_id,payload,dedupe_key,requires_confirm,status,created_at) "
+                    "VALUES('discord.notice',NULL,?,?,0,'pending',?)",
+                    (json.dumps({"text": res["message"]}, ensure_ascii=False), key, now_s))
+                res["queued"] = True
+            else:
+                res["queued"] = False
+                res["already_queued_id"] = exists["id"]
+    return res
+
+
+def build_parser():
+    p = argparse.ArgumentParser(prog="claire_run", description="Claire 실행 관리 (PRD §8)")
+    sub = p.add_subparsers(dest="cmd")
+    b = sub.add_parser("begin", help="실행 시작·잠금")
+    b.add_argument("--kind", choices=RUN_KINDS, required=True)
+    b.add_argument("--trigger", required=True, help="cron | user:<message id> | launchd")
+    b.set_defaults(fn=cmd_begin)
+    s = sub.add_parser("step", help="단계 기록")
+    s.add_argument("--run", type=int, required=True)
+    s.add_argument("--name", required=True)
+    s.add_argument("--status", choices=STEP_STATUSES, default="ok")
+    s.add_argument("--detail")
+    s.add_argument("--error")
+    s.set_defaults(fn=cmd_step)
+    br = sub.add_parser("brief", help="브리핑 기록 (중복 발송 방지)")
+    br.add_argument("--run", type=int, required=True)
+    br.add_argument("--file")
+    br.add_argument("--kind", choices=["morning", "on_demand", "answer_ack"], default="morning")
+    br.set_defaults(fn=cmd_brief)
+    e = sub.add_parser("end", help="실행 종료")
+    e.add_argument("--run", type=int, required=True)
+    e.add_argument("--status", choices=["ok", "partial", "failed", "aborted"])
+    e.add_argument("--summary")
+    e.add_argument("--reason")
+    e.add_argument("--backup", action="store_true", help="종료 전에 claire_check backup 실행 (§10 쓰기 발생일 1회)")
+    e.set_defaults(fn=cmd_end)
+    st = sub.add_parser("status", help="실행 상태")
+    st.set_defaults(fn=cmd_status)
+    m = sub.add_parser("missed", help="미실행 감지")
+    m.add_argument("--notify", action="store_true")
+    m.set_defaults(fn=cmd_missed)
+    return p
+
+
+if __name__ == "__main__":
+    run_cli(build_parser, lambda args, cfg: args.fn(args, cfg))

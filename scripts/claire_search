@@ -1,0 +1,437 @@
+#!/usr/bin/env python3
+"""claire_search — 조회 (PRD §8.1 6단계, §11). DB만 읽는다.
+
+2단계 범위:
+  review   [--run ID]                    브리핑 재료 일괄 조회
+  today    [--date YYYY-MM-DD]           오늘 일정·마감·예정
+  week     [--date YYYY-MM-DD]           이번 주(7일) 마감·일정
+  overdue                                기한 지난 미완료
+  questions [--due-now]                  열린 질문
+  show --item CLR-0001                   항목 상세 (출처·질문·이력·연결)
+  find --q "심사 의견" [--status open|all|done] [--project] [--since] [--until]   한국어 검색 (근거 포함)
+  history --item CLR-0001                변경 이력
+  trace --source-event 981 | --item CLR  원문 역추적 (원문 → 항목 → 이력)
+  waiting [--who "김 교수"]               답변 대기 항목
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from datetime import datetime, timedelta
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import sqlite3  # noqa: E402
+import unicodedata  # noqa: E402
+from claire_core import (  # noqa: E402
+    ClaireError, OPEN_STATUSES, connect, fts_query, get_item, hits, now_dt, now_iso, parse_iso, ref_order_sql,
+    run_cli, tokenize, tz_of,
+)
+
+OPEN_SQL = "status IN (" + ",".join(f"'{s}'" for s in OPEN_STATUSES) + ")"
+
+
+def _item(r) -> dict:
+    d = dict(r)
+    return {k: d.get(k) for k in ("ref", "title", "kind", "status", "priority", "project", "start_at", "end_at",
+                                  "all_day", "due_at", "scheduled_on", "tentative", "confidence", "waiting_on",
+                                  "next_check_at", "next_action", "done_criteria", "updated_at")}
+
+
+def _day_bounds(cfg, day: str) -> tuple[str, str]:
+    off = now_dt(cfg).strftime("%z"); off = off[:3] + ":" + off[3:]
+    return f"{day}T00:00:00{off}", f"{day}T23:59:59{off}"
+
+
+def _local_day(ts: str | None, cfg) -> str | None:
+    if not ts:
+        return None
+    if len(ts) == 10:
+        return ts
+    try:
+        return parse_iso(ts).astimezone(tz_of(cfg)).strftime("%Y-%m-%d")
+    except ValueError:
+        return ts[:10]
+
+
+def _meetings_on(conn, cfg, day: str) -> list[dict]:
+    out = []
+    for r in conn.execute(f"SELECT * FROM item WHERE deleted_at IS NULL AND kind='meeting' AND {OPEN_SQL} "
+                          "AND start_at IS NOT NULL"):
+        if _local_day(r["start_at"], cfg) == day:
+            d = _item(r)
+            d["preps"] = [dict(p) for p in conn.execute(
+                "SELECT i.ref, i.title, i.status FROM relation rl JOIN item i ON i.id=rl.from_item_id "
+                "WHERE rl.rel_type='prep_for' AND rl.to_item_id=?", (r["id"],))]
+            d["link_status"] = [l["sync_status"] for l in conn.execute(
+                "SELECT sync_status FROM link WHERE item_id=? AND system='calendar'", (r["id"],))]
+            d["questions"] = [q["ref"] for q in conn.execute(
+                "SELECT ref FROM question WHERE item_id=? AND status='open'", (r["id"],))]
+            out.append(d)
+    out.sort(key=lambda x: x["start_at"] or "")
+    return out
+
+
+def _overlay_on(conn, cfg, day: str) -> list[dict]:
+    """overlay 캘린더(Family·HUR Group)의 그날 이벤트. 항목은 없고 겹침 확인용."""
+    out = []
+    for r in conn.execute("SELECT id, headers, excerpt FROM source_event WHERE platform='calendar' "
+                          "AND ignore_reason='overlay' ORDER BY id"):
+        h = json.loads(r["headers"] or "{}")
+        if h.get("status") == "cancelled":
+            continue
+        if _local_day(h.get("start"), cfg) == day:
+            out.append({"source_event_id": r["id"], "calendar": h.get("calendar"), "summary": h.get("summary"),
+                        "start": h.get("start"), "end": h.get("end"), "all_day": h.get("all_day"),
+                        "location": h.get("location")})
+    # 같은 이벤트의 여러 버전(etag) 중 마지막만
+    dedup = {}
+    for o in out:
+        dedup[(o["calendar"], o["summary"], o["start"])] = o
+    return sorted(dedup.values(), key=lambda x: x["start"] or "")
+
+
+def _overlaps(meetings: list[dict], overlays: list[dict]) -> list[dict]:
+    def span(s, e):
+        if not s or len(s) == 10:
+            return None
+        try:
+            a = parse_iso(s); b = parse_iso(e) if e and len(e) > 10 else a + timedelta(hours=1)
+            return a, b
+        except ValueError:
+            return None
+    blocks = [(m["ref"], m["title"], span(m["start_at"], m["end_at"])) for m in meetings]
+    blocks += [(f"overlay:{o['calendar']}", o["summary"], span(o["start"], o["end"])) for o in overlays]
+    found = []
+    for i in range(len(blocks)):
+        for j in range(i + 1, len(blocks)):
+            a, b = blocks[i][2], blocks[j][2]
+            if a and b and a[0] < b[1] and b[0] < a[1]:
+                found.append({"a": blocks[i][0], "a_title": blocks[i][1], "b": blocks[j][0], "b_title": blocks[j][1]})
+    return found
+
+
+def _due_between(conn, cfg, start: str, end: str) -> list[dict]:
+    rows = [_item(r) for r in conn.execute(
+        f"SELECT * FROM item WHERE deleted_at IS NULL AND {OPEN_SQL} AND due_at IS NOT NULL "
+        "AND due_at >= ? AND due_at <= ? ORDER BY due_at", (start, end))]
+    return rows
+
+
+def _overdue(conn, cfg, now_s: str) -> list[dict]:
+    return [_item(r) for r in conn.execute(
+        f"SELECT * FROM item WHERE deleted_at IS NULL AND {OPEN_SQL} AND due_at IS NOT NULL AND due_at < ? "
+        "ORDER BY due_at", (now_s,))]
+
+
+def _open_questions(conn, now_s: str, due_now: bool) -> list[dict]:
+    out = []
+    for q in conn.execute("SELECT q.*, i.ref AS item_ref, i.title AS item_title FROM question q "
+                          "LEFT JOIN item i ON i.id=q.item_id WHERE q.status='open' ORDER BY q.id"):
+        if due_now and q["next_ask_at"] and q["next_ask_at"] > now_s:
+            continue
+        out.append({"ref": q["ref"], "item_ref": q["item_ref"], "item_title": q["item_title"], "field": q["field"],
+                    "question": q["question"], "options": json.loads(q["options"]) if q["options"] else None,
+                    "reason": q["reason"], "asked_count": q["asked_count"], "last_asked_at": q["last_asked_at"],
+                    "next_ask_at": q["next_ask_at"]})
+    return out
+
+
+def cmd_review(args, cfg):
+    conn = connect(create=False)
+    now = now_dt(cfg); now_s = now.isoformat(); today = now.strftime("%Y-%m-%d")
+    d0, d1 = _day_bounds(cfg, today)
+    imminent_end = _day_bounds(cfg, (now + timedelta(days=int(cfg["briefing"]["imminent_days"]))).strftime("%Y-%m-%d"))[1]
+
+    last_brief = conn.execute("SELECT sent_at FROM briefing WHERE kind='morning' ORDER BY id DESC LIMIT 1").fetchone()
+    since = last_brief["sent_at"] if last_brief else "0000"
+
+    meetings = _meetings_on(conn, cfg, today)
+    overlays = _overlay_on(conn, cfg, today)
+    new_items, changed = [], []
+    for r in conn.execute(
+        "SELECT a.action, a.field, a.old_value, a.new_value, a.reason, a.created_at, i.* FROM activity_log a "
+        "JOIN item i ON i.id=a.item_id WHERE a.created_at > ? AND a.undone_at IS NULL "
+        "AND a.action IN ('create','update','complete','link') ORDER BY a.id", (since,)):
+        d = _item(r)
+        if r["action"] == "create":
+            if r["status"] != "captured":
+                new_items.append(d)
+        else:
+            changed.append({**d, "change": {"action": r["action"], "field": r["field"], "old": r["old_value"],
+                                            "new": r["new_value"], "reason": r["reason"]}})
+    captured = [_item(r) for r in conn.execute(
+        "SELECT * FROM item WHERE deleted_at IS NULL AND status='captured' AND created_at > ? ORDER BY id", (since,))]
+    ignored = {r["ignore_reason"]: r["c"] for r in conn.execute(
+        "SELECT ignore_reason, COUNT(*) c FROM source_event WHERE triage='ignored' AND ingested_at > ? "
+        "GROUP BY ignore_reason", (since,))}
+    suspicious = [{"source_event_id": r["id"], "platform": r["platform"], "excerpt": (r["excerpt"] or "")[:120],
+                   "phrases": json.loads(r["headers"] or "{}").get("suspicious")}
+                  for r in conn.execute("SELECT id, platform, excerpt, headers FROM source_event "
+                                        "WHERE ignore_reason='suspicious' AND ingested_at > ?", (since,))]
+    links = [{"item_ref": r["ref"], "title": r["title"], "system": r["system"], "sync_status": r["sync_status"]}
+             for r in conn.execute("SELECT i.ref, i.title, l.system, l.sync_status FROM link l JOIN item i ON i.id=l.item_id "
+                                   "WHERE l.sync_status IN ('conflict','missing') AND i.deleted_at IS NULL")]
+    waiting = [_item(r) for r in conn.execute(
+        "SELECT * FROM item WHERE deleted_at IS NULL AND status='waiting' AND (next_check_at IS NULL OR next_check_at <= ?)",
+        (now_s,))]
+    outbox = {"done_since_last": [], "awaiting_confirm": [], "pending": 0, "failed": []}
+    for r in conn.execute("SELECT o.*, i.ref AS item_ref, i.title AS item_title FROM outbox o LEFT JOIN item i ON i.id=o.item_id "
+                          "WHERE (o.status='done' AND o.done_at > ?) OR o.status IN ('awaiting_confirm','pending','failed') ORDER BY o.id",
+                          (since,)):
+        p = json.loads(r["payload"])
+        entry = {"outbox_id": r["id"], "op": r["op"], "item_ref": r["item_ref"], "title": r["item_title"],
+                 "summary": p.get("title") or p.get("external_key") or "", "last_error": r["last_error"]}
+        if r["status"] == "done":
+            outbox["done_since_last"].append(entry)
+        elif r["status"] == "awaiting_confirm":
+            outbox["awaiting_confirm"].append(entry)
+        elif r["status"] == "failed":
+            outbox["failed"].append(entry)
+        else:
+            outbox["pending"] += 1
+    sync = [dict(r) for r in conn.execute("SELECT * FROM sync_state ORDER BY platform, account")]
+    stale = [s for s in sync if not s["last_success_at"] or s["last_success_at"] < d0]
+    pending = {r["platform"]: r["c"] for r in conn.execute(
+        "SELECT platform, COUNT(*) c FROM source_event WHERE triage='new' GROUP BY platform")}
+    run = None
+    if args.run:
+        rr = conn.execute("SELECT * FROM run WHERE id=?", (args.run,)).fetchone()
+        if rr:
+            run = {"run_id": rr["id"], "kind": rr["kind"], "started_at": rr["started_at"], "delayed": bool(rr["delayed"]),
+                   "steps": json.loads(rr["steps"] or "[]")}
+    return {
+        "now": now_s, "today": today, "weekday": "월화수목금토일"[now.weekday()], "run": run,
+        "last_briefing_at": last_brief["sent_at"] if last_brief else None,
+        "sync_state": sync, "stale_sources": stale, "pending_unprocessed": pending,
+        "today_meetings": meetings, "today_overlay": overlays, "overlaps": _overlaps(meetings, overlays),
+        "overdue": _overdue(conn, cfg, now_s),
+        "imminent": _due_between(conn, cfg, d0, imminent_end),
+        "new_items": new_items, "changed_items": changed, "captured": captured,
+        "waiting_check": waiting, "questions": _open_questions(conn, now_s, due_now=True),
+        "links_attention": links, "ignored_since_last": ignored, "suspicious": suspicious, "outbox": outbox,
+        "limits": {"section_limit": cfg["briefing"]["section_limit"], "imminent_days": cfg["briefing"]["imminent_days"]},
+        "data_as_of": max([s["last_success_at"] or "" for s in sync] + [""]) or None,
+    }
+
+
+def cmd_today(args, cfg):
+    conn = connect(create=False)
+    now = now_dt(cfg); day = args.date or now.strftime("%Y-%m-%d")
+    d0, d1 = _day_bounds(cfg, day)
+    if args.basis:
+        out = {"date": day, "basis": args.basis, "data_as_of": _data_as_of(conn)}
+        if args.basis == "due":
+            out["items"] = _due_between(conn, cfg, d0, d1)
+        elif args.basis == "scheduled":
+            out["items"] = [_item(r) for r in conn.execute(
+                f"SELECT * FROM item WHERE deleted_at IS NULL AND {OPEN_SQL} AND scheduled_on=? ORDER BY id", (day,))]
+        elif args.basis == "completed":
+            out["items"] = [_item(r) for r in conn.execute(
+                "SELECT * FROM item WHERE deleted_at IS NULL AND status='done' AND completed_at >= ? AND completed_at <= ?", (d0, d1))]
+        elif args.basis == "start":
+            out["items"] = _meetings_on(conn, cfg, day)
+        limit_days = int(cfg["obsidian"].get("completed_days", 90))
+        if args.basis == "completed" and (now - datetime.strptime(day, "%Y-%m-%d").replace(tzinfo=tz_of(cfg))).days > limit_days:
+            out["note"] = f"완료 이력 보존 범위({limit_days}일) 밖입니다. 결과가 불완전할 수 있습니다 (D2)"
+        return out
+    scheduled = [_item(r) for r in conn.execute(
+        f"SELECT * FROM item WHERE deleted_at IS NULL AND {OPEN_SQL} AND scheduled_on=? ORDER BY id", (day,))]
+    completed = [_item(r) for r in conn.execute(
+        "SELECT * FROM item WHERE deleted_at IS NULL AND status='done' AND completed_at >= ? AND completed_at <= ?", (d0, d1))]
+    meetings = _meetings_on(conn, cfg, day)
+    return {"date": day, "basis": {"meetings": "start", "due": "due", "scheduled": "scheduled", "completed": "completed"},
+            "meetings": meetings, "overlay": _overlay_on(conn, cfg, day), "due": _due_between(conn, cfg, d0, d1),
+            "scheduled": scheduled, "completed": completed,
+            "overdue": _overdue(conn, cfg, now.isoformat()) if day == now.strftime("%Y-%m-%d") else [],
+            "data_as_of": _data_as_of(conn)}
+
+
+def cmd_week(args, cfg):
+    conn = connect(create=False)
+    now = now_dt(cfg); start_day = args.date or now.strftime("%Y-%m-%d")
+    d0 = _day_bounds(cfg, start_day)[0]
+    end_day = (datetime.strptime(start_day, "%Y-%m-%d") + timedelta(days=6)).strftime("%Y-%m-%d")
+    d1 = _day_bounds(cfg, end_day)[1]
+    meetings = []
+    for i in range(7):
+        day = (datetime.strptime(start_day, "%Y-%m-%d") + timedelta(days=i)).strftime("%Y-%m-%d")
+        meetings += _meetings_on(conn, cfg, day)
+    return {"from": start_day, "to": end_day, "basis": "due·start", "due": _due_between(conn, cfg, d0, d1),
+            "meetings": meetings, "data_as_of": _data_as_of(conn)}
+
+
+def cmd_overdue(args, cfg):
+    conn = connect(create=False)
+    return {"basis": "due", "overdue": _overdue(conn, cfg, now_iso(cfg)), "data_as_of": _data_as_of(conn)}
+
+
+def cmd_questions(args, cfg):
+    conn = connect(create=False)
+    return {"questions": _open_questions(conn, now_iso(cfg), due_now=args.due_now)}
+
+
+def cmd_show(args, cfg):
+    conn = connect(create=False)
+    it = get_item(conn, args.item, allow_deleted=True)
+    d = dict(it)
+    d["sources"] = [dict(r) for r in conn.execute(
+        "SELECT s.role, e.id AS source_event_id, e.platform, e.account, e.event_ts, e.excerpt, e.triage "
+        "FROM item_source s JOIN source_event e ON e.id=s.source_event_id WHERE s.item_id=? ORDER BY e.id", (it["id"],))]
+    d["questions"] = [dict(r) for r in conn.execute("SELECT ref, field, question, status, answer FROM question WHERE item_id=?", (it["id"],))]
+    d["links"] = [dict(r) for r in conn.execute("SELECT system, external_key, version, sync_status FROM link WHERE item_id=?", (it["id"],))]
+    d["history"] = [dict(r) for r in conn.execute(
+        "SELECT id, action, actor, field, old_value, new_value, reason, run_id, undone_at, created_at "
+        "FROM activity_log WHERE item_id=? ORDER BY id", (it["id"],))]
+    d["relations"] = [dict(r) for r in conn.execute(
+        "SELECT rl.rel_type, a.ref AS from_ref, b.ref AS to_ref FROM relation rl JOIN item a ON a.id=rl.from_item_id "
+        "JOIN item b ON b.id=rl.to_item_id WHERE rl.from_item_id=? OR rl.to_item_id=?", (it["id"], it["id"]))]
+    return d
+
+
+# --------------------------------------------------------------------------
+# find / history / trace / waiting (3단계, §11)
+# --------------------------------------------------------------------------
+
+def cmd_find(args, cfg):
+    """한국어 검색. Clio §7.1 가중합(제목·프로젝트·다음 행동·출처 발췌·FTS·최신성)을 항목에 맞게 적용."""
+    conn = connect(create=False)
+    toks = tokenize(args.q)
+    if not toks:
+        raise ClaireError("empty_query", "검색어가 비어 있습니다")
+    status_filter = args.status or "open"
+    now = now_dt(cfg)
+    half = max(1, int(cfg.get("recency_halflife_days", 30)))
+    fts_raw = {}
+    try:
+        q = fts_query(toks)
+        if q:
+            for r in conn.execute("SELECT rowid AS rid, bm25(search_fts) AS b FROM search_fts WHERE search_fts MATCH ? LIMIT 300", (q,)):
+                fts_raw[r["rid"]] = -float(r["b"])
+    except sqlite3.OperationalError:
+        fts_raw = {}
+    fts_max = max(fts_raw.values()) if fts_raw else 0.0
+    sql = "SELECT * FROM item WHERE deleted_at IS NULL"
+    params = []
+    if status_filter == "open":
+        sql += f" AND {OPEN_SQL}"
+    elif status_filter != "all":
+        sql += " AND status=?"; params.append(status_filter)
+    if args.project:
+        sql += " AND project LIKE ?"; params.append(f"%{args.project}%")
+    if args.since:
+        sql += " AND updated_at >= ?"; params.append(args.since)
+    if args.until:
+        sql += " AND updated_at <= ?"; params.append(args.until + "T23:59:59+99:99")
+    out = []
+    for r in conn.execute(sql, params):
+        title = unicodedata.normalize("NFC", r["title"] or "")
+        proj = unicodedata.normalize("NFC", r["project"] or "")
+        nxt = unicodedata.normalize("NFC", (r["next_action"] or "") + " " + (r["waiting_on"] or "") + " " + (r["done_criteria"] or ""))
+        exc = unicodedata.normalize("NFC", " ".join(e["excerpt"] or "" for e in conn.execute(
+            "SELECT s.excerpt FROM item_source i JOIN source_event s ON s.id=i.source_event_id WHERE i.item_id=? AND s.redacted_at IS NULL", (r["id"],))))
+        h_title = [t for t in toks if hits(t, title)]
+        h_proj = [t for t in toks if hits(t, proj)]
+        h_next = [t for t in toks if hits(t, nxt)]
+        h_exc = [t for t in toks if hits(t, exc)]
+        n = len(toks)
+        s_fts = (fts_raw.get(r["id"], 0.0) / fts_max) if fts_max > 0 else 0.0
+        try:
+            age = max(0.0, (now - parse_iso(r["updated_at"])).total_seconds() / 86400.0)
+        except ValueError:
+            age = 0.0
+        score = (0.40 * len(h_title) / n + 0.15 * len(h_proj) / n + 0.15 * len(h_next) / n + 0.15 * len(h_exc) / n
+                 + 0.10 * s_fts + 0.05 * 0.5 ** (age / half))
+        if not (h_title or h_proj or h_next or h_exc or s_fts):
+            continue
+        d = _item(r)
+        d["score"] = round(min(1.0, score), 4)
+        d["matched"] = {"title": h_title, "project": h_proj, "next_action": h_next, "excerpt": h_exc, "fts": round(s_fts, 3)}
+        out.append(d)
+    out.sort(key=lambda x: (-x["score"], x["ref"]))
+    return {"q": args.q, "tokens": toks, "status": status_filter, "count": len(out), "results": out[: args.limit],
+            "data_as_of": _data_as_of(conn)}
+
+
+def cmd_history(args, cfg):
+    conn = connect(create=False)
+    it = get_item(conn, args.item, allow_deleted=True)
+    rows = [dict(r) for r in conn.execute(
+        "SELECT a.id, a.action, a.actor, a.field, a.old_value, a.new_value, a.reason, a.evidence_source_event_id, "
+        "a.run_id, a.undone_at, a.created_at, e.platform, e.excerpt FROM activity_log a "
+        "LEFT JOIN source_event e ON e.id=a.evidence_source_event_id WHERE a.item_id=? ORDER BY a.id", (it["id"],))]
+    return {"ref": it["ref"], "title": it["title"], "status": it["status"], "history": rows}
+
+
+def cmd_trace(args, cfg):
+    """원문 역추적: source_event → 연결 항목 → 그 항목의 이력. 또는 항목 → 원문들."""
+    conn = connect(create=False)
+    if args.source_event:
+        ev = conn.execute("SELECT * FROM source_event WHERE id=?", (args.source_event,)).fetchone()
+        if ev is None:
+            raise ClaireError("source_event_not_found", f"source_event {args.source_event} 가 없습니다")
+        items = []
+        for r in conn.execute("SELECT i.*, s.role FROM item_source s JOIN item i ON i.id=s.item_id WHERE s.source_event_id=? ORDER BY i.id", (ev["id"],)):
+            d = _item(r); d["role"] = r["role"]
+            d["history"] = [dict(h) for h in conn.execute(
+                "SELECT id, action, actor, field, old_value, new_value, reason, created_at, undone_at FROM activity_log "
+                "WHERE item_id=? ORDER BY id", (r["id"],))]
+            items.append(d)
+        e = dict(ev); e["headers"] = json.loads(e.get("headers") or "{}")
+        return {"source_event": {k: e.get(k) for k in ("id", "platform", "account", "external_id", "thread_id", "event_ts",
+                                                          "ingested_at", "triage", "ignore_reason", "excerpt", "raw_path", "redacted_at")},
+                "headers": {k: e["headers"].get(k) for k in ("subject", "from", "summary", "file", "line", "received_as", "suspicious") if k in e["headers"]},
+                "items": items}
+    it = get_item(conn, args.item, allow_deleted=True)
+    srcs = [dict(r) for r in conn.execute(
+        "SELECT s.role, e.id AS source_event_id, e.platform, e.account, e.external_id, e.thread_id, e.event_ts, e.excerpt, e.triage "
+        "FROM item_source s JOIN source_event e ON e.id=s.source_event_id WHERE s.item_id=? ORDER BY e.id", (it["id"],))]
+    return {"ref": it["ref"], "title": it["title"], "sources": srcs}
+
+
+def cmd_waiting(args, cfg):
+    conn = connect(create=False)
+    now_s = now_iso(cfg)
+    sql = "SELECT * FROM item WHERE deleted_at IS NULL AND status='waiting'"
+    params = []
+    if args.who:
+        sql += " AND waiting_on LIKE ?"; params.append(f"%{args.who}%")
+    out = []
+    for r in conn.execute(sql + " ORDER BY next_check_at", params):
+        d = _item(r)
+        last = conn.execute("SELECT created_at, reason FROM activity_log WHERE item_id=? AND action IN ('wait','update','progress') "
+                            "ORDER BY id DESC LIMIT 1", (r["id"],)).fetchone()
+        d["last_followup_at"] = last["created_at"] if last else None
+        d["check_due"] = bool(r["next_check_at"] and r["next_check_at"] <= now_s)
+        out.append(d)
+    return {"who": args.who, "count": len(out), "waiting": out, "data_as_of": _data_as_of(conn)}
+
+
+def _data_as_of(conn):
+    r = conn.execute("SELECT MAX(last_success_at) m FROM sync_state").fetchone()
+    return r["m"] if r else None
+
+
+def build_parser():
+    p = argparse.ArgumentParser(prog="claire_search", description="Claire 조회 (DB만 읽음)")
+    sub = p.add_subparsers(dest="cmd")
+    r = sub.add_parser("review"); r.add_argument("--run", type=int); r.set_defaults(fn=cmd_review)
+    t = sub.add_parser("today"); t.add_argument("--date")
+    t.add_argument("--basis", choices=["due", "scheduled", "completed", "start"]); t.set_defaults(fn=cmd_today)
+    f = sub.add_parser("find"); f.add_argument("--q", required=True); f.add_argument("--status", default="open")
+    f.add_argument("--project"); f.add_argument("--since"); f.add_argument("--until"); f.add_argument("--limit", type=int, default=10)
+    f.set_defaults(fn=cmd_find)
+    h = sub.add_parser("history"); h.add_argument("--item", required=True); h.set_defaults(fn=cmd_history)
+    tr = sub.add_parser("trace"); tr.add_argument("--source-event", type=int); tr.add_argument("--item"); tr.set_defaults(fn=cmd_trace)
+    wt = sub.add_parser("waiting"); wt.add_argument("--who"); wt.set_defaults(fn=cmd_waiting)
+    w = sub.add_parser("week"); w.add_argument("--date"); w.set_defaults(fn=cmd_week)
+    o = sub.add_parser("overdue"); o.set_defaults(fn=cmd_overdue)
+    q = sub.add_parser("questions"); q.add_argument("--due-now", action="store_true"); q.set_defaults(fn=cmd_questions)
+    s = sub.add_parser("show"); s.add_argument("--item", required=True); s.set_defaults(fn=cmd_show)
+    return p
+
+
+if __name__ == "__main__":
+    run_cli(build_parser, lambda args, cfg: args.fn(args, cfg))

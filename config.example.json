@@ -1,0 +1,59 @@
+{
+  "gmail": {
+    "accounts": [
+      "me@gmail.com"
+    ],
+    "user_addresses": [
+      "me@gmail.com",
+      "me@university.example"
+    ],
+    "ignore_senders": [
+      "nice_customer@nicepg.co.kr"
+    ],
+    "ignore_domains": [
+      "no-reply.spamsniper.co.kr",
+      "stunning.kr"
+    ],
+    "never_ignore_domains": [
+      "university.example"
+    ]
+  },
+  "calendars": [
+    {
+      "name": "Prof. Hur",
+      "id": "xxxxxxxxxxxxxxxxxxxxxxxxxx@group.calendar.google.com",
+      "account": "me@gmail.com",
+      "mode": "track",
+      "write": true
+    },
+    {
+      "name": "Personal",
+      "id": "me@gmail.com",
+      "account": "me@gmail.com",
+      "mode": "track",
+      "write": false
+    },
+    {
+      "name": "Family",
+      "id": "familyxxxxxxxxxxxxxxxxxxxx@group.calendar.google.com",
+      "account": "me@gmail.com",
+      "mode": "overlay",
+      "write": false
+    },
+    {
+      "name": "Lab",
+      "id": "yyyyyyyyyyyyyyyyyyyyyyyyyy@group.calendar.google.com",
+      "account": "me@gmail.com",
+      "mode": "overlay",
+      "write": false,
+      "track_if_attendee": true
+    }
+  ],
+  "obsidian": {
+    "vault": "~/Library/Mobile Documents/iCloud~md~obsidian/Documents/MyVault"
+  },
+  "discord": {
+    "inbound_media_dir": "~/.openclaw/media/inbound"
+  },
+  "backup_mirror": "~/Dropbox/ClaireBackup"
+}
