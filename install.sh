@@ -99,7 +99,7 @@ print(f"파일: 추가 {added} · 갱신 {updated} · 유지 {kept} · 삭제 {r
 PY
 
 chmod +x "$SKILL_DIR"/scripts/claire_check "$SKILL_DIR"/scripts/claire_run "$SKILL_DIR"/scripts/claire_sync "$SKILL_DIR"/scripts/claire_store "$SKILL_DIR"/scripts/claire_search "$SKILL_DIR"/scripts/claire_apply \
-         "$SKILL_DIR"/scripts/claire_export "$SKILL_DIR"/connectors/*.py
+         "$SKILL_DIR"/scripts/claire_export "$SKILL_DIR"/scripts/claire_buttons "$SKILL_DIR"/connectors/*.py
 
 # 데이터 디렉터리·스키마·config.json (멱등). secrets/ 권한 700.
 CLAIRE_DATA_DIR="$DATA_DIR" python3 "$SKILL_DIR/scripts/claire_check" init \

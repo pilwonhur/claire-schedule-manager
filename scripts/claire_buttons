@@ -1,0 +1,346 @@
+#!/usr/bin/env python3
+"""claire_buttons — Discord 번호 버튼 페이로드 생성 (PRD §6.4 응답 형식, v0.4.3). DB는 읽기만 한다.
+
+  build   --file briefing.md [--max-components 38] [--max-chars 3800]
+          브리핑·답변 본문을 OpenClaw message 도구의 `components`(Discord Components V2)로 바꾼다.
+          본문의 번호 복사 블록(```CLR-0031```)이 있던 줄은 "줄 + 오른쪽 버튼"(section) 이 되고,
+          블록이 없는 본문은 번호가 처음 나온 줄마다 버튼을 붙인다. Discord 한도(메시지당 컴포넌트 40개,
+          텍스트 4,000자)에 맞춰 여러 메시지로 나눈다. 각 메시지에는 버튼이 없을 때 쓸 fallback 본문도 준다.
+  actions --item CLR-0031 | --question Q-0007
+          번호 버튼을 눌렀을 때 보낼 "항목 카드": 한 줄 요약과 다음 행동 버튼(끝냈어·진행 중·보류·취소·등록…).
+
+버튼을 누르면 OpenClaw 가 Claire 에게 `Clicked "라벨".` 을 교수님 메시지로 넣어 준다. 라벨은 그대로 교수님이
+타이핑한 지시("CLR-0031 끝냈어")로 읽히도록 만든다. 클립보드가 없는 iPhone·iPad 에서도 탭 한 번이면 된다.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from claire_core import ClaireError, connect, get_item, now_dt, parse_iso, run_cli, tz_of  # noqa: E402
+
+NUMBER_RE = re.compile(r"(?<![A-Za-z0-9-])((?:CLR|Q)-\d{3,6})(?!\d)")   # 한글이 바로 붙어도(CLR-0031로) 잡는다
+ONE_LINE_BLOCK_RE = re.compile(r"^\s*```\s*((?:CLR|Q)-\d{3,6})\s*```\s*$")
+FENCE_RE = re.compile(r"^\s*```\s*$")
+NUMBER_ONLY_RE = re.compile(r"^\s*((?:CLR|Q)-\d{3,6})\s*$")
+SKIP_PREFIXES = ("반영 상태", "참고")          # 번호가 있어도 버튼을 붙이지 않는 줄 (SKILL §5)
+
+# Discord Components V2: 컨테이너 안 컴포넌트 40개, 텍스트 합계 4,000자. 여유를 둔다.
+DEFAULT_MAX_COMPONENTS = 38
+DEFAULT_MAX_CHARS = 3800
+BUTTON_STYLE = "secondary"
+LABEL_MAX = 80                                    # Discord 버튼 라벨 한도
+
+STATUS_KO = {"captured": "포착", "needs_info": "확인 필요", "todo": "할 일", "in_progress": "진행 중",
+             "waiting": "대기", "on_hold": "보류", "done": "완료", "cancelled": "취소"}
+KIND_KO = {"meeting": "회의·면담", "deadline": "마감", "reply": "회신", "task": "할 일", "reference": "참고"}
+
+
+# --------------------------------------------------------------------------
+# 본문 → 블록
+# --------------------------------------------------------------------------
+
+def _button(label: str) -> dict:
+    label = label.strip()
+    if len(label) > LABEL_MAX:
+        label = label[:LABEL_MAX - 1] + "…"
+    return {"label": label, "style": BUTTON_STYLE}
+
+
+def _parse_lines(text: str) -> tuple[list[dict], str]:
+    """본문을 (kind, text, numbers) 단위로 쪼갠다. kind: text | anchor(버튼 달린 줄) | orphan(앞줄 없는 블록)."""
+    lines = text.rstrip("\n").split("\n")
+    has_blocks = any(ONE_LINE_BLOCK_RE.match(l) for l in lines) or any(
+        FENCE_RE.match(lines[i]) and i + 2 < len(lines) and NUMBER_ONLY_RE.match(lines[i + 1]) and FENCE_RE.match(lines[i + 2])
+        for i in range(len(lines)))
+    units: list[dict] = []          # {"kind": "text"|"anchor"|"orphan", "text": str, "numbers": [..], "raw": [원문 줄들]}
+    seen: set[str] = set()
+
+    def attach(numbers: list[str], raw_block: list[str]):
+        fresh = [n for n in numbers if n not in seen]
+        seen.update(fresh)
+        # 직전 비어 있지 않은 text 줄이 anchor 가 된다 (한 줄 사이 공백은 허용하지 않는다: 블록은 바로 다음 줄 규칙)
+        if units and units[-1]["kind"] == "text" and units[-1]["text"].strip():
+            anchor = units.pop()
+            units.append({"kind": "anchor", "text": anchor["text"], "numbers": fresh, "raw": anchor["raw"] + raw_block})
+        elif units and units[-1]["kind"] == "anchor":
+            units[-1]["numbers"].extend(fresh); units[-1]["raw"].extend(raw_block)
+        else:
+            units.append({"kind": "orphan", "text": "", "numbers": fresh, "raw": raw_block})
+
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        m = ONE_LINE_BLOCK_RE.match(line)
+        if m:
+            attach([m.group(1)], [line]); i += 1; continue
+        if FENCE_RE.match(line) and i + 2 < len(lines) and NUMBER_ONLY_RE.match(lines[i + 1]) and FENCE_RE.match(lines[i + 2]):
+            attach([NUMBER_ONLY_RE.match(lines[i + 1]).group(1)], lines[i:i + 3]); i += 3; continue
+        if not has_blocks and line.strip() and not line.strip().startswith(SKIP_PREFIXES):
+            nums = [n for n in NUMBER_RE.findall(line) if n not in seen]
+            if nums:
+                seen.update(nums)
+                units.append({"kind": "anchor", "text": line, "numbers": nums, "raw": [line]}); i += 1; continue
+        units.append({"kind": "text", "text": line, "numbers": [], "raw": [line]}); i += 1
+    return units, ("blocks" if has_blocks else "numbers")
+
+
+def _units_to_blocks(units: list[dict]) -> list[dict]:
+    """연속된 text 줄은 하나의 text 블록으로, anchor 는 section(+버튼), 남는 번호는 actions 행으로."""
+    blocks: list[dict] = []
+    buf: list[str] = []
+    raw_buf: list[str] = []
+
+    def flush():
+        if buf and any(l.strip() for l in buf):
+            blocks.append({"type": "text", "text": "\n".join(buf).strip("\n"), "_raw": list(raw_buf)})
+        buf.clear(); raw_buf.clear()
+
+    for u in units:
+        if u["kind"] == "text":
+            buf.append(u["text"]); raw_buf.extend(u["raw"]); continue
+        flush()
+        nums = u["numbers"]
+        if u["kind"] == "anchor":
+            if nums:
+                blocks.append({"type": "section", "text": u["text"].rstrip(),
+                               "accessory": {"type": "button", "button": _button(nums[0])}, "_raw": list(u["raw"])})
+                rest = nums[1:]
+            else:                               # 같은 번호가 다시 나온 줄: 버튼 없이 글만
+                blocks.append({"type": "text", "text": u["text"].rstrip(), "_raw": list(u["raw"])}); rest = []
+        else:
+            rest = nums
+            if not rest:
+                continue
+        for k in range(0, len(rest), 5):
+            blocks.append({"type": "actions", "buttons": [_button(n) for n in rest[k:k + 5]], "_raw": [] if u["kind"] == "anchor" else list(u["raw"])})
+    flush()
+    return blocks
+
+
+def _cost(block: dict) -> int:
+    if block["type"] == "text":
+        return 1
+    if block["type"] == "section":
+        return 3                                # section + text display + accessory button
+    return 1 + len(block["buttons"])            # action row + buttons
+
+
+def _chars(block: dict) -> int:
+    return len(block.get("text") or "")
+
+
+def _split_text_block(block: dict, max_chars: int) -> list[dict]:
+    if _chars(block) <= max_chars:
+        return [block]
+    out, cur, raw = [], [], []
+    for line, r in zip(block["text"].split("\n"), block["_raw"] or block["text"].split("\n")):
+        if cur and len("\n".join(cur + [line])) > max_chars:
+            out.append({"type": "text", "text": "\n".join(cur), "_raw": raw}); cur, raw = [], []
+        cur.append(line); raw.append(r)
+    if cur:
+        out.append({"type": "text", "text": "\n".join(cur), "_raw": raw})
+    return out
+
+
+def _chunk(blocks: list[dict], max_components: int, max_chars: int) -> list[list[dict]]:
+    chunks: list[list[dict]] = []
+    cur: list[dict] = []
+    used = 2                                    # 컨테이너 + 머리글 text display
+    chars = 0
+    for b in blocks:
+        for piece in (_split_text_block(b, max_chars) if b["type"] == "text" else [b]):
+            c, n = _cost(piece), _chars(piece)
+            if cur and (used + c > max_components or chars + n > max_chars):
+                carry = []
+                if len(cur) > 1 and cur[-1]["type"] == "text" and _chars(cur[-1]) <= 200:
+                    carry = [cur.pop()]           # 섹션 제목이 메시지 끝에 홀로 남지 않게 다음 메시지로 넘긴다
+                chunks.append(cur); cur, used, chars = [], 2, 0
+                for k in carry:
+                    cur.append(k); used += _cost(k); chars += _chars(k)
+            cur.append(piece); used += c; chars += n
+    if cur:
+        chunks.append(cur)
+    return chunks
+
+
+def _strip_private(block: dict) -> dict:
+    return {k: v for k, v in block.items() if not k.startswith("_")}
+
+
+def cmd_build(args, cfg):
+    text = Path(args.file).read_text(encoding="utf-8") if args.file else sys.stdin.read()
+    if not text.strip():
+        raise ClaireError("empty_text", "본문이 비어 있습니다.")
+    units, mode = _parse_lines(text)
+    blocks = _units_to_blocks(units)
+    numbers: list[str] = []
+    for b in blocks:
+        if b["type"] == "section":
+            numbers.append(b["accessory"]["button"]["label"])
+        elif b["type"] == "actions":
+            numbers.extend(x["label"] for x in b["buttons"])
+    if not numbers:
+        return {"mode": mode, "numbers": [], "messages": [],
+                "note": "번호가 없어 버튼을 만들지 않았습니다. 본문을 그대로 보내세요."}
+    chunks = _chunk(blocks, args.max_components, args.max_chars)
+    first_line = next((l.strip() for l in text.split("\n") if l.strip()), "")
+    messages = []
+    for idx, chunk in enumerate(chunks, 1):
+        fallback = "\n".join(l for b in chunk for l in (b.get("_raw") or [b.get("text", "")])).strip("\n")
+        header = None
+        body = list(chunk)
+        if body and body[0]["type"] == "text":
+            header = body.pop(0)["text"]
+        elif idx > 1:
+            header = f"{first_line} (계속 {idx}/{len(chunks)})"
+        comp = {"reusable": True, "blocks": [_strip_private(b) for b in body]}
+        if header:
+            comp["text"] = header
+        elif comp["blocks"]:
+            # OpenClaw 는 components.text 가 없으면 message(fallback 본문 전체)를 첫 text display 로 넣는다
+            # (@openclaw/discord components: `spec.text ?? fallbackText`). 본문이 두 번 보이지 않게 짧은 제목을 둔다.
+            # first_line 을 쓰면 첫 줄이 section 과 겹쳐 두 번 보이므로 고정 제목.
+            comp["text"] = "Claire"
+        messages.append({"index": idx, "of": len(chunks), "message": fallback, "components": comp,
+                         "component_count": 2 + sum(_cost(b) for b in body),
+                         "numbers": [n for n in numbers if any(
+                             (b["type"] == "section" and b["accessory"]["button"]["label"] == n) or
+                             (b["type"] == "actions" and any(x["label"] == n for x in b["buttons"])) for b in chunk)]})
+    return {"mode": mode, "numbers": numbers, "messages": messages,
+            "send_with": "message 도구: channel=discord, action=send, to=<채널>, message=<message>, components=<components>. "
+                         "보낸 뒤 최종 답변은 NO_REPLY. 도구가 없거나 실패하면 message 본문(복사 블록 포함)을 그대로 답한다."}
+
+
+# --------------------------------------------------------------------------
+# 항목·질문 카드
+# --------------------------------------------------------------------------
+
+def _when(it: dict, cfg) -> str:
+    tz = tz_of(cfg)
+
+    def fmt(ts: str | None, all_day=False) -> str:
+        if not ts:
+            return ""
+        if len(ts) == 10:
+            return ts[5:].replace("-", "/")
+        try:
+            d = parse_iso(ts).astimezone(tz)
+        except ValueError:
+            return ts
+        return d.strftime("%m/%d") if all_day else d.strftime("%m/%d %H:%M")
+
+    parts = []
+    if it.get("start_at"):
+        s = fmt(it["start_at"], bool(it.get("all_day")))
+        e = fmt(it["end_at"], bool(it.get("all_day"))) if it.get("end_at") else ""
+        if e and not it.get("all_day") and e[:5] == s[:5]:
+            e = e[6:]
+        parts.append(s + (f"–{e}" if e and e != s else ""))
+    if it.get("due_at"):
+        parts.append(f"{fmt(it['due_at'])} 마감")
+    if it.get("scheduled_on") and not parts:
+        parts.append(f"{fmt(it['scheduled_on'])} 예정")
+    return " · ".join(parts)
+
+
+def _row(labels: list[tuple[str, str]]) -> dict:
+    return {"type": "actions", "buttons": [{"label": l, "style": s} for l, s in labels][:5]}
+
+
+def cmd_actions_item(conn, cfg, ref: str) -> dict:
+    it = dict(get_item(conn, ref))
+    ref = it["ref"]
+    status = it["status"]
+    head = f"{ref} · {it['title']}"
+    meta = [KIND_KO.get(it.get("kind"), it.get("kind") or ""), STATUS_KO.get(status, status), _when(it, cfg)]
+    if it.get("waiting_on"):
+        meta.append(f"{it['waiting_on']} 답 대기")
+    lines = [head, " · ".join(m for m in meta if m)]
+    if it.get("next_action"):
+        lines.append(f"다음 행동: {it['next_action']}")
+    questions = [dict(q) for q in conn.execute(
+        "SELECT ref, question, options FROM question WHERE item_id=? AND status='open' ORDER BY id", (it["id"],))]
+    pending = [dict(r) for r in conn.execute(
+        "SELECT op FROM outbox WHERE item_id=? AND status='awaiting_confirm' ORDER BY id", (it["id"],))]
+
+    rows: list[dict] = []
+    if status in ("captured", "needs_info", "todo", "in_progress"):
+        rows.append(_row([(f"{ref} 끝냈어", "success"), (f"{ref} 진행 중", "primary"),
+                          (f"{ref} 보류", "secondary"), (f"{ref} 취소", "danger")]))
+    elif status in ("waiting", "on_hold"):
+        rows.append(_row([(f"{ref} 끝냈어", "success"), (f"{ref} 재개", "primary"), (f"{ref} 취소", "danger")]))
+    elif status in ("done", "cancelled"):
+        rows.append(_row([(f"{ref} 다시 열어", "primary")]))
+    if pending:
+        ops = "·".join(sorted({("Calendar" if p["op"].startswith("calendar") else "Tasks") for p in pending}))
+        lines.append(f"반영 대기: {ops} (승인 필요)")
+        rows.append(_row([(f"{ref} 등록", "success"), (f"{ref} 등록 안 함", "secondary")]))
+    for q in questions[:2]:
+        opts = json.loads(q["options"]) if q["options"] else []
+        lines.append(f"{q['ref']} {q['question']}")
+        if opts:
+            rows.append(_row([(f"{q['ref']}: {o}", "primary") for o in opts[:5]]))
+    hint = "다른 지시(기한·우선순위·메모·답변)는 이 메시지에 답장으로 적어 주세요."
+    lines.append(hint)
+    text = "\n".join(lines)
+    return {"ref": ref, "status": status, "message": text,
+            "components": {"reusable": True, "text": "\n".join(lines[:-1]), "blocks": rows + [{"type": "text", "text": hint}]},
+            "buttons": [b["label"] for r in rows for b in r["buttons"]]}
+
+
+def cmd_actions_question(conn, cfg, qref: str) -> dict:
+    q = conn.execute("SELECT q.*, i.ref AS item_ref, i.title AS item_title FROM question q LEFT JOIN item i ON i.id=q.item_id "
+                     "WHERE q.ref=?", (qref,)).fetchone()
+    if q is None:
+        raise ClaireError("question_not_found", f"{qref} 질문이 없습니다.")
+    q = dict(q)
+    opts = json.loads(q["options"]) if q["options"] else []
+    lines = [f"{q['ref']} ({q['item_ref']} {q['item_title']})" if q.get("item_ref") else q["ref"], q["question"]]
+    if q.get("reason"):
+        lines.append(f"참고: {q['reason']}")
+    if q["status"] != "open":
+        lines.append(f"이 질문은 이미 {STATUS_KO.get(q['status'], q['status'])} 상태입니다.")
+    rows = [_row([(f"{q['ref']}: {o}", "primary") for o in opts[:5]])] if opts and q["status"] == "open" else []
+    hint = "다른 답은 이 메시지에 답장으로 적어 주세요."
+    lines.append(hint)
+    return {"ref": q["ref"], "status": q["status"], "item_ref": q.get("item_ref"), "message": "\n".join(lines),
+            "components": {"reusable": True, "text": "\n".join(lines[:-1]), "blocks": rows + [{"type": "text", "text": hint}]},
+            "buttons": [b["label"] for r in rows for b in r["buttons"]]}
+
+
+def cmd_actions(args, cfg):
+    conn = connect(create=False)
+    if args.item:
+        return cmd_actions_item(conn, cfg, args.item.strip().upper())
+    if args.question:
+        return cmd_actions_question(conn, cfg, args.question.strip().upper())
+    raise ClaireError("bad_args", "--item 또는 --question 이 필요합니다.")
+
+
+# --------------------------------------------------------------------------
+
+def build_parser():
+    p = argparse.ArgumentParser(prog="claire_buttons", description="Discord 번호 버튼 페이로드")
+    sub = p.add_subparsers(dest="cmd")
+    b = sub.add_parser("build", help="본문 → components (번호 버튼)")
+    b.add_argument("--file", help="본문 파일 (없으면 stdin)")
+    b.add_argument("--max-components", type=int, default=DEFAULT_MAX_COMPONENTS)
+    b.add_argument("--max-chars", type=int, default=DEFAULT_MAX_CHARS)
+    a = sub.add_parser("actions", help="항목·질문 카드와 다음 행동 버튼")
+    a.add_argument("--item")
+    a.add_argument("--question")
+    return p
+
+
+def dispatch(args, cfg):
+    return {"build": cmd_build, "actions": cmd_actions}[args.cmd](args, cfg)
+
+
+if __name__ == "__main__":
+    run_cli(build_parser, dispatch)

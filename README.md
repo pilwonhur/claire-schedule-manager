@@ -19,6 +19,7 @@
 SKILL.md              판단 계층 규칙 (LLM 이 읽는다)
 scripts/              결정론적 도구 (Python 3.11+, 표준 라이브러리만)
   claire_sync         수집: gmail | calendar | obsidian | ingest-discord | pending | retriage
+  claire_buttons      Discord 번호 버튼 페이로드: build (본문 → components) | actions (항목·질문 카드)
   claire_store        저장: propose | update | complete | answer | wait | undo | merge | ...
   claire_search       조회: review | today | week | overdue | find | history | trace | waiting
   claire_apply        외부 반영: outbox 실행·승인 (Obsidian 🆔·체크·Daily 줄, Calendar 등록·변경)

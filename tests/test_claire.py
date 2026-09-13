@@ -1457,5 +1457,124 @@ class Phase4Test(FixtureBase):
         self.assertEqual(self.apply()["summary"]["to_deliver"], 0)
 
 
+class ButtonsTest(FixtureBase):
+    """v0.4.3: Discord 번호 버튼 페이로드 (claire_buttons)."""
+
+    BRIEF = (
+        "[아침 브리핑 2026-09-11 (목)]  실행 06:00–06:07 · 정상\n\n"
+        "오늘 일정 (2)\n"
+        "  10:00–11:00  연구 미팅 (CLR-0012) · 준비: 자료 최종 확인 (CLR-0013, 미완료)\n"
+        "```CLR-0012```\n```CLR-0013```\n"
+        "  15:00–15:30  ○○ 교수 면담 (CLR-0031, 잠정 · Q-0007 답변 대기)\n"
+        "```CLR-0031```\n\n"
+        "확인 필요 (1)\n"
+        "  Q-0007 (CLR-0031) 금요일 오후 몇 시인가요? 후보 14:00 / 15:00\n"
+        "```\nQ-0007\n```\n"
+        "반영 상태: Calendar 반영 대기 1건(승인 필요: CLR-0031)\n")
+
+    def buttons(self, *args, **kw):
+        return self.sh("claire_buttons", *args, **kw)
+
+    def _build(self, text, *extra):
+        f = self.data / "body.md"
+        f.write_text(text, encoding="utf-8")
+        return self.buttons("build", "--file", f, *extra)
+
+    def test_build_blocks_mode_puts_button_beside_line(self):
+        r = self._build(self.BRIEF)
+        self.assertEqual(r["mode"], "blocks")
+        self.assertEqual(r["numbers"], ["CLR-0012", "CLR-0013", "CLR-0031", "Q-0007"])
+        self.assertEqual(len(r["messages"]), 1)
+        m = r["messages"][0]
+        comp = m["components"]
+        self.assertTrue(comp["reusable"])
+        self.assertTrue(comp["text"].startswith("[아침 브리핑"))          # 머리글은 컨테이너 text 로
+        kinds = [(b["type"], b.get("accessory", {}).get("button", {}).get("label")) for b in comp["blocks"]]
+        self.assertEqual(kinds[0], ("section", "CLR-0012"))               # 줄 오른쪽 버튼
+        self.assertEqual(comp["blocks"][1]["type"], "actions")             # 같은 줄의 둘째 번호는 아래 행
+        self.assertEqual([b["label"] for b in comp["blocks"][1]["buttons"]], ["CLR-0013"])
+        self.assertEqual(kinds[2], ("section", "CLR-0031"))
+        self.assertIn("확인 필요", comp["blocks"][3]["text"])
+        self.assertEqual(kinds[4], ("section", "Q-0007"))                  # 3줄 형태 블록도 인식
+        self.assertEqual(comp["blocks"][-1]["type"], "text"); self.assertIn("반영 상태", comp["blocks"][-1]["text"])
+        # 컴포넌트 텍스트에는 코드 블록이 없고, fallback 본문에는 남아 있다
+        self.assertNotIn("```", json.dumps(comp, ensure_ascii=False))
+        self.assertIn("```CLR-0012```", m["message"])
+        self.assertLessEqual(m["component_count"], 40)
+        self.assertNotIn("_raw", json.dumps(comp))
+
+    def test_build_numbers_mode_when_no_blocks(self):
+        r = self._build("○○ 교수 면담을 CLR-0031로 등록했습니다.\n시각이 없어 Q-0007로 여쭙습니다.\n참고: CLR-0031은 잠정입니다.\n")
+        self.assertEqual(r["mode"], "numbers"); self.assertEqual(r["numbers"], ["CLR-0031", "Q-0007"])
+        blocks = r["messages"][0]["components"]["blocks"]
+        self.assertEqual([b["type"] for b in blocks], ["section", "section", "text"])
+        self.assertEqual(blocks[0]["accessory"]["button"]["label"], "CLR-0031")
+        self.assertEqual(blocks[1]["accessory"]["button"]["label"], "Q-0007")
+        # 머리글이 없으면 짧은 고정 제목. text 를 비우면 OpenClaw 가 fallback 본문 전체를 머리글로 넣어 두 번 보인다.
+        self.assertEqual(r["messages"][0]["components"]["text"], "Claire")
+        self.assertNotIn("CLR-0031", r["messages"][0]["components"]["text"])
+        r = self._build("오늘은 변화 없음\n")
+        self.assertEqual(r["messages"], []); self.assertIn("note", r)
+
+    def test_build_splits_by_discord_limits_and_carries_heading(self):
+        lines = ["[브리핑]", "", "우선 처리 (20)"]
+        for i in range(1, 21):
+            lines += [f"  {i}번 일 (CLR-{i:04d})", f"```CLR-{i:04d}```"]
+        lines += ["", "확인 필요 (1)", "  Q-0001 질문?", "```Q-0001```"]
+        r = self._build("\n".join(lines) + "\n")
+        self.assertGreater(len(r["messages"]), 1)
+        for m in r["messages"]:
+            self.assertLessEqual(m["component_count"], 38)
+            self.assertLessEqual(sum(len(b.get("text") or "") for b in m["components"]["blocks"]), 3800)
+            self.assertTrue(m["components"]["text"])
+        self.assertIn("(계속 2/", r["messages"][1]["components"]["text"])
+        # 섹션 제목이 앞 메시지 끝에 홀로 남지 않는다
+        for m in r["messages"][:-1]:
+            self.assertNotEqual(m["components"]["blocks"][-1]["type"], "text")
+        self.assertEqual(sum(len(m["numbers"]) for m in r["messages"]), 21)
+        r2 = self._build("\n".join(lines) + "\n", "--max-components", "8")
+        self.assertGreaterEqual(len(r2["messages"]), 7)
+
+    def test_actions_item_card_and_question_card(self):
+        a = self.sh("claire_sync", "ingest-discord", "--message-id", "d9", "--text", "등록: 9/15 10시 김 교수 면담",
+                    "--captured-at", "2026-09-11T09:00:00+09:00")
+        # 질문은 unknown_fields 가 있어 needs_info 로 들어갈 때만 만들어진다 (claire_store propose)
+        self.propose([{"op": "create", "source_event_ids": [a["source_event_id"]], "kind": "meeting", "title": "김 교수 면담",
+                       "scheduled_on": "2026-09-15", "confidence": 0.6, "unknown_fields": ["start_at"],
+                       "evidence": ["등록"], "questions": [{"field": "start_at", "question": "몇 시인가요?", "options": ["10:00", "14:00"]}]}])
+        c = self.buttons("actions", "--item", "clr-0001")
+        self.assertEqual(c["ref"], "CLR-0001")
+        self.assertTrue(c["message"].startswith("CLR-0001 · 김 교수 면담"))
+        labels = c["buttons"]
+        self.assertEqual(labels[:4], ["CLR-0001 끝냈어", "CLR-0001 진행 중", "CLR-0001 보류", "CLR-0001 취소"])
+        self.assertIn("Q-0001: 10:00", labels); self.assertIn("Q-0001: 14:00", labels)
+        rows = c["components"]["blocks"]
+        self.assertEqual(rows[0]["type"], "actions"); self.assertEqual(rows[-1]["type"], "text")
+        self.assertTrue(all(len(r["buttons"]) <= 5 for r in rows if r["type"] == "actions"))
+        q = self.buttons("actions", "--question", "Q-0001")
+        self.assertEqual((q["ref"], q["item_ref"], q["status"]), ("Q-0001", "CLR-0001", "open"))
+        self.assertEqual(q["buttons"], ["Q-0001: 10:00", "Q-0001: 14:00"])
+        e = self.buttons("actions", "--question", "Q-0999", expect_ok=False)
+        self.assertEqual(e["error"]["code"], "question_not_found")
+        e = self.buttons("actions", "--item", "CLR-0999", expect_ok=False)
+        self.assertFalse(e["ok"])
+
+    def test_actions_card_follows_status_and_pending_approval(self):
+        a = self.sh("claire_sync", "ingest-discord", "--message-id", "d10", "--text", "할일: 심사 의견 9/12까지",
+                    "--captured-at", "2026-09-11T09:00:00+09:00")
+        self.propose([{"op": "create", "source_event_ids": [a["source_event_id"]], "kind": "deadline", "title": "심사 의견",
+                       "due_at": "2026-09-12", "confidence": 0.95, "evidence": ["할일"]}])
+        self.sh("claire_store", "wait", "--item", "CLR-0001", "--waiting-on", "김 교수")
+        c = self.buttons("actions", "--item", "CLR-0001")
+        self.assertEqual(c["status"], "waiting")
+        self.assertEqual(c["buttons"][:2], ["CLR-0001 끝냈어", "CLR-0001 재개"]); self.assertIn("김 교수 답 대기", c["message"])
+        self.sh("claire_store", "complete", "--item", "CLR-0001", "--evidence", "user_report")
+        c = self.buttons("actions", "--item", "CLR-0001")
+        self.assertEqual(c["buttons"], ["CLR-0001 다시 열어"])
+        ob = self.db().execute("SELECT COUNT(*) FROM outbox WHERE item_id=1 AND status='awaiting_confirm'").fetchone()[0]
+        if ob:
+            self.assertIn("CLR-0001 등록", c["buttons"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

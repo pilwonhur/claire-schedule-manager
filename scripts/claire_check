@@ -607,6 +607,35 @@ class Doctor:
                          f"last={job.get('lastRunStatus') or job.get('state', {}).get('lastRunStatus')}")
         except (subprocess.TimeoutExpired, json.JSONDecodeError, OSError) as e:
             self.add("openclaw", "cron_daily", "warn", f"cron 목록을 읽지 못함: {e}")
+        self.check_openclaw_buttons()
+
+    def _openclaw_config_get(self, path: str):
+        out = subprocess.run(["openclaw", "config", "get", path], capture_output=True, text=True, timeout=30)
+        try:
+            return json.loads(out.stdout)
+        except json.JSONDecodeError:
+            return None                              # 미설정이면 문장이 나온다
+
+    def check_openclaw_buttons(self):
+        """번호 버튼(v0.4.3): Claire 에이전트에 message 도구가 허용되고, 버튼 콜백 수명이 하루 브리핑을 덮는지."""
+        try:
+            tools = self._openclaw_config_get("agents.entries.claire.tools") or {}
+            allow = set((tools.get("alsoAllow") or []) + (tools.get("allow") or []))
+            profile = tools.get("profile") or (self._openclaw_config_get("tools") or {}).get("profile")
+            has_msg = bool({"message", "group:messaging"} & allow) or profile in ("messaging", "full")
+            self.add("openclaw", "message_tool", "ok" if has_msg else "warn",
+                     "Claire 에이전트에 message 도구 허용됨" if has_msg else
+                     "Claire 에이전트에 message 도구가 없음 → 번호 버튼 없이 코드 블록으로만 답한다",
+                     None if has_msg else "openclaw config patch '{agents:{entries:{claire:{tools:{alsoAllow:[\"message\"]}}}}}'")
+            comp = self._openclaw_config_get("channels.discord.accounts.claire.agentComponents") or \
+                self._openclaw_config_get("channels.discord.agentComponents") or {}
+            ttl = int(comp.get("ttlMs") or 1800000)
+            ok = ttl >= 12 * 3600 * 1000
+            self.add("openclaw", "button_ttl", "ok" if ok else "warn",
+                     f"버튼 콜백 수명 {ttl // 60000}분" + ("" if ok else " (06:00 브리핑 버튼이 오전에 만료됨)"),
+                     None if ok else "openclaw config patch '{channels:{discord:{accounts:{claire:{agentComponents:{ttlMs:86400000}}}}}}'")
+        except (subprocess.TimeoutExpired, OSError, ValueError, TypeError) as e:
+            self.add("openclaw", "message_tool", "warn", f"OpenClaw 설정을 읽지 못함: {e}")
 
     def run(self) -> dict:
         self.check_env()

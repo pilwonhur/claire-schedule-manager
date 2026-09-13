@@ -3,6 +3,20 @@
 형식은 [Keep a Changelog](https://keepachangelog.com/ko/1.1.0/)를 따르고 버전은 SemVer다.
 데이터 형식 버전(`SCHEMA_VERSION`)은 따로 관리한다.
 
+## [0.4.3] — 2026-09-13
+
+Discord **번호 버튼**(교수님 피드백: iPhone·iPad Discord에는 코드 블록 복사 버튼이 없어 0.4.2 방식이 모바일에서 동작하지 않음).
+
+### 추가
+- `scripts/claire_buttons` — `build --file 본문.md`: 본문의 번호 복사 블록(```CLR-0031```)이 있던 줄을 "줄 + 오른쪽 번호 버튼"(Discord Components V2 section)으로 바꾼 message 도구 `components` 페이로드를 만든다. 블록이 없는 본문은 번호가 처음 나온 줄마다 버튼. Discord 한도(컴포넌트 40개·4,000자)에 맞춰 여러 메시지로 나누고 fallback 본문을 함께 준다. `actions --item CLR | --question Q`: 버튼을 눌렀을 때 보낼 카드(한 줄 요약 + `끝냈어`·`진행 중`·`보류`·`취소`·`재개`·`다시 열어`·`등록`/`등록 안 함`·질문 후보 답 버튼).
+- SKILL §4: 버튼 입력 처리 — OpenClaw가 넣어 주는 `Clicked "라벨".`을 번호만이면 카드 응답, 지시가 있으면 그 문장을 타이핑한 것으로 처리. §5: 보내는 법(message 도구, 보낸 뒤 `NO_REPLY`), fallback(도구 없음·실패 시 본문 그대로), 24시간 만료 안내. §2 8단계.
+- doctor: `openclaw.message_tool`(Claire 에이전트에 message 도구 허용 여부), `openclaw.button_ttl`(버튼 콜백 수명 ≥ 12시간) 점검과 고치는 명령.
+- 테스트 5건(build 블록 모드·번호 모드·분할·fallback, actions 카드).
+
+### 변경
+- 번호 복사 블록 규칙은 그대로 두되 역할이 바뀐다: 버튼 위치 표시 + 버튼을 못 쓸 때의 fallback. 브리핑 형식·매뉴얼·활용 안내 갱신.
+- OpenClaw 설정 2건이 필요하다(install.sh가 건드리지 않음, doctor가 안내): `agents.entries.claire.tools.alsoAllow: ["message"]`, `channels.discord.accounts.claire.agentComponents.ttlMs: 86400000`.
+
 ## [0.4.2] — 2026-09-12
 
 번호 복사 블록의 위치 조정(교수님 피드백). 코드 변경 없음.
