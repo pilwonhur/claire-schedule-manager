@@ -624,7 +624,7 @@ class Doctor:
             profile = tools.get("profile") or (self._openclaw_config_get("tools") or {}).get("profile")
             has_msg = bool({"message", "group:messaging"} & allow) or profile in ("messaging", "full")
             self.add("openclaw", "message_tool", "ok" if has_msg else "warn",
-                     "Claire 에이전트에 message 도구 허용됨" if has_msg else
+                     "Claire 에이전트에 message 도구 허용됨 (Codex 하네스에서는 초기 목록에 없고 tool search로 로드 — SKILL §5)" if has_msg else
                      "Claire 에이전트에 message 도구가 없음 → 번호 버튼 없이 코드 블록으로만 답한다",
                      None if has_msg else "echo '{agents:{entries:{claire:{tools:{alsoAllow:[\"message\"]}}}}}' | openclaw config patch --stdin")
             comp = self._openclaw_config_get("channels.discord.accounts.claire.agentComponents") or \

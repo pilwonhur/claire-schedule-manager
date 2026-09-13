@@ -1,6 +1,6 @@
 ---
 name: claire-schedule-manager
-version: 0.4.3
+version: 0.4.4
 description: >-
   교수님의 일정·업무를 Gmail(기관 메일 포워드 포함)·Google Calendar·Obsidian Tasks·Discord 이미지에서
   하나의 장부(SQLite)로 모아 아침 브리핑·확인 질문·진행 추적·검색을 제공한다. Claire 전용 Discord 채널에서
@@ -10,7 +10,7 @@ description: >-
   반영(승인 대기열)까지 동작한다. 브리핑의 "등록" 승인도 이 스킬로 처리한다.
 ---
 
-# Claire 통합 일정·업무 관리 (v0.4.3 — 외부 반영·번호 버튼까지)
+# Claire 통합 일정·업무 관리 (v0.4.4 — 외부 반영·번호 버튼까지)
 
 정본 설계: 프로젝트의 `PRD.md` v1.2. 이 문서는 판단 계층(Claire)이 지켜야 할 규칙과 절차만 적는다.
 
@@ -81,7 +81,8 @@ OpenClaw cron이 "일일 점검을 실행하고 브리핑을 보내세요"를 �
 7. [Claire] 브리핑 작성 (references/briefing-format.md) → 파일로 저장
 8. claire_run brief --run <id> --file briefing.md
      duplicate=true 면 보내지 않는다. 아니면 claire_buttons build --file briefing.md 로 변환해 message 도구로
-     보낸다(§5 번호 버튼). message 도구가 없거나 전송이 실패하면 본문을 그대로 답한다.
+     보낸다(§5 번호 버튼). message 도구는 초기 도구 목록에 안 보인다 — tool search 로 `message` 를 찾아
+     로드한 뒤 호출한다(§5). 검색해도 없거나 전송이 실패할 때만 본문을 그대로 답한다.
 9. claire_apply --run <id>
      requires_confirm=0 인 outbox 실행 (Tasks 🆔 부여·체크·Daily 줄 추가, 지시·답변으로 확정된 Calendar 등록·변경).
      to_deliver 가 있으면 그 문구를 채널에 그대로 보낸다. awaiting_confirm 은 다음 브리핑 "반영 상태"에.
@@ -183,11 +184,12 @@ OpenClaw cron이 "일일 점검을 실행하고 브리핑을 보내세요"를 �
   - 형식: `` ```CLR-0031``` `` 처럼 여는 백틱 셋·번호·닫는 백틱 셋을 **한 줄에**. 블록 하나에 번호 하나. 설명·괄호·마침표를 블록 안에 넣지 않는다.
   - 위치: 번호가 실린 문장·줄이 끝난 직후. 한 줄에 번호가 둘이면 블록 둘을 나온 순서대로(첫 번호는 줄 오른쪽 버튼, 나머지는 그 아래 버튼 행). 같은 번호는 한 메시지에서 **처음 나온 자리에만** 한 번.
     부가 언급(`Q-0007 답변 대기`처럼 괄호 안 참고, 겹침 경고의 상대 항목, 후보 목록에서 이미 위에 나온 번호, 반영 상태·참고 줄)에는 붙이지 않는다.
+  - **message 도구 찾기(먼저 읽을 것):** OpenClaw의 `message` 도구는 **초기 도구 목록에 나타나지 않는다**(Codex 하네스에서는 `openclaw` 네임스페이스의 지연 로딩 도구다). 이름만 보이거나 아예 안 보여도 "없다"고 판단하지 말고, **tool search로 `message`를 찾아 스키마를 로드한 뒤** 호출한다. 이 절차를 건너뛰고 본문만 답하면 교수님 iPhone에는 버튼이 없는 메시지가 간다(2026-09-13 실측: 검색 후 호출하면 정상 전송됨).
   - **보내는 법(번호 버튼):** 본문을 파일로 저장하고 `claire_buttons build --file 본문.md`를 실행한다. 결과 `messages[]`를 순서대로 message 도구로 보낸다:
     `{channel: "discord", action: "send", to: "<지금 대화 중인 채널 channel:ID>", message: <message>, components: <components>}`.
     `components`는 도구 출력을 **그대로** 넘긴다(고치지 않는다). 다 보낸 뒤 최종 답변은 `NO_REPLY`로 끝낸다(본문이 두 번 가지 않게).
     `messages`가 비어 있으면(번호 없음) 본문을 평소처럼 답한다.
-  - **fallback:** message 도구가 도구 목록에 없거나 전송 결과가 실패면, 본문(복사 블록 포함)을 그대로 최종 답변으로 보낸다. 이때도 답장(reply)으로 번호 없이 지시하는 길은 열려 있다(§4).
+  - **fallback:** tool search로 찾아도 message 도구가 없거나 전송 결과가 실패면, 본문(복사 블록 포함)을 그대로 최종 답변으로 보낸다. 실패 사유(도구 없음/오류 문구)를 본문 끝에 한 줄로 적는다. 이때도 답장(reply)으로 번호 없이 지시하는 길은 열려 있다(§4).
   - **버튼을 누르면** OpenClaw가 `Clicked "라벨".`을 교수님 메시지로 넣어 준다. 번호만 있는 라벨은 §4의 "번호 버튼" 행(카드 응답), 지시가 있는 라벨(`CLR-0031 끝냈어`)은 그 문장을 타이핑한 것으로 처리한다. 버튼은 보낸 지 24시간이 지나면 만료된다(Discord가 "expired"라고 알린다) — 그때는 번호를 타이핑하거나 답장으로 지시하면 된다.
   - `CLR-0031 번호` / `Q-0007 번호` / `번호 CLR-0031`이라고 하면 그 번호의 제목 한 줄과 복사 블록만 답한다(DB 무변경). 버튼 카드가 필요하면 `claire_buttons actions`.
   - 브리핑은 `references/briefing-format.md`의 예시대로. 짧은 대화·조회 결과(`today`/`week`/`overdue`)에는 붙이지 않는다.

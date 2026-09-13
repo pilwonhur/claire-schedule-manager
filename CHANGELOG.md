@@ -3,6 +3,19 @@
 형식은 [Keep a Changelog](https://keepachangelog.com/ko/1.1.0/)를 따르고 버전은 SemVer다.
 데이터 형식 버전(`SCHEMA_VERSION`)은 따로 관리한다.
 
+## [0.4.4] — 2026-09-13
+
+번호 버튼이 실제로는 한 번도 전송되지 않던 문제(교수님 피드백: iPhone에서 번호를 눌러도 아무 일도 없음).
+
+### 원인
+- Claire 에이전트(`openai/gpt-6-astra`, Codex 하네스)에서 OpenClaw `message` 도구는 초기 도구 목록에 들어가지 않고 `openclaw` 네임스페이스의 **지연 로딩(searchable) 도구**로만 제공된다. SKILL §5의 "message 도구가 도구 목록에 없으면 본문을 그대로 답한다"는 fallback 규칙이 매번 발동해 `claire_buttons build`·message 도구 호출을 건너뛰었다(9/13 06:00 브리핑·12:22 `등록:` 응답 모두 코드 블록만 전송, `message_tool_run_outcomes` 0건). tool search로 `message`를 찾아 로드한 뒤 호출하면 정상 전송됨을 실측했다(메시지 1548540630399983698).
+
+### 변경
+- SKILL §2 8단계·§5: message 도구는 **tool search로 찾아 로드한 뒤** 호출한다. 검색해도 없거나 전송이 실패할 때만 본문 그대로(사유 한 줄 첨부).
+- cron `Claire 일일 점검` 문구: "브리핑 본문은 채널에 그대로 전송" → 8단계(번호 버튼, 보낸 뒤 `NO_REPLY`)대로.
+- doctor `openclaw.message_tool` 안내에 지연 로딩 사실 표기.
+- 코드 변경 없음(버전 문자열만).
+
 ## [0.4.3] — 2026-09-13
 
 Discord **번호 버튼**(교수님 피드백: iPhone·iPad Discord에는 코드 블록 복사 버튼이 없어 0.4.2 방식이 모바일에서 동작하지 않음).

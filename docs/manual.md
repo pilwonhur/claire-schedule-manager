@@ -1,4 +1,4 @@
-# Claire 사용 안내 (v0.4.3)
+# Claire 사용 안내 (v0.4.4)
 
 > 구체적인 활용 시나리오 모음은 `references/usage-guide.md`에 있다. Claire 채널에서 `사용법 알려줘`라고 하면 Claire가 그 문서를 보여 준다.
 
