@@ -626,14 +626,14 @@ class Doctor:
             self.add("openclaw", "message_tool", "ok" if has_msg else "warn",
                      "Claire 에이전트에 message 도구 허용됨" if has_msg else
                      "Claire 에이전트에 message 도구가 없음 → 번호 버튼 없이 코드 블록으로만 답한다",
-                     None if has_msg else "openclaw config patch '{agents:{entries:{claire:{tools:{alsoAllow:[\"message\"]}}}}}'")
+                     None if has_msg else "echo '{agents:{entries:{claire:{tools:{alsoAllow:[\"message\"]}}}}}' | openclaw config patch --stdin")
             comp = self._openclaw_config_get("channels.discord.accounts.claire.agentComponents") or \
                 self._openclaw_config_get("channels.discord.agentComponents") or {}
             ttl = int(comp.get("ttlMs") or 1800000)
             ok = ttl >= 12 * 3600 * 1000
             self.add("openclaw", "button_ttl", "ok" if ok else "warn",
                      f"버튼 콜백 수명 {ttl // 60000}분" + ("" if ok else " (06:00 브리핑 버튼이 오전에 만료됨)"),
-                     None if ok else "openclaw config patch '{channels:{discord:{accounts:{claire:{agentComponents:{ttlMs:86400000}}}}}}'")
+                     None if ok else "echo '{channels:{discord:{accounts:{claire:{agentComponents:{ttlMs:86400000}}}}}}' | openclaw config patch --stdin")
         except (subprocess.TimeoutExpired, OSError, ValueError, TypeError) as e:
             self.add("openclaw", "message_tool", "warn", f"OpenClaw 설정을 읽지 못함: {e}")
 
