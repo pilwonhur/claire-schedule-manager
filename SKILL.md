@@ -1,6 +1,6 @@
 ---
 name: claire-schedule-manager
-version: 0.4.4
+version: 0.4.5
 description: >-
   교수님의 일정·업무를 Gmail(기관 메일 포워드 포함)·Google Calendar·Obsidian Tasks·Discord 이미지에서
   하나의 장부(SQLite)로 모아 아침 브리핑·확인 질문·진행 추적·검색을 제공한다. Claire 전용 Discord 채널에서
@@ -10,7 +10,7 @@ description: >-
   반영(승인 대기열)까지 동작한다. 브리핑의 "등록" 승인도 이 스킬로 처리한다.
 ---
 
-# Claire 통합 일정·업무 관리 (v0.4.4 — 외부 반영·번호 버튼까지)
+# Claire 통합 일정·업무 관리 (v0.4.5 — 외부 반영·번호 버튼까지)
 
 정본 설계: 프로젝트의 `PRD.md` v1.2. 이 문서는 판단 계층(Claire)이 지켜야 할 규칙과 절차만 적는다.
 
@@ -185,6 +185,7 @@ OpenClaw cron이 "일일 점검을 실행하고 브리핑을 보내세요"를 �
   - 위치: 번호가 실린 문장·줄이 끝난 직후. 한 줄에 번호가 둘이면 블록 둘을 나온 순서대로(첫 번호는 줄 오른쪽 버튼, 나머지는 그 아래 버튼 행). 같은 번호는 한 메시지에서 **처음 나온 자리에만** 한 번.
     부가 언급(`Q-0007 답변 대기`처럼 괄호 안 참고, 겹침 경고의 상대 항목, 후보 목록에서 이미 위에 나온 번호, 반영 상태·참고 줄)에는 붙이지 않는다.
   - **message 도구 찾기(먼저 읽을 것):** OpenClaw의 `message` 도구는 **초기 도구 목록에 나타나지 않는다**(Codex 하네스에서는 `openclaw` 네임스페이스의 지연 로딩 도구다). 이름만 보이거나 아예 안 보여도 "없다"고 판단하지 말고, **tool search로 `message`를 찾아 스키마를 로드한 뒤** 호출한다. 이 절차를 건너뛰고 본문만 답하면 교수님 iPhone에는 버튼이 없는 메시지가 간다(2026-09-13 실측: 검색 후 호출하면 정상 전송됨).
+  - **이 채널에서는 message 도구 사용이 허용된 예외다:** OpenClaw 의 그룹 채널 지침("For ordinary text, do not use the message tool … Use message(action=send) only when you need to send files, images, or other attachments")은 **번호 버튼·카드 응답에는 적용되지 않는다.** Claire 채널의 채널별 systemPrompt(`references/discord-channel-prompt.txt`, doctor `channel_prompt`)가 이 응답을 "current-turn context 가 message(action=send)로 보이는 출력을 요구하는 경우"로 선언해 두었다. 버튼이 필요한 응답을 그 지침 때문에 텍스트로 보내지 않는다.
   - **보내는 법(번호 버튼):** 본문을 파일로 저장하고 `claire_buttons build --file 본문.md`를 실행한다. 결과 `messages[]`를 순서대로 message 도구로 보낸다:
     `{channel: "discord", action: "send", to: "<지금 대화 중인 채널 channel:ID>", message: <message>, components: <components>}`.
     `components`는 도구 출력을 **그대로** 넘긴다(고치지 않는다). 다 보낸 뒤 최종 답변은 `NO_REPLY`로 끝낸다(본문이 두 번 가지 않게).

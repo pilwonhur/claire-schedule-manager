@@ -6,6 +6,7 @@
   backup [--out] [--no-mirror]
   restore-test --from <backup dir 또는 db 파일>   건수·해시 대조 (TC20)
   doctor [--offline] [--format text]              §4.3 확인 사항 실측
+  channel-prompt [--guild --channel]              Claire 채널 systemPrompt 패치 JSON (| openclaw config patch --stdin)
   calibrate                 5단계 (표본이 없으면 근거 부족만 보고)
 """
 
@@ -31,6 +32,37 @@ from claire_core import (  # noqa: E402
 )
 
 DATA_SUBDIRS = ("secrets", "raw", "attachments", "exports", "backups", "logs")
+CHANNEL_PROMPT_FILE = Path(__file__).resolve().parent.parent / "references" / "discord-channel-prompt.txt"
+CHANNEL_PROMPT_MARKER = "message(action=send)"
+
+
+def channel_prompt_text() -> str:
+    """Claire 채널에 넣는 OpenClaw 채널별 systemPrompt 원문 (v0.4.5, references/discord-channel-prompt.txt)."""
+    return CHANNEL_PROMPT_FILE.read_text(encoding="utf-8").strip()
+
+
+def find_claire_channels(guilds: dict) -> list[dict]:
+    """OpenClaw `channels.discord.accounts.claire.guilds` 에서 enabled 채널을 [{guild, channel, systemPrompt}] 로 편다."""
+    found = []
+    for gid, g in (guilds or {}).items():
+        for cid, c in ((g or {}).get("channels") or {}).items():
+            if (c or {}).get("enabled", True):
+                found.append({"guild": str(gid), "channel": str(cid), "systemPrompt": (c or {}).get("systemPrompt")})
+    return found
+
+
+def channel_prompt_status(channels: list[dict], expected: str) -> tuple[str, str]:
+    """(status, detail). 채널 하나라도 원문과 같으면 ok, 문구는 있지만 다르면 warn(구버전), 없으면 warn."""
+    if not channels:
+        return "warn", "OpenClaw Claire 계정에 enabled 된 Discord 채널이 없음"
+    same = [c for c in channels if (c["systemPrompt"] or "").strip() == expected]
+    if same:
+        return "ok", f"채널 {same[0]['channel']} systemPrompt = references/discord-channel-prompt.txt (버튼 응답의 message 도구 허용 예외)"
+    partial = [c for c in channels if CHANNEL_PROMPT_MARKER in (c["systemPrompt"] or "")]
+    if partial:
+        return "warn", f"채널 {partial[0]['channel']} systemPrompt 가 원문과 다름(구버전?) → 다시 적용"
+    return "warn", ("채널 systemPrompt 없음 → OpenClaw 그룹 지침이 message 도구를 첨부 전용으로 제한해 "
+                    "번호 버튼 대신 텍스트로 답하는 퇴행이 생긴다(2026-09-16 실측)")
 
 
 def _open(path) -> sqlite3.Connection:
@@ -634,6 +666,12 @@ class Doctor:
             self.add("openclaw", "button_ttl", "ok" if ok else "warn",
                      f"버튼 콜백 수명 {ttl // 60000}분" + ("" if ok else " (06:00 브리핑 버튼이 오전에 만료됨)"),
                      None if ok else "echo '{channels:{discord:{accounts:{claire:{agentComponents:{ttlMs:86400000}}}}}}' | openclaw config patch --stdin")
+            guilds = self._openclaw_config_get("channels.discord.accounts.claire.guilds") or \
+                self._openclaw_config_get("channels.discord.guilds") or {}
+            status, detail = channel_prompt_status(find_claire_channels(guilds), channel_prompt_text())
+            self.add("openclaw", "channel_prompt", status, detail,
+                     None if status == "ok" else
+                     f"{Path(__file__).resolve().parent}/claire_check channel-prompt | openclaw config patch --stdin && openclaw gateway restart")
         except (subprocess.TimeoutExpired, OSError, ValueError, TypeError) as e:
             self.add("openclaw", "message_tool", "warn", f"OpenClaw 설정을 읽지 못함: {e}")
 
@@ -671,6 +709,28 @@ def cmd_doctor(args, cfg):
     return Doctor(cfg, offline=args.offline).run()
 
 
+def cmd_channel_prompt(args, cfg):
+    """OpenClaw 채널별 systemPrompt 패치 JSON 을 stdout 에 낸다 (`| openclaw config patch --stdin`).
+    --guild/--channel 을 안 주면 OpenClaw 설정에서 Claire 계정의 첫 enabled 채널을 쓴다. 설정을 직접 바꾸지는 않는다."""
+    guild, channel = args.guild, args.channel
+    if not (guild and channel):
+        if not shutil.which("openclaw"):
+            raise ClaireError("openclaw_missing", "openclaw 가 없으면 --guild 와 --channel 을 직접 주세요")
+        out = subprocess.run(["openclaw", "config", "get", "channels.discord.accounts.claire.guilds"],
+                             capture_output=True, text=True, timeout=30)
+        try:
+            found = find_claire_channels(json.loads(out.stdout))
+        except json.JSONDecodeError:
+            found = []
+        if not found:
+            raise ClaireError("channel_not_found", "OpenClaw Claire 계정에 enabled 된 Discord 채널이 없음. --guild/--channel 을 주세요")
+        guild, channel = found[0]["guild"], found[0]["channel"]
+    patch = {"channels": {"discord": {"accounts": {"claire": {"guilds": {guild: {"channels": {channel: {
+        "systemPrompt": channel_prompt_text()}}}}}}}}}
+    print(json.dumps(patch, ensure_ascii=False))
+    sys.exit(0)
+
+
 def cmd_calibrate(args, cfg):
     conn = connect(create=False)
     n = conn.execute("SELECT COUNT(*) c FROM outbox WHERE op LIKE 'calendar.%' AND requires_confirm=1").fetchone()["c"]
@@ -697,6 +757,10 @@ def build_parser():
     d.add_argument("--offline", action="store_true", help="네트워크 호출 없이 파일·설정만 검사")
     d.add_argument("--format", choices=["json", "text"], default="json")
     d.set_defaults(fn=cmd_doctor)
+    cp = sub.add_parser("channel-prompt", help="Claire 채널 systemPrompt 패치 JSON 출력 (| openclaw config patch --stdin)")
+    cp.add_argument("--guild")
+    cp.add_argument("--channel")
+    cp.set_defaults(fn=cmd_channel_prompt)
     c = sub.add_parser("calibrate", help="임계값 조정 근거 (5단계)")
     c.set_defaults(fn=cmd_calibrate)
     return p

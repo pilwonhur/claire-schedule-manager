@@ -359,6 +359,36 @@ class ClaireTest(BaseTest):
         by = {c["name"]: c for c in d["checks"]}
         self.assertEqual(by["token:prof@example.com:read"]["status"], "ok")
 
+    # -- channel-prompt (v0.4.5) ---------------------------------------------
+    def test_channel_prompt_patch_shape_and_status(self):
+        import importlib.util
+        spec = importlib.util.spec_from_loader("claire_check", loader=None)
+        mod = importlib.util.module_from_spec(spec)
+        mod.__file__ = str(SCRIPTS / "claire_check")
+        exec(compile((SCRIPTS / "claire_check").read_text(encoding="utf-8"), str(SCRIPTS / "claire_check"), "exec"), mod.__dict__)
+        text = mod.channel_prompt_text()
+        self.assertIn("message(action=send)", text)
+        self.assertIn("NO_REPLY", text)
+        # 패치 JSON 형태 (openclaw config patch --stdin 입력)
+        proc = subprocess.run([sys.executable, str(SCRIPTS / "claire_check"), "channel-prompt",
+                               "--guild", "G1", "--channel", "C1"], capture_output=True, text=True, env=self.env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        patch = json.loads(proc.stdout)
+        self.assertEqual(patch["channels"]["discord"]["accounts"]["claire"]["guilds"]["G1"]["channels"]["C1"]["systemPrompt"], text)
+        # 채널 탐지: enabled=false 는 제외
+        guilds = {"G1": {"channels": {"C1": {"enabled": True, "systemPrompt": text},
+                                      "C2": {"enabled": False}}}}
+        found = mod.find_claire_channels(guilds)
+        self.assertEqual([c["channel"] for c in found], ["C1"])
+        # 상태 판정
+        self.assertEqual(mod.channel_prompt_status(found, text)[0], "ok")
+        stale = [{"guild": "G1", "channel": "C1", "systemPrompt": "old rule with message(action=send)"}]
+        st, detail = mod.channel_prompt_status(stale, text)
+        self.assertEqual(st, "warn"); self.assertIn("다름", detail)
+        st, detail = mod.channel_prompt_status([{"guild": "G1", "channel": "C1", "systemPrompt": None}], text)
+        self.assertEqual(st, "warn"); self.assertIn("없음", detail)
+        self.assertEqual(mod.channel_prompt_status([], text)[0], "warn")
+
     def test_doctor_flags_data_dir_in_dropbox_like_path(self):
         self.assertEqual(claire_core.is_synced_location(Path("/Users/x/Dropbox/ClaireData")), "Dropbox")
 

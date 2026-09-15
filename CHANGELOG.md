@@ -3,6 +3,25 @@
 형식은 [Keep a Changelog](https://keepachangelog.com/ko/1.1.0/)를 따르고 버전은 SemVer다.
 데이터 형식 버전(`SCHEMA_VERSION`)은 따로 관리한다.
 
+## [0.4.5] — 2026-09-16
+
+번호 버튼이 며칠 만에 다시 사라지고 텍스트(코드 블록)로만 오던 퇴행(교수님 피드백: "어제는 버튼이 왔는데 오늘은 예전처럼 보인다").
+
+### 원인
+- OpenClaw(2026.9.2) `buildGroupChatContext`가 그룹 채널 **매 턴** 시스템 프롬프트에 "For ordinary text, do not use the message tool … unless the current-turn context asks for visible output via message(action=send). Use message(action=send) only when you need to send files, images, or other attachments"를 넣는다. SKILL §5(버튼은 message 도구로)와 매 턴 충돌해 모델이 어느 쪽을 따르느냐가 달라졌다(버튼 전송 9/13 7건 → 9/14 17건 → 9/15 2건 → 9/16 0건). 스킬 문구만으로는 못 고친다.
+- 그 문장이 열어 둔 예외("current-turn context 가 요구하면")를 선언하는 정식 자리는 Discord **채널별 `systemPrompt`** 설정이다. Discord 플러그인이 이를 `GroupSystemPrompt`로 넘기고 OpenClaw 가 그룹 지침 바로 뒤 같은 블록에 붙인다. dist 수정·재빌드 불필요, 업그레이드에도 유지.
+
+### 추가
+- `references/discord-channel-prompt.txt` — 채널 systemPrompt 원문(단일 출처).
+- `claire_check channel-prompt [--guild --channel]` — 위 원문으로 `openclaw config patch --stdin` 에 넣을 패치 JSON 출력. guild·channel 은 OpenClaw 설정에서 자동 탐지. 설정을 직접 바꾸지는 않는다(교수님이 실행).
+- doctor `openclaw.channel_prompt` — Claire 채널 systemPrompt 가 원문과 같으면 ok, 문구는 있으나 다르면 warn(구버전), 없으면 warn + fix 명령.
+- `references/doctor.md` — OpenClaw 설정 3건 표와 채널 systemPrompt 절(원인·명령·확인법).
+- SKILL §5 — 이 채널에서는 그룹 지침의 제한이 버튼 응답에 적용되지 않는다는 한 줄.
+- 테스트 3건(channel-prompt 패치 형태, 상태 판정 ok/구버전/없음, 채널 탐지).
+
+### 적용(9/16)
+- 교수님이 채널 systemPrompt 를 `openclaw config patch --stdin` 으로 넣고 `openclaw gateway restart`. iPhone 에서 버튼 재확인됨.
+
 ## [0.4.4] — 2026-09-13
 
 번호 버튼이 실제로는 한 번도 전송되지 않던 문제(교수님 피드백: iPhone에서 번호를 눌러도 아무 일도 없음).
