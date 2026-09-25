@@ -19,3 +19,11 @@
 ## 무결성 (`claire_check integrity`)
 고아 `item_source`·`link`·`attachment`·`question`·`relation`·`activity_log`, 근거 없는 `done`, 열린 질문 없는 `needs_info`,
 `outbox` 실패 잔량, 48시간 넘게 성공 없는 `sync_state`, 첨부 sha256 불일치, `ref` 중복·공백, FTS 건수 불일치, `running` 실행 2건 이상, `PRAGMA integrity_check`.
+
+## 업그레이드·되돌리기 (0.5.0)
+- `install.sh`는 버전이 바뀌면 스키마 변환 전에 `~/ClaireData/backups/pre-upgrade-<이전>-to-<새>-<시각>/claire.db`를 남기고,
+  직전 스킬 폴더를 `~/ClaireData/skill-prev/`에 한 세대 보관한다.
+- 코드만 되돌리기: `claire-update --version v0.4.5`. 스키마 v2 의 추가 열은 옛 코드가 무시한다.
+- DB까지 되돌리기: Claire 를 멈추고(cron 일시 중지) `claire.db`를 pre-upgrade 사본으로 교체(`-wal`·`-shm` 삭제) → `claire_check integrity`.
+  그 사이 쌓인 변경은 사라지므로 마지막 수단이다.
+

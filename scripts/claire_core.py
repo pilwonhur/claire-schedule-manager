@@ -27,10 +27,11 @@ from zoneinfo import ZoneInfo
 #
 # 스킬 전체의 배포 버전 (SemVer). 동작이나 문서가 바뀌면 반드시 올리고
 # CHANGELOG.md에 항목을 남긴다. tests/test_claire.py가 둘의 일치를 검사한다.
-CLAIRE_VERSION = "0.4.5"
+CLAIRE_VERSION = "0.5.0"
 
-# 데이터 파일 형식의 버전. 스키마가 바뀌면 올린다.
-SCHEMA_VERSION = 1
+# 데이터 파일 형식의 버전. 스키마가 바뀌면 올리고 MIGRATIONS 에 기존 DB 변환을 적는다.
+# v2 (0.5.0): item.due_precision·window_auto·attendance·daily_logged_on, outbox.selected_at, checkin 표.
+SCHEMA_VERSION = 2
 
 # --------------------------------------------------------------------------
 # 설정 (PRD §12, §15)
@@ -133,7 +134,21 @@ DEFAULT_CONFIG = {
         "max_attempts": 5,
         "backoff_minutes": [1, 5, 15, 60, 240],
         "calendar_reminder_minutes": 30,
+        # 0.5.0 — 마감 시각만 있는 항목은 마감 N분 전부터 마감까지 달력에 표시한다 (별도 시작·기간 지시가 우선)
+        "deadline_calendar": True,
+        "deadline_window_minutes": 60,
+        "deadline_title_prefix": "[마감] ",
     },
+
+    # 0.5.0 — 완료 기록을 완료한 날의 Daily 노트에 남긴다 (완료 시점에 outbox 로 즉시 기록, 매일 점검에서 누락 대조)
+    "daily_done": {
+        "enabled": True,
+        "section": "## 완료한 일",
+        "after_section": "## Tasks",           # 섹션이 없으면 이 섹션 뒤에 만든다
+    },
+
+    # 0.5.0 — 12:00·18:00 미등록 일정 확인 (OpenClaw cron 이 claire_run checkin 을 부른다)
+    "checkin": {"slots": ["12:00", "18:00"]},
 
     # §7.1, §9
     "min_confidence": 0.4,
@@ -269,6 +284,10 @@ CREATE TABLE IF NOT EXISTS item (
   occurrence_at  TEXT,
   canonical_note TEXT,
   ledger_note    TEXT,
+  due_precision  TEXT CHECK (due_precision IN ('date','time')),
+  window_auto    INTEGER NOT NULL DEFAULT 0,
+  attendance     TEXT CHECK (attendance IN ('undecided','attending','declined')),
+  daily_logged_on TEXT,
   created_at     TEXT NOT NULL,
   updated_at     TEXT NOT NULL,
   completed_at   TEXT,
@@ -432,6 +451,7 @@ CREATE TABLE IF NOT EXISTS outbox (
   last_error       TEXT,
   status           TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','awaiting_confirm','done','failed','cancelled')),
   result           TEXT,
+  selected_at      TEXT,
   created_at       TEXT NOT NULL,
   done_at          TEXT
 );
@@ -449,6 +469,18 @@ CREATE TABLE IF NOT EXISTS briefing (
   delivery      TEXT
 );
 
+-- 12:00·18:00 미등록 일정 확인 (0.5.0). 하루·슬롯마다 한 번만 보낸다.
+CREATE TABLE IF NOT EXISTS checkin (
+  id          INTEGER PRIMARY KEY,
+  day         TEXT NOT NULL,
+  slot        TEXT NOT NULL,
+  created_at  TEXT NOT NULL,
+  message_id  TEXT,
+  answered_at TEXT,
+  result      TEXT,
+  UNIQUE (day, slot)
+);
+
 -- 한국어 검색 (Clio의 어간 근사 처리 재사용)
 CREATE VIRTUAL TABLE IF NOT EXISTS search_fts USING fts5(
   ref, title, project, next_action, waiting_on, excerpts,
@@ -459,7 +491,7 @@ CREATE VIRTUAL TABLE IF NOT EXISTS search_fts USING fts5(
 # 백업·복구 대조와 무결성 집계에 쓰는 표 목록 (TC20)
 COUNT_TABLES = ["item", "source_event", "item_source", "attachment", "question",
                 "activity_log", "relation", "link", "sync_state", "run", "outbox",
-                "briefing"]
+                "briefing", "checkin"]
 
 # 내용 해시에 참여하는 표. 복구 후 "건수·해시 일치"의 해시가 이것이다 (TC20).
 HASH_TABLES = ["item", "source_event", "item_source", "question", "activity_log",
@@ -481,18 +513,86 @@ def connect(create: bool = True) -> sqlite3.Connection:
     d.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(db, isolation_level=None, timeout=10.0)
     conn.row_factory = sqlite3.Row
+    fresh = not _has_table(conn, "item")
+    if not fresh:
+        migrate(conn)                      # 기존 DB 는 먼저 열을 맞춘 뒤 DDL(인덱스·새 표)을 적용한다
     conn.executescript(SCHEMA_SQL)
     conn.execute(
         "INSERT INTO meta(key,value) VALUES('schema_version',?) "
         "ON CONFLICT(key) DO NOTHING",
         (str(SCHEMA_VERSION),),
     )
+    if fresh:
+        conn.execute("INSERT INTO meta(key,value) VALUES('daily_done_since',?) ON CONFLICT(key) DO NOTHING",
+                     (_meta_now(),))
     conn.execute(
         "INSERT INTO meta(key,value) VALUES('created_by_version',?) "
         "ON CONFLICT(key) DO NOTHING",
         (CLAIRE_VERSION,),
     )
     return conn
+
+
+def _meta_now() -> str:
+    """meta 기록용 현재 시각 (설정을 읽기 전이라 CLAIRE_NOW 만 본다)."""
+    override = os.environ.get("CLAIRE_NOW")
+    if override:
+        dt = datetime.fromisoformat(override)
+        return (dt if dt.tzinfo else dt.replace(tzinfo=ZoneInfo("Asia/Seoul"))).replace(microsecond=0).isoformat()
+    return datetime.now(ZoneInfo("Asia/Seoul")).replace(microsecond=0).isoformat()
+
+
+def _has_table(conn, name: str) -> bool:
+    return conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)).fetchone() is not None
+
+
+def _columns(conn, table: str) -> set[str]:
+    return {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+
+
+# 기존 DB 변환 (앞으로만). 열 추가는 ALTER TABLE ADD COLUMN 으로, 멱등하게 (열이 있으면 건너뛴다).
+MIGRATION_COLUMNS = {
+    "item": [
+        ("due_precision", "TEXT CHECK (due_precision IN ('date','time'))"),
+        ("window_auto", "INTEGER NOT NULL DEFAULT 0"),
+        ("attendance", "TEXT CHECK (attendance IN ('undecided','attending','declined'))"),
+        ("daily_logged_on", "TEXT"),
+    ],
+    "outbox": [("selected_at", "TEXT")],
+}
+
+
+def migrate(conn) -> list[str]:
+    """스키마 v1 → v2. 바꾼 것을 돌려준다. install.sh 가 migrate 전에 백업한다."""
+    done = []
+    row = conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone() if _has_table(conn, "meta") else None
+    before = int(row[0]) if row else 1
+    for table, cols in MIGRATION_COLUMNS.items():
+        if not _has_table(conn, table):
+            continue
+        have = _columns(conn, table)
+        for name, ddl in cols:
+            if name not in have:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}")
+                done.append(f"{table}.{name}")
+    if "item.due_precision" in done:
+        # 날짜만 받은 마감은 T23:59:59 로 저장되어 왔다. 그 외 시각은 확정된 시각으로 본다.
+        conn.execute("UPDATE item SET due_precision = CASE WHEN due_at LIKE '%T23:59:59%' THEN 'date' ELSE 'time' END "
+                     "WHERE due_at IS NOT NULL AND due_precision IS NULL")
+    if before < SCHEMA_VERSION and _has_table(conn, "meta"):
+        conn.execute("UPDATE meta SET value=? WHERE key='schema_version'", (str(SCHEMA_VERSION),))
+        # Daily 완료 기록은 이 시각 이후 완료분부터 (과거 완료를 한꺼번에 Daily 에 쏟아 넣지 않는다)
+        conn.execute("INSERT INTO meta(key,value) VALUES('daily_done_since',?) ON CONFLICT(key) DO NOTHING",
+                     (_meta_now(),))
+        conn.execute("INSERT INTO meta(key,value) VALUES('migrated_v%d',?) ON CONFLICT(key) DO NOTHING" % SCHEMA_VERSION,
+                     (_meta_now(),))
+        done.append(f"schema_version {before} → {SCHEMA_VERSION}")
+    return done
+
+
+def meta_get(conn, key: str) -> str | None:
+    row = conn.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+    return row[0] if row else None
 
 
 class tx:
@@ -588,8 +688,22 @@ def next_question_ref(conn, cfg) -> str:
     return next_ref(conn, "question", cfg["question_prefix"], cfg["ref_digits"])
 
 
+_SHORT_REF = re.compile(r"^\s*(?:(CLR|Q)\s*-?\s*)?0*(\d{1,6})\s*$", re.IGNORECASE)
+
+
+def normalize_ref(ref: str, default_prefix: str = "CLR", digits: int = 4) -> str:
+    """버튼이 만료된 뒤 모바일에서 짧게 적은 번호를 정식 번호로: `31`·`0031`·`clr31`·`CLR 31` → `CLR-0031`,
+    `q7`·`Q-7` → `Q-0007`. 형식이 다르면 대문자로만 바꿔 돌려준다."""
+    m = _SHORT_REF.match(ref or "")
+    if not m:
+        return (ref or "").strip().upper()
+    prefix = (m.group(1) or default_prefix).upper()
+    return f"{prefix}-{int(m.group(2)):0{digits}d}"
+
+
 def get_item(conn: sqlite3.Connection, ref: str, allow_deleted: bool = False) -> sqlite3.Row:
-    row = conn.execute("SELECT * FROM item WHERE ref = ?", (ref.upper(),)).fetchone()
+    ref = normalize_ref(ref)
+    row = conn.execute("SELECT * FROM item WHERE ref = ?", (ref,)).fetchone()
     if row is None:
         raise ClaireError("item_not_found", f"항목을 찾을 수 없습니다: {ref}")
     if row["deleted_at"] and not allow_deleted:
@@ -598,7 +712,8 @@ def get_item(conn: sqlite3.Connection, ref: str, allow_deleted: bool = False) ->
 
 
 def get_question(conn: sqlite3.Connection, ref: str) -> sqlite3.Row:
-    row = conn.execute("SELECT * FROM question WHERE ref = ?", (ref.upper(),)).fetchone()
+    ref = normalize_ref(ref, default_prefix="Q")
+    row = conn.execute("SELECT * FROM question WHERE ref = ?", (ref,)).fetchone()
     if row is None:
         raise ClaireError("question_not_found", f"질문을 찾을 수 없습니다: {ref}")
     return row

@@ -1,0 +1,34 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python: ["3.11", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: version strings agree
+        run: |
+          v=$(tr -d ' \n' < VERSION)
+          grep -q "^CLAIRE_VERSION = \"$v\"" scripts/claire_core.py
+          grep -q "^version: $v$" SKILL.md
+          grep -q "^## \[$v\]" CHANGELOG.md
+      - name: unit tests (표준 라이브러리만, 네트워크 없음)
+        run: python tests/test_claire.py
+      - name: install into a temp HOME
+        run: |
+          export HOME=$(mktemp -d) CLAIRE_DATA_DIR=$(mktemp -d)/ClaireData
+          ./install.sh
+          test -x "$HOME/.local/bin/claire-update"
+          python3 "$HOME/.claude/skills/claire-schedule-manager/scripts/claire_check" version

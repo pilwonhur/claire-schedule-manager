@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """claire_apply — outbox 실행 (PRD §6.2 쓰기, §6.3 쓰기, §9 원자성, D5).
 
-  claire_apply [--run ID] [--dry-run] [--op calendar.create ...]   대기 중 op 실행 (승인 필요한 것은 건너뜀)
-  claire_apply --list [--status pending|awaiting_confirm|failed|done]
-  claire_apply --confirm <outbox id | CLR-0045 | all>              브리핑에서 "등록" 승인
-  claire_apply --cancel <outbox id | CLR-0045>
+  claire_apply [--run ID] [--dry-run] [--op calendar.create ...] [--item CLR]   대기 중 op 실행 (승인 필요한 것은 건너뜀)
+  claire_apply --list [--status pending|awaiting_confirm|failed|done] [--include-past]
+  claire_apply --approvals [--include-past]                          승인 대기 목록 (달력 / Tasks 구분, 지난 일정 제외)
+  claire_apply --confirm <outbox id | CLR-0045[,CLR-0047…] | selected | all> [--only calendar|tasks] [--include-past]
+  claire_apply --select <CLR…> | --unselect <CLR… | all>            선택 일괄 승인용 표시 (모바일 버튼)
+  claire_apply --cancel <outbox id | CLR-0045[,…]> [--only …]        "등록 안 함" (기록은 남고 declined 로 보인다)
+  claire_apply --request <CLR> [--only calendar|tasks]               교수님이 "달력에 넣어줘" 한 항목을 바로 예약
 
 op
   obsidian.assign_id   연결된 Tasks 줄에 🆔 clrNNNN 부여 (D12)
@@ -12,6 +15,7 @@ op
   obsidian.add_task    Daily `## Tasks` 에 `- [ ] #tasks [[정본]]: 제목 📅 마감 🆔 clrNNNN`
   calendar.create      Prof. Hur 에 이벤트 생성 (extendedProperties.private.claire_ref)
   calendar.update      교수님 지시로 시각 변경 → Calendar patch → 항목 미러링
+  obsidian.daily_done  완료한 날 Daily `## 완료한 일` 에 한 줄 (0.5.0. 완료 취소·완료일 정정이면 옮기거나 지운다)
   discord.notice       Claire 가 채널에 전달할 문구 (실행은 하지 않고 to_deliver 로 돌려준다)
 
 실패는 지수 백오프(1·5·15·60·240분)로 최대 5회 재시도 뒤 failed. 볼트 파일이 읽은 뒤 바뀌면 쓰지 않고 다음으로 미룬다 (TC19).
@@ -22,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from datetime import timedelta
 from pathlib import Path
@@ -31,11 +36,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "connectors"))
 from claire_core import (  # noqa: E402
     ClaireError, connect, get_item, log_activity, now_dt, now_iso, parse_iso, reindex_item, run_cli, tx,
 )
+import claire_ops as ops  # noqa: E402
 import google_api  # noqa: E402
 import obsidian_tasks  # noqa: E402
 
-OPS = ("obsidian.assign_id", "obsidian.check_task", "obsidian.add_task", "calendar.create", "calendar.update",
-       "discord.notice", "discord.brief")
+OPS = ("obsidian.assign_id", "obsidian.check_task", "obsidian.add_task", "obsidian.daily_done", "calendar.create",
+       "calendar.update", "discord.notice", "discord.brief")
+ONLY = {"calendar": ("calendar.create", "calendar.update"), "tasks": ("obsidian.add_task",)}
 
 
 # --------------------------------------------------------------------------
@@ -87,7 +94,7 @@ def op_check_task(conn, cfg, row, payload, ts):
 def op_add_task(conn, cfg, row, payload, ts):
     day = payload.get("day") or ts[:10]
     line = obsidian_tasks.format_task_line(payload["title"], payload.get("due"), payload["ref"], payload.get("note"),
-                                           cfg["obsidian"].get("tag", "#tasks"))
+                                           cfg["obsidian"].get("tag", "#tasks"), payload.get("due_time"))
     res = obsidian_tasks.add_task_to_daily(cfg, day, line)
     file_rel = str(Path(res["path"]).relative_to(obsidian_tasks.vault_path(cfg)))
     key = f"{file_rel}#{obsidian_tasks.format_id(payload['ref'])}"
@@ -168,12 +175,32 @@ def op_calendar_update(conn, cfg, row, payload, ts):
     return {"event_id": payload["event_id"], "etag": ev.get("etag"), "mirrored": sets}
 
 
+def op_daily_done(conn, cfg, row, payload, ts):
+    """Daily 완료 기록을 원하는 상태로 맞춘다 (멱등): 목표일에는 한 줄, 그 외(이전 기록일)에서는 지운다."""
+    item = conn.execute("SELECT * FROM item WHERE id=?", (row["item_id"],)).fetchone()
+    target = payload.get("day")
+    remove = (set(payload.get("remove_from") or []) | {item["daily_logged_on"]}) - {target, None}
+    out = {"day": target, "removed": [], "action": None}
+    for d in sorted(remove):
+        r = obsidian_tasks.remove_done_line(cfg, d, payload["ref"])
+        if r["action"] == "removed":
+            out["removed"].append(d)
+    if target:
+        line = obsidian_tasks.format_done_line(payload["ref"], payload["title"], payload.get("time"), payload.get("note"))
+        r = obsidian_tasks.upsert_done_line(cfg, target, payload["ref"], line)
+        out.update({"action": r["action"], "file": str(Path(r["path"]).relative_to(obsidian_tasks.vault_path(cfg))),
+                    "created_daily": r["created"]})
+    conn.execute("UPDATE item SET daily_logged_on=? WHERE id=?", (target, row["item_id"]))
+    return out
+
+
 class _Skip(Exception):
     """시도 횟수를 늘리지 않고 이번 실행에서만 건너뛴다."""
 
 
 HANDLERS = {"obsidian.assign_id": op_assign_id, "obsidian.check_task": op_check_task, "obsidian.add_task": op_add_task,
-            "calendar.create": op_calendar_create, "calendar.update": op_calendar_update}
+            "obsidian.daily_done": op_daily_done, "calendar.create": op_calendar_create,
+            "calendar.update": op_calendar_update}
 
 
 # --------------------------------------------------------------------------
@@ -188,10 +215,18 @@ def _backoff(cfg, attempts: int) -> int:
 def cmd_run(args, cfg):
     conn = connect(create=False)
     now = now_dt(cfg); now_s = now.isoformat()
+    reconciled = []
+    if not args.dry_run:
+        with tx(conn):
+            reconciled = ops.reconcile_daily_done(conn, cfg, now_s)      # 완료 기록 누락 대조 (0.5.0)
     rows = conn.execute(
         "SELECT * FROM outbox WHERE status='pending' AND (not_before IS NULL OR not_before <= ?) ORDER BY id", (now_s,)).fetchall()
     if args.op:
         rows = [r for r in rows if r["op"] in args.op]
+    if args.item:
+        it = get_item(conn, args.item)
+        # 바로 반영(--apply): 이 항목의 op 는 백오프 대기 중이어도 한 번 시도한다
+        rows = conn.execute("SELECT * FROM outbox WHERE status='pending' AND item_id=? ORDER BY id", (it["id"],)).fetchall()
     done, failed, retry, skipped, deliver = [], [], [], [], []
     max_attempts = int(cfg["apply"].get("max_attempts", 5))
     for row in rows:
@@ -243,7 +278,7 @@ def cmd_run(args, cfg):
                                   "not_before": nb})
     awaiting = [_row(conn, r) for r in conn.execute("SELECT * FROM outbox WHERE status='awaiting_confirm' ORDER BY id")]
     return {"run_id": args.run, "done": done, "retry": retry, "failed": failed, "skipped": skipped, "to_deliver": deliver,
-            "awaiting_confirm": awaiting, "dry_run": bool(args.dry_run),
+            "awaiting_confirm": awaiting, "dry_run": bool(args.dry_run), "daily_reconciled": reconciled,
             "summary": {"done": len(done), "retry": len(retry), "failed": len(failed), "skipped": len(skipped),
                         "awaiting_confirm": len(awaiting), "to_deliver": len(deliver)}}
 
@@ -254,7 +289,7 @@ def _row(conn, r) -> dict:
     return {"outbox_id": r["id"], "op": r["op"], "item_ref": ref["ref"] if ref else None, "title": ref["title"] if ref else None,
             "status": r["status"], "requires_confirm": bool(r["requires_confirm"]), "attempts": r["attempts"],
             "not_before": r["not_before"], "last_error": r["last_error"], "created_at": r["created_at"],
-            "summary": _describe(r["op"], p)}
+            "selected": bool(r["selected_at"]), "summary": _describe(r["op"], p)}
 
 
 def _describe(op: str, p: dict) -> str:
@@ -268,41 +303,71 @@ def _describe(op: str, p: dict) -> str:
         return f"Tasks 체크: {p.get('external_key')}"
     if op == "obsidian.assign_id":
         return f"🆔 부여: {p.get('external_key')}"
+    if op == "obsidian.daily_done":
+        return f"Daily {p.get('day')} 완료 기록: {p.get('title')}" if p.get("day") else f"Daily 완료 기록 삭제: {p.get('ref')}"
     return op
 
 
-def _select(conn, target: str):
-    if target == "all":
-        return conn.execute("SELECT * FROM outbox WHERE status='awaiting_confirm'").fetchall()
-    if target.isdigit():
-        r = conn.execute("SELECT * FROM outbox WHERE id=?", (int(target),)).fetchone()
-        return [r] if r else []
-    it = get_item(conn, target)
-    return conn.execute("SELECT * FROM outbox WHERE item_id=? AND status IN ('awaiting_confirm','pending')", (it["id"],)).fetchall()
+def _targets(raw: str) -> list[str]:
+    return [t for t in re.split(r"[\s,]+", raw or "") if t]
+
+
+def _select(conn, cfg, target: str, only: str | None = None, include_past: bool = False,
+            statuses=("awaiting_confirm", "pending")):
+    """승인·취소 대상 outbox 행. target: outbox id(숫자) | CLR-0031·clr31(쉼표·공백으로 여럿) | selected | all.
+    all·selected 는 지난 일정(목록에서 숨긴 것)을 빼고, --include-past 면 포함한다."""
+    now = now_dt(cfg)
+    ops_filter = ONLY.get(only) if only else None
+    out, seen = [], set()
+
+    def add(rows):
+        for r in rows:
+            if r["id"] in seen or (ops_filter and r["op"] not in ops_filter):
+                continue
+            seen.add(r["id"]); out.append(r)
+
+    for t in _targets(target):
+        low = t.lower()
+        if low in ("all", "selected"):
+            sql = "SELECT * FROM outbox WHERE status='awaiting_confirm'" + (" AND selected_at IS NOT NULL" if low == "selected" else "")
+            rows = [r for r in conn.execute(sql + " ORDER BY id")
+                    if include_past or not ops._op_is_past(cfg, r["op"], json.loads(r["payload"]), now)]
+            add(rows)
+        elif t.isdigit():                    # 숫자만이면 outbox id (항목 번호는 CLR-0031·clr31 처럼)
+            add(conn.execute("SELECT * FROM outbox WHERE id=?", (int(t),)).fetchall())
+        else:
+            it = get_item(conn, t)
+            add(conn.execute("SELECT * FROM outbox WHERE item_id=? AND status IN (%s) ORDER BY id"
+                             % ",".join("?" * len(statuses)), (it["id"], *statuses)).fetchall())
+    return out
 
 
 def cmd_confirm(args, cfg):
     conn = connect(create=False); now_s = now_iso(cfg)
-    rows = _select(conn, args.confirm)
+    rows = _select(conn, cfg, args.confirm, args.only, args.include_past)
     if not rows:
         raise ClaireError("nothing_to_confirm", f"승인할 대기 항목이 없습니다: {args.confirm}")
     out = []
     with tx(conn):
         for r in rows:
             if r["status"] != "awaiting_confirm":
-                out.append({"outbox_id": r["id"], "status": r["status"], "note": "승인 대상 아님"})
+                out.append({"outbox_id": r["id"], "op": r["op"], "status": r["status"], "note": "승인 대상 아님"})
                 continue
-            conn.execute("UPDATE outbox SET status='pending', confirmed_at=?, not_before=NULL WHERE id=?", (now_s, r["id"]))
+            conn.execute("UPDATE outbox SET status='pending', confirmed_at=?, not_before=NULL, selected_at=NULL WHERE id=?",
+                         (now_s, r["id"]))
             if r["item_id"]:
                 log_activity(conn, item_id=r["item_id"], action="apply", actor="user", ts=now_s, field=r["op"],
                              new_value="confirmed", reason="교수님 승인", payload={"outbox_id": r["id"]})
-            out.append({"outbox_id": r["id"], "op": r["op"], "status": "pending"})
-    return {"confirmed": out, "message": "승인했습니다. 다음 claire_apply 실행 때 반영됩니다 (지금 바로: claire_apply --run <id>)."}
+            ref = conn.execute("SELECT ref FROM item WHERE id=?", (r["item_id"],)).fetchone() if r["item_id"] else None
+            out.append({"outbox_id": r["id"], "op": r["op"], "item_ref": ref["ref"] if ref else None, "status": "pending"})
+    n = sum(1 for o in out if o["status"] == "pending")
+    return {"confirmed": out, "count": n,
+            "message": f"{n}건 승인했습니다. 다음 claire_apply 실행 때 반영됩니다 (지금 바로: claire_apply --run <id>)."}
 
 
 def cmd_cancel(args, cfg):
     conn = connect(create=False); now_s = now_iso(cfg)
-    rows = _select(conn, args.cancel)
+    rows = _select(conn, cfg, args.cancel, args.only, True)
     if not rows:
         raise ClaireError("nothing_to_cancel", f"취소할 대기 항목이 없습니다: {args.cancel}")
     out = []
@@ -311,12 +376,69 @@ def cmd_cancel(args, cfg):
             if r["status"] not in ("awaiting_confirm", "pending"):
                 out.append({"outbox_id": r["id"], "status": r["status"], "note": "취소 대상 아님"})
                 continue
-            conn.execute("UPDATE outbox SET status='cancelled', done_at=? WHERE id=?", (now_s, r["id"]))
+            conn.execute("UPDATE outbox SET status='cancelled', done_at=?, selected_at=NULL, result=? WHERE id=?",
+                         (now_s, json.dumps({"declined": True, "by": "user"}), r["id"]))
             if r["op"] == "calendar.update" and r["item_id"]:
                 conn.execute("UPDATE link SET sync_status='ok' WHERE item_id=? AND system='calendar' AND sync_status='pending'",
                              (r["item_id"],))
+            if r["item_id"]:
+                log_activity(conn, item_id=r["item_id"], action="apply", actor="user", ts=now_s, field=r["op"],
+                             new_value="declined", reason="교수님: 등록 안 함", payload={"outbox_id": r["id"]})
             out.append({"outbox_id": r["id"], "op": r["op"], "status": "cancelled"})
-    return {"cancelled": out}
+    return {"cancelled": out, "message": f"{len([o for o in out if o['status'] == 'cancelled'])}건 등록하지 않기로 했습니다. 업무 항목은 그대로 둡니다."}
+
+
+def cmd_select(args, cfg, on: bool):
+    conn = connect(create=False); now_s = now_iso(cfg)
+    target = args.select if on else args.unselect
+    if not on and target.lower() == "all":
+        rows = conn.execute("SELECT * FROM outbox WHERE selected_at IS NOT NULL").fetchall()
+    else:
+        rows = [r for r in _select(conn, cfg, target, args.only, True, statuses=("awaiting_confirm",))
+                if r["status"] == "awaiting_confirm"]
+    if not rows:
+        raise ClaireError("nothing_to_select", f"승인 대기 중인 항목이 아닙니다: {target}")
+    with tx(conn):
+        for r in rows:
+            conn.execute("UPDATE outbox SET selected_at=? WHERE id=?", (now_s if on else None, r["id"]))
+    q = ops.approval_queue(conn, cfg, now_dt(cfg), include_past=True)
+    sel = q["selected"]
+    return {"selected": sel, "count": len(sel),
+            "message": (f"선택 {len(sel)}건: {', '.join(sel)}. '선택한 것 등록'을 누르면 한 번에 승인합니다." if sel
+                        else "선택한 항목이 없습니다.")}
+
+
+def cmd_request(args, cfg):
+    """교수님이 명시적으로 "달력에(Tasks 에) 넣어줘" 한 항목: 지시로 보고 바로 예약한다(승인 불필요)."""
+    conn = connect(create=False); now_s = now_iso(cfg)
+    with tx(conn):
+        it = get_item(conn, args.request)
+        waiting = conn.execute("SELECT * FROM outbox WHERE item_id=? AND status='awaiting_confirm'", (it["id"],)).fetchall()
+        waiting = [r for r in waiting if not args.only or r["op"] in ONLY[args.only]]
+        for r in waiting:
+            conn.execute("UPDATE outbox SET status='pending', confirmed_at=?, selected_at=NULL WHERE id=?", (now_s, r["id"]))
+        # 이전에 "등록 안 함"으로 닫은 op 는 교수님 요청이면 다시 살린다
+        revived = []
+        for r in conn.execute("SELECT * FROM outbox WHERE item_id=? AND status='cancelled' AND op IN "
+                              "('calendar.create','obsidian.add_task')", (it["id"],)).fetchall():
+            if args.only and r["op"] not in ONLY[args.only]:
+                continue
+            conn.execute("UPDATE outbox SET status='pending', requires_confirm=0, confirmed_at=?, attempts=0, last_error=NULL, "
+                         "result=NULL, done_at=NULL WHERE id=?", (now_s, r["id"]))
+            revived.append(r["op"])
+        planned = ops.plan_external(conn, cfg, it, now_s, directed=True)
+    if not (waiting or revived or planned):
+        st = ops.sync_state_of(conn, get_item(conn, args.request))
+        why = "이미 등록되어 있습니다" if "linked" in (st["calendar"], st["tasks"]) else \
+            "달력에 올릴 시각이 없습니다(회의 시작 시각 또는 마감 시각이 필요합니다)"
+        raise ClaireError("nothing_to_request", f"{it['ref']}: {why}", sync=st)
+    return {"ref": it["ref"], "confirmed": [r["op"] for r in waiting], "revived": revived, "planned": planned,
+            "message": "예약했습니다. claire_apply 로 반영합니다."}
+
+
+def cmd_approvals(args, cfg):
+    conn = connect(create=False)
+    return ops.approval_queue(conn, cfg, now_dt(cfg), include_past=args.include_past)
 
 
 def cmd_list(args, cfg):
@@ -329,7 +451,8 @@ def cmd_list(args, cfg):
         sql += " WHERE status IN ('pending','awaiting_confirm','failed')"
     rows = [_row(conn, r) for r in conn.execute(sql + " ORDER BY id", params)]
     counts = {r["status"]: r["c"] for r in conn.execute("SELECT status, COUNT(*) c FROM outbox GROUP BY status")}
-    return {"outbox": rows, "counts": counts}
+    return {"outbox": rows, "counts": counts,
+            "approvals": ops.approval_queue(conn, cfg, now_dt(cfg), include_past=args.include_past)}
 
 
 def build_parser():
@@ -337,8 +460,15 @@ def build_parser():
     p.add_argument("--run", type=int)
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--op", action="append", choices=OPS)
-    p.add_argument("--confirm", help="outbox id | CLR-ref | all")
-    p.add_argument("--cancel", help="outbox id | CLR-ref")
+    p.add_argument("--item", help="이 항목의 대기 op 만 실행 (claire_store --apply 가 쓴다)")
+    p.add_argument("--confirm", help="outbox id | CLR-ref[,CLR-ref…] | selected | all")
+    p.add_argument("--cancel", help="outbox id | CLR-ref[,…] (등록 안 함)")
+    p.add_argument("--select", help="CLR-ref[,…] 를 선택 (선택 일괄 승인)")
+    p.add_argument("--unselect", help="CLR-ref[,…] | all")
+    p.add_argument("--request", help="CLR-ref: 교수님 요청으로 달력·Tasks 등록을 바로 예약")
+    p.add_argument("--only", choices=sorted(ONLY), help="calendar | tasks 만")
+    p.add_argument("--include-past", action="store_true", help="지난 일정의 승인 대기도 포함")
+    p.add_argument("--approvals", action="store_true", help="승인 대기 목록 (달력/Tasks 구분)")
     p.add_argument("--list", action="store_true")
     p.add_argument("--status")
     p.set_defaults(cmd="apply")
@@ -350,6 +480,14 @@ def dispatch(args, cfg):
         return cmd_confirm(args, cfg)
     if args.cancel:
         return cmd_cancel(args, cfg)
+    if args.select:
+        return cmd_select(args, cfg, True)
+    if args.unselect:
+        return cmd_select(args, cfg, False)
+    if args.request:
+        return cmd_request(args, cfg)
+    if args.approvals:
+        return cmd_approvals(args, cfg)
     if args.list:
         return cmd_list(args, cfg)
     return cmd_run(args, cfg)

@@ -1,0 +1,39 @@
+name: release
+
+# release.sh tag 가 v* 태그를 push 하면: 태그와 VERSION 이 같은지 확인 → 테스트 → GitHub Release(CHANGELOG 절) 생성.
+# 설치된 기기의 claire-update 는 가장 높은 v* 태그를 받는다.
+on:
+  push:
+    tags: ["v*.*.*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - name: tag matches VERSION
+        run: test "v$(tr -d ' \n' < VERSION)" = "${GITHUB_REF_NAME}"
+      - name: tests
+        run: python tests/test_claire.py
+      - name: release notes from CHANGELOG
+        run: |
+          v="${GITHUB_REF_NAME#v}"
+          awk -v v="$v" '$0 ~ "^## \\[" v "\\]" {f=1; next} /^## \[/ {f=0} f' CHANGELOG.md > notes.md
+          {
+            echo ""
+            echo "### 설치·업그레이드"
+            echo '```bash'
+            echo "curl -fsSL https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/main/get.sh | bash   # 처음"
+            echo "claire-update                                                                        # 이후"
+            echo '```'
+          } >> notes.md
+      - name: create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${GITHUB_REF_NAME}" --title "claire-schedule-manager ${GITHUB_REF_NAME}" --notes-file notes.md --verify-tag

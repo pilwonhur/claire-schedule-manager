@@ -500,6 +500,7 @@ class ClaireTest(BaseTest):
         self.assertIn(f"## [{v}]", changelog)
         skill = (ROOT / "SKILL.md").read_text(encoding="utf-8")
         self.assertIn(f"version: {v}", skill)
+        self.assertEqual((ROOT / "VERSION").read_text(encoding="utf-8").strip(), v)     # get.sh·release.sh·CI 가 읽는다
 
     def test_missing_db_is_reported_not_created_by_run(self):
         r = self.sh("claire_run", "status", expect_ok=False)
@@ -1576,7 +1577,8 @@ class ButtonsTest(FixtureBase):
         self.assertEqual(c["ref"], "CLR-0001")
         self.assertTrue(c["message"].startswith("CLR-0001 · 김 교수 면담"))
         labels = c["buttons"]
-        self.assertEqual(labels[:4], ["CLR-0001 끝냈어", "CLR-0001 진행 중", "CLR-0001 보류", "CLR-0001 취소"])
+        self.assertEqual(labels[:5], ["CLR-0001 완료", "CLR-0001 진행 중", "CLR-0001 보류", "CLR-0001 취소", "CLR-0001 상세"])
+        self.assertIn("업무 확인 필요", c["message"])                       # 업무 상태와 반영 상태를 따로 적는다
         self.assertIn("Q-0001: 10:00", labels); self.assertIn("Q-0001: 14:00", labels)
         rows = c["components"]["blocks"]
         self.assertEqual(rows[0]["type"], "actions"); self.assertEqual(rows[-1]["type"], "text")
@@ -1597,13 +1599,451 @@ class ButtonsTest(FixtureBase):
         self.sh("claire_store", "wait", "--item", "CLR-0001", "--waiting-on", "김 교수")
         c = self.buttons("actions", "--item", "CLR-0001")
         self.assertEqual(c["status"], "waiting")
-        self.assertEqual(c["buttons"][:2], ["CLR-0001 끝냈어", "CLR-0001 재개"]); self.assertIn("김 교수 답 대기", c["message"])
+        self.assertEqual(c["buttons"][:2], ["CLR-0001 완료", "CLR-0001 재개"]); self.assertIn("김 교수 답 대기", c["message"])
         self.sh("claire_store", "complete", "--item", "CLR-0001", "--evidence", "user_report")
         c = self.buttons("actions", "--item", "CLR-0001")
-        self.assertEqual(c["buttons"], ["CLR-0001 다시 열어"])
+        self.assertEqual(c["buttons"][:2], ["CLR-0001 다시 열어", "CLR-0001 상세"])
         ob = self.db().execute("SELECT COUNT(*) FROM outbox WHERE item_id=1 AND status='awaiting_confirm'").fetchone()[0]
         if ob:
             self.assertIn("CLR-0001 등록", c["buttons"])
+
+
+
+class V050Test(FixtureBase):
+    """0.5.0 (ISSUE_20260925): 마감 시각·달력 구간, 승인 대기 목록, 미등록 일정 확인, 버튼, Daily 완료 기록."""
+
+    def setUp(self):
+        super().setUp()
+        (self.vault / "92 Templates").mkdir()
+        (self.vault / "92 Templates" / "template_daily.md").write_text(
+            '---\ntags:\n  - "Daily"\ndate created:\n---\n\n\n## Tasks\n\n\n\n\n## Reflections\n\n\n\n\n## Routine\n### Medication\n- [ ] 비타민\n',
+            encoding="utf-8")
+        claire_core.write_secret_json(self.data / "secrets" / "google-prof@example.com-write.json",
+                                      {"email": "prof@example.com", "kind": "write", "refresh_token": "x",
+                                       "scopes": ["https://www.googleapis.com/auth/calendar.events"]})
+        self.fixture("cal_insert", {"htmlLink": "https://cal/new"})
+        self.fixture("cal_patch", {})
+
+    def store(self, *args, expect_ok=True):
+        return self.sh("claire_store", *args, expect_ok=expect_ok)
+
+    def apply(self, *args, expect_ok=True):
+        return self.sh("claire_apply", *args, expect_ok=expect_ok)
+
+    def item(self, ref):
+        return self.db().execute("SELECT * FROM item WHERE ref=?", (ref,)).fetchone()
+
+    def outbox(self, op=None):
+        sql = "SELECT * FROM outbox" + (f" WHERE op='{op}'" if op else "") + " ORDER BY id"
+        return [dict(r) for r in self.db().execute(sql)]
+
+    def writes(self):
+        f = self.fx / "writes.jsonl"
+        return [json.loads(l) for l in f.read_text(encoding="utf-8").splitlines()] if f.exists() else []
+
+    def ingest(self, mid, text, **kw):
+        args = ["ingest-discord", "--message-id", mid, "--text", text, "--captured-at", "2026-09-11T09:00:00+09:00"]
+        for k, v in kw.items():
+            args += [f"--{k.replace('_', '-')}", v]
+        return self.sh("claire_sync", *args)
+
+    def register_deadline(self, due="2026-09-26T15:00:00+09:00", title="보고서 제출", mid="d1", **extra):
+        a = self.ingest(mid, f"등록: {title} {due}")
+        return self.propose([{"op": "create", "source_event_ids": [a["source_event_id"]], "kind": "deadline", "title": title,
+                              "due_at": due, "confidence": 0.95, "evidence": [title], **extra}])
+
+    def daily_text(self, day):
+        f = self.vault / "50 Daily" / f"{day}.md"
+        return f.read_text(encoding="utf-8") if f.exists() else ""
+
+    # -- 1. 마감 시각 → 달력 표시 구간 -------------------------------------------
+    def test_deadline_time_shows_one_hour_block_on_calendar(self):
+        r = self.register_deadline()
+        c = r["created"][0]
+        self.assertEqual((c["due_precision"], c["calendar_window"]), ("time", "auto"))
+        it = self.item("CLR-0001")
+        self.assertEqual((it["start_at"], it["end_at"], it["due_at"]),
+                         ("2026-09-26T14:00:00+09:00", "2026-09-26T15:00:00+09:00", "2026-09-26T15:00:00+09:00"))
+        self.assertEqual(sorted(p["op"] for p in c["planned"]), ["calendar.create", "obsidian.add_task"])
+        self.apply()
+        w = self.writes()[0]["body"]
+        self.assertEqual(w["summary"], "[마감] 보고서 제출")
+        self.assertEqual((w["start"]["dateTime"], w["end"]["dateTime"]), ("2026-09-26T14:00:00+09:00", "2026-09-26T15:00:00+09:00"))
+        self.assertIn("마감 09/26 15:00", w["description"])
+        self.assertIn("보고서 제출 (15:00 마감) 📅 2026-09-26 🆔 clr0001", self.daily_text("2026-09-26"))
+        card = self.sh("claire_buttons", "actions", "--item", "CLR-0001")
+        self.assertIn("09/26 15:00 마감 (달력 14:00–15:00)", card["message"])
+        self.assertIn("업무 할 일 · 달력 등록됨 · Tasks 등록됨", card["message"])
+
+    def test_explicit_start_or_duration_wins_over_default_window(self):
+        self.register_deadline(start_at="2026-09-26T10:00:00+09:00")
+        it = self.item("CLR-0001")
+        self.assertEqual((it["start_at"], it["end_at"], it["window_auto"]),
+                         ("2026-09-26T10:00:00+09:00", "2026-09-26T15:00:00+09:00", 0))
+        self.register_deadline(title="심사평", mid="d2", start_at="2026-09-26T09:00:00+09:00", end_at="2026-09-26T09:30:00+09:00")
+        it = self.item("CLR-0002")
+        self.assertEqual((it["end_at"], it["due_at"]), ("2026-09-26T09:30:00+09:00", "2026-09-26T15:00:00+09:00"))
+
+    def test_date_only_deadline_warns_or_asks_time(self):
+        r = self.register_deadline(due="2026-09-26")
+        self.assertEqual(r["warnings"][0]["code"], "due_time_missing")
+        self.assertEqual(r["created"][0]["planned"], [{"op": "obsidian.add_task", "requires_confirm": 0}])   # 달력 없음
+        a = self.ingest("d2", "등록: 추천서 9/28까지")
+        r = self.propose([{"op": "create", "source_event_ids": [a["source_event_id"]], "kind": "deadline", "title": "추천서",
+                           "due_at": "2026-09-28", "confidence": 0.9, "evidence": ["추천서"], "unknown_fields": ["due_time"],
+                           "questions": [{"field": "due_time", "question": "몇 시 마감인가요?", "options": ["12:00", "18:00"]}]}])
+        self.assertEqual(r["warnings"], []); self.assertEqual(r["created"][0]["status"], "needs_info")
+        qref = r["questions"][0]["ref"]
+        a = self.store("answer", "--question", qref, "--answer", "18시", "--resolve", json.dumps({"due_at": "2026-09-28T18:00:00+09:00"}))
+        self.assertEqual(sorted(p["op"] for p in a["transition"]["planned"]), ["calendar.create", "obsidian.add_task"])
+        it = self.item("CLR-0002")
+        self.assertEqual((it["due_precision"], it["start_at"], it["window_auto"]), ("time", "2026-09-28T17:00:00+09:00", 1))
+        bad = self.ingest("d3", "등록: x")
+        e = self.propose([{"op": "create", "source_event_ids": [bad["source_event_id"]], "kind": "deadline", "title": "x",
+                           "due_at": "2026-09-28T10:00:00+09:00", "confidence": 0.9, "evidence": ["x"], "unknown_fields": ["due_time"],
+                           "questions": [{"field": "due_time", "question": "몇 시?"}]}], expect_ok=False)
+        self.assertIn("due_time", e["error"]["message"])
+
+    def test_obsidian_date_only_line_does_not_overwrite_confirmed_time(self):
+        self.register_deadline()
+        self.apply()                                                   # 달력 블록 + Daily 줄(🆔 clr0001)
+        self.sh("claire_sync", "obsidian")
+        it = self.item("CLR-0001")
+        self.assertEqual(it["due_at"], "2026-09-26T15:00:00+09:00")    # 23:59:59 로 덮이지 않는다 (ISSUE 1)
+        # 교수님이 Obsidian 에서 날짜만 하루 미룸 → 날짜만 옮기고 15:00 유지, 달력 블록도 옮김(outbox)
+        f = self.vault / "50 Daily" / "2026-09-26.md"
+        f.write_text(f.read_text(encoding="utf-8").replace("📅 2026-09-26", "📅 2026-09-27"), encoding="utf-8")
+        os.utime(f, None)
+        self.env["CLAIRE_NOW"] = "2026-09-11T07:00:00+09:00"
+        self.sh("claire_sync", "obsidian")
+        it = self.item("CLR-0001")
+        self.assertEqual(it["due_at"], "2026-09-27T15:00:00+09:00")
+        upd = self.outbox("calendar.update")[-1]
+        self.assertEqual(json.loads(upd["payload"])["fields"],
+                         {"start_at": "2026-09-27T14:00:00+09:00", "end_at": "2026-09-27T15:00:00+09:00"})
+        self.apply()
+        self.assertEqual(self.writes()[-1]["body"]["start"]["dateTime"], "2026-09-27T14:00:00+09:00")
+        self.assertEqual(self.item("CLR-0001")["start_at"], "2026-09-27T14:00:00+09:00")
+
+    def test_update_with_date_keeps_time_and_calendar_drag_keeps_due(self):
+        self.register_deadline()
+        self.store("update", "--item", "CLR-0001", "--set", "due_at=2026-09-29", "--reason", "교수님 지시")
+        it = self.item("CLR-0001")
+        self.assertEqual((it["due_at"], it["start_at"]), ("2026-09-29T15:00:00+09:00", "2026-09-29T14:00:00+09:00"))
+        cc = json.loads(self.outbox("calendar.create")[0]["payload"])        # 실행 전 예약도 새 시각으로
+        self.assertEqual(cc["start_at"], "2026-09-29T14:00:00+09:00")
+        self.store("update", "--item", "CLR-0001", "--set", "due_at=2026-09-30", "--set", "due_precision=date", "--reason", "시각 미정")
+        self.assertEqual(self.item("CLR-0001")["due_at"][11:], "23:59:59+09:00")
+        self.store("update", "--item", "CLR-0001", "--set", "due_at=2026-09-29T15:00:00+09:00", "--reason", "다시")
+        self.apply()
+        eid = self.db().execute("SELECT external_key FROM link WHERE system='calendar'").fetchone()[0].split(":", 1)[1]
+        # 교수님이 달력에서 블록을 13–14시로 옮김 → 표시 구간만 따라오고 마감·제목은 그대로
+        self.fixture(f"cal_events_{PROF}", {"items": [{"id": eid, "etag": "z1", "status": "confirmed", "summary": "[마감] 보고서 제출",
+                                                       "updated": "2026-09-11T02:00:00.000Z",
+                                                       "start": {"dateTime": "2026-09-29T13:00:00+09:00"},
+                                                       "end": {"dateTime": "2026-09-29T14:00:00+09:00"},
+                                                       "organizer": {"email": "prof@example.com", "self": True},
+                                                       "extendedProperties": {"private": {"claire_ref": "CLR-0001"}}}],
+                                            "nextSyncToken": "tokZ"})
+        self.sh("claire_sync", "calendar", "--calendar", "Prof. Hur")
+        it = self.item("CLR-0001")
+        self.assertEqual((it["title"], it["start_at"], it["due_at"], it["window_auto"]),
+                         ("보고서 제출", "2026-09-29T13:00:00+09:00", "2026-09-29T15:00:00+09:00", 0))
+
+    # -- 2. 승인 대기 목록·아침 보고 ----------------------------------------------
+    def discovered(self):
+        self.sh("claire_sync", "gmail")
+        m1 = self.gmail_event("m1")["id"]
+        return self.propose([
+            {"op": "create", "source_event_ids": [m1], "kind": "meeting", "title": "조직위 회의", "start_at": "2026-09-15T10:00:00+09:00",
+             "end_at": "2026-09-15T11:00:00+09:00", "confidence": 0.8, "evidence": ["meeting"], "attendance": "undecided"},
+            {"op": "create", "source_event_ids": [m1], "kind": "meeting", "title": "지난 회의", "start_at": "2026-09-10T10:00:00+09:00",
+             "confidence": 0.8, "evidence": ["past"]},
+            {"op": "create", "source_event_ids": [m1], "kind": "deadline", "title": "초록 제출", "due_at": "2026-09-19T17:00:00+09:00",
+             "confidence": 0.85, "evidence": ["abstract"]},
+            {"op": "create", "source_event_ids": [m1], "kind": "task", "title": "명단 정리", "due_at": "2026-09-13",
+             "confidence": 0.85, "evidence": ["list"]}])
+
+    def test_approval_queue_lists_future_by_tool_and_hides_past(self):
+        self.discovered()
+        q = self.apply("--approvals")
+        self.assertEqual([x["item_ref"] for x in q["calendar"]], ["CLR-0001", "CLR-0003"])      # 회의 + 마감 블록, 지난 회의 제외
+        self.assertEqual([x["item_ref"] for x in q["tasks"]], ["CLR-0004", "CLR-0003"])
+        self.assertEqual(q["past_hidden"], {"calendar": 1})
+        self.assertEqual(q["calendar"][0]["when"], "9/15(화) 10:00–11:00")
+        self.assertEqual(q["calendar"][0]["attendance"], "미정")
+        rv = self.sh("claire_search", "review")
+        self.assertEqual(rv["approvals"]["counts"], {"calendar": 2, "tasks": 2})
+        # 업무 상태와 반영 상태는 따로: 할 일이면서 달력 승인 대기
+        show = self.sh("claire_search", "show", "--item", "CLR-0001")
+        self.assertEqual(show["state_line"], "업무 할 일 · 달력 승인 대기 · 참석 미정")
+        # 선택 일괄 승인
+        self.apply("--select", "CLR-0001"); r = self.apply("--select", "clr4")
+        self.assertEqual(r["selected"], ["CLR-0001", "CLR-0004"])
+        c = self.apply("--confirm", "selected")
+        self.assertEqual(sorted(x["item_ref"] for x in c["confirmed"]), ["CLR-0001", "CLR-0004"])
+        # 등록 안 함 (달력만) → declined, 업무는 그대로
+        self.apply("--cancel", "CLR-0003", "--only", "calendar")
+        st = self.sh("claire_search", "show", "--item", "CLR-0003")
+        self.assertEqual((st["status"], st["sync"]["calendar"], st["sync"]["tasks"]), ("todo", "declined", "awaiting_confirm"))
+        # 지난 일정의 대기 기록은 지우거나 완료로 바꾸지 않는다
+        past = self.outbox("calendar.create")[1]
+        self.assertEqual((past["status"], self.item("CLR-0002")["status"]), ("awaiting_confirm", "todo"))
+        self.assertEqual(self.apply("--approvals", "--include-past")["calendar"][0]["item_ref"], "CLR-0002")
+        # 전부 등록 = 목록에 보이는 것만
+        c = self.apply("--confirm", "all")
+        self.assertEqual([x["item_ref"] for x in c["confirmed"]], ["CLR-0003"])
+        self.assertEqual(self.outbox("calendar.create")[1]["status"], "awaiting_confirm")
+
+    def test_approvals_buttons_messages(self):
+        self.discovered()
+        b = self.sh("claire_buttons", "approvals")
+        self.assertEqual(b["count"], 4)
+        labels = [x["label"] for m in b["messages"] for blk in m["components"]["blocks"] if blk["type"] == "actions" for x in blk["buttons"]]
+        for lab in ("CLR-0001 달력 등록", "CLR-0001 선택", "CLR-0001 등록 안 함", "CLR-0001 상세", "CLR-0004 Tasks 등록",
+                    "선택한 것 등록", "전부 등록"):
+            self.assertIn(lab, labels)
+        self.assertNotIn("CLR-0002 달력 등록", labels)
+        self.assertIn("지난 일정 달력 1건", b["text"]); self.assertIn("9/15(화) 10:00–11:00", b["text"])
+        for m in b["messages"]:
+            self.assertLessEqual(m["component_count"], 38)
+        small = self.sh("claire_buttons", "approvals", "--max-components", "14")
+        self.assertGreater(len(small["messages"]), 1)
+        self.assertEqual(small["messages"][-1]["components"]["blocks"][-2]["buttons"][0]["label"], "선택한 것 등록")
+        self.apply("--confirm", "CLR-0001,CLR-0003", "--only", "calendar")
+        self.assertEqual(self.apply("--approvals")["counts"], {"calendar": 0, "tasks": 2})
+
+    def test_request_puts_item_on_calendar_even_after_decline(self):
+        self.discovered()
+        self.apply("--cancel", "CLR-0001")
+        r = self.apply("--request", "CLR-0001", "--only", "calendar")
+        self.assertEqual(r["revived"], ["calendar.create"])
+        self.assertEqual(self.apply()["summary"]["done"], 1)
+        e = self.apply("--request", "CLR-0001", "--only", "calendar", expect_ok=False)
+        self.assertEqual(e["error"]["code"], "nothing_to_request")
+
+    # -- 3. 미등록 일정 확인 --------------------------------------------------------
+    def test_checkin_once_per_slot_and_answer_dedup(self):
+        self.register_deadline(title="김 교수 면담 자료", due="2026-09-12T15:00:00+09:00")
+        self.env["CLAIRE_NOW"] = "2026-09-11T18:00:00+09:00"
+        c = self.sh("claire_run", "checkin", "--slot", "18")
+        self.assertFalse(c["duplicate"]); self.assertEqual(c["slot"], "18:00")
+        self.assertIn("아직 등록하지 않은 것", c["message"]); self.assertIn("CLR-0001", c["message"])
+        self.assertEqual(c["components"]["blocks"][-1]["buttons"][0]["label"], "18:00 미등록 일정 없음")
+        self.assertTrue(self.sh("claire_run", "checkin", "--slot", "18:00")["duplicate"])
+        self.assertFalse(self.sh("claire_run", "checkin", "--slot", "12:00")["duplicate"])
+        a = self.ingest("d9", "금요일 3시 김 교수 면담", intent="register", checkin="2026-09-11@18:00", reply_to="m-checkin")
+        self.assertEqual(a["intent"], "register")
+        d = self.sh("claire_search", "dupcheck", "--title", "김 교수 면담", "--date", "2026-09-12")
+        self.assertEqual(d["candidates"][0]["ref"], "CLR-0001"); self.assertIn("같은 날짜", d["candidates"][0]["why"])
+        self.assertEqual(self.sh("claire_search", "dupcheck", "--title", "학회 등록비")["count"], 0)
+        m = self.sh("claire_run", "checkin-mark", "--slot", "18:00", "--result", "registered", "--refs", "CLR-0002", "--message-id", "123")
+        self.assertEqual(m["refs"], ["CLR-0002"])
+        rv = self.sh("claire_search", "review")
+        self.assertEqual([c["slot"] for c in rv["checkins"]], ["18:00", "12:00"])
+
+    # -- 4. 버튼·짧은 번호 ----------------------------------------------------------
+    def test_short_refs_and_detail_card(self):
+        self.register_deadline()
+        self.assertEqual(claire_core.normalize_ref("31"), "CLR-0031")
+        self.assertEqual(claire_core.normalize_ref("clr 7"), "CLR-0007")
+        self.assertEqual(claire_core.normalize_ref("q7", default_prefix="Q"), "Q-0007")
+        d = self.sh("claire_buttons", "actions", "--item", "1", "--detail")
+        self.assertEqual(d["ref"], "CLR-0001")
+        self.assertIn("출처: discord", d["message"]); self.assertIn("완료 기준", d["message"])
+        self.assertIn("31 완료", d["message"])                                     # 만료 뒤 입력 안내
+        r = self.store("progress", "--item", "0001", "--note", "초안")
+        self.assertEqual(r["ref"], "CLR-0001")
+
+    # -- 5. 완료 → Daily ---------------------------------------------------------------
+    def test_daily_done_record_idempotent_correct_and_reopen(self):
+        a = self.ingest("d1", "할일: 심사 의견 정리")
+        self.propose([{"op": "create", "source_event_ids": [a["source_event_id"]], "kind": "task", "title": "심사 의견 정리",
+                       "confidence": 0.95, "evidence": ["할일"], "canonical_note": "20260911 논문 심사"}])
+        self.env["CLAIRE_NOW"] = "2026-09-11T14:32:00+09:00"
+        r = self.store("complete", "--item", "CLR-0001", "--evidence", "user_report", "--apply")
+        self.assertIn("Daily 2026-09-11 에 기록했습니다", r["message"])
+        line = "- ✅ 14:32 심사 의견 정리 (CLR-0001) · [[20260911 논문 심사]] %%claire-done:CLR-0001%%"
+        text = self.daily_text("2026-09-11")
+        self.assertIn("## 완료한 일\n" + line, text)
+        self.assertLess(text.index("## Tasks"), text.index("## 완료한 일"))
+        self.assertEqual(self.item("CLR-0001")["daily_logged_on"], "2026-09-11")
+        # 완료 버튼을 또 눌러도 한 줄
+        r = self.store("complete", "--item", "CLR-0001", "--evidence", "user_report", "--apply")
+        self.assertFalse(r["changed"]); self.assertEqual(self.daily_text("2026-09-11").count("claire-done:CLR-0001"), 1)
+        self.apply()
+        self.assertEqual(self.daily_text("2026-09-11").count("claire-done:CLR-0001"), 1)
+        # 실제로는 어제 끝냈다 → 완료일 정정: 오늘 Daily 에서 빼고 어제 Daily 에 (시각 없이)
+        r = self.store("complete", "--item", "CLR-0001", "--evidence", "user_report", "--completed-at", "2026-09-10", "--apply")
+        self.assertEqual(r["corrected_from"], "2026-09-11T14:32:00+09:00")
+        self.assertNotIn("claire-done:CLR-0001", self.daily_text("2026-09-11"))
+        self.assertIn("- ✅ 심사 의견 정리 (CLR-0001) · [[20260911 논문 심사]] %%claire-done:CLR-0001%%", self.daily_text("2026-09-10"))
+        # 완료 취소 → 기록 삭제, 그 취소를 되돌리면 기록 복구
+        self.store("reopen", "--item", "CLR-0001", "--apply")
+        self.assertNotIn("claire-done", self.daily_text("2026-09-10"))
+        self.assertIsNone(self.item("CLR-0001")["daily_logged_on"])
+        self.store("undo", "--apply")
+        self.assertIn("claire-done:CLR-0001", self.daily_text("2026-09-10"))
+        self.store("reopen", "--item", "CLR-0001", "--apply")
+        self.assertNotIn("claire-done", self.daily_text("2026-09-10"))
+        # 다시 완료 후 되돌리기(undo) → 기록 삭제
+        self.store("complete", "--item", "CLR-0001", "--evidence", "user_report", "--apply")
+        self.assertIn("claire-done:CLR-0001", self.daily_text("2026-09-11"))
+        self.store("undo", "--apply")
+        self.assertNotIn("claire-done", self.daily_text("2026-09-11"))
+        self.assertTrue(self.sh("claire_check", "integrity")["healthy"])
+
+    def test_daily_done_failure_retries_and_shows_unsynced(self):
+        a = self.ingest("d1", "할일: 보고서")
+        self.propose([{"op": "create", "source_event_ids": [a["source_event_id"]], "kind": "task", "title": "보고서",
+                       "confidence": 0.95, "evidence": ["할일"]}])
+        (self.vault / "50 Daily" / "2026-09-08.md").mkdir()                   # 쓰기 실패를 만든다
+        r = self.store("complete", "--item", "CLR-0001", "--evidence", "user_report", "--completed-at", "2026-09-08", "--apply")
+        self.assertEqual(r["applied"]["retry"][0]["op"], "obsidian.daily_done")
+        self.assertIn("미반영", r["message"])
+        rv = self.sh("claire_search", "review")
+        self.assertEqual(rv["daily_unsynced"][0]["state"], "retrying")
+        self.assertEqual(self.sh("claire_search", "show", "--item", "CLR-0001")["state_line"], "업무 완료 · Daily 재시도 중")
+        (self.vault / "50 Daily" / "2026-09-08.md").rmdir()
+        self.env["CLAIRE_NOW"] = "2026-09-11T06:05:00+09:00"
+        self.assertEqual(self.apply()["done"][0]["op"], "obsidian.daily_done")
+        self.assertIn("claire-done:CLR-0001", self.daily_text("2026-09-08"))
+        self.assertEqual(self.sh("claire_search", "review")["daily_unsynced"], [])
+
+    def test_daily_done_reconcile_and_tasks_checked(self):
+        # Obsidian 에서 교수님이 직접 체크한 완료도 Daily 에 남고, 기록이 빠지면 대조가 메운다
+        self.sh("claire_sync", "obsidian")
+        ev = next(e for e in self.events("obsidian") if e["triage"] == "new")
+        self.propose([{"op": "create", "source_event_ids": [ev["id"]], "kind": "task", "title": "심사 의견 정리",
+                       "due_at": "2026-09-12", "confidence": 0.95, "evidence": ["#tasks"]}])
+        self.apply()
+        f = self.vault / "50 Daily" / "2026-09-11.md"
+        f.write_text(f.read_text(encoding="utf-8").replace("- [ ] #tasks 심사", "- [x] #tasks 심사").replace(
+            "🆔 clr0001", "🆔 clr0001 ✅ 2026-09-11"), encoding="utf-8")
+        os.utime(f, None)
+        self.env["CLAIRE_NOW"] = "2026-09-11T08:00:00+09:00"
+        self.sh("claire_sync", "obsidian")
+        self.assertEqual(self.item("CLR-0001")["status"], "done")
+        self.apply()
+        self.assertIn("claire-done:CLR-0001", self.daily_text("2026-09-11"))
+        # 누군가 줄을 지우고 DB 표식도 사라졌다고 가정 → 대조가 다시 쓴다
+        with self.db() as conn:
+            conn.execute("UPDATE item SET daily_logged_on=NULL WHERE ref='CLR-0001'")
+            conn.execute("DELETE FROM outbox WHERE op='obsidian.daily_done'")
+        res = self.apply()
+        self.assertEqual(res["daily_reconciled"], ["CLR-0001"])
+        self.assertEqual(self.daily_text("2026-09-11").count("claire-done:CLR-0001"), 1)
+
+    # -- 스키마 v1 → v2 ------------------------------------------------------------
+    def test_migration_from_v1_database(self):
+        d = Path(tempfile.mkdtemp(prefix="claire-v1-"))
+        try:
+            v1 = claire_core.SCHEMA_SQL
+            v1 = re.sub(r"\n\s*(due_precision|window_auto|attendance|daily_logged_on|selected_at)\s+[^\n]*", "", v1)
+            v1 = re.sub(r"-- 12:00·18:00.*?\);\n", "", v1, flags=re.S)
+            conn = sqlite3.connect(d / "claire.db")
+            conn.executescript(v1)
+            conn.execute("INSERT INTO meta VALUES('schema_version','1')")
+            for i, due in enumerate(("2026-09-12T23:59:59+09:00", "2026-09-12T15:00:00+09:00", None), 1):
+                conn.execute("INSERT INTO item(ref,title,kind,status,due_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",
+                             (f"CLR-{i:04d}", f"t{i}", "task", "todo", due, "2026-09-01", "2026-09-01"))
+            conn.commit(); conn.close()
+            env = dict(self.env, CLAIRE_DATA_DIR=str(d))
+            r = self.sh("claire_check", "integrity", env=env)
+            self.assertEqual(r["counts"]["checkin"], 0)
+            conn = sqlite3.connect(d / "claire.db")
+            self.assertEqual(conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()[0], "2")
+            self.assertEqual([x[0] for x in conn.execute("SELECT due_precision FROM item ORDER BY id")], ["date", "time", None])
+            self.assertTrue(conn.execute("SELECT value FROM meta WHERE key='daily_done_since'").fetchone())
+            cols = {x[1] for x in conn.execute("PRAGMA table_info(outbox)")}
+            self.assertIn("selected_at", cols)
+            conn.close()
+            v = self.sh("claire_check", "version", env=env)
+            self.assertEqual((v["version"], v["db_schema_version"]), (claire_core.CLAIRE_VERSION, 2))
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+
+
+@unittest.skipUnless(shutil.which("git") and shutil.which("bash"), "git·bash 필요")
+class InstallTest(unittest.TestCase):
+    """0.5.0: install.sh(설치 기록·claire-update·업그레이드 전 DB 사본)와 get.sh(릴리스 태그 설치·고정·확인)."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="claire-inst-"))
+        self.env = dict(os.environ, CLAIRE_SKILL_DIR=str(self.tmp / "skill"), CLAIRE_DATA_DIR=str(self.tmp / "data"),
+                        CLAIRE_BIN_DIR=str(self.tmp / "bin"), CLAIRE_OPENCLAW_WORKSPACE=str(self.tmp / "no-openclaw"),
+                        CLAIRE_SRC_DIR=str(self.tmp / "src"), GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@example.com",
+                        GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@example.com", GIT_CONFIG_GLOBAL="/dev/null")
+        self.env.pop("CLAIRE_NOW", None)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def run_sh(self, *cmd, cwd=None, ok=True):
+        p = subprocess.run(list(cmd), cwd=cwd, env=self.env, capture_output=True, text=True)
+        if ok:
+            self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        return p
+
+    def repo_copy(self, dest: Path, version: str | None = None) -> Path:
+        ignore = shutil.ignore_patterns(".git", "__pycache__", "*.pyc")
+        shutil.copytree(ROOT, dest, ignore=ignore)
+        if version:
+            core = dest / "scripts" / "claire_core.py"
+            core.write_text(re.sub(r'^CLAIRE_VERSION = "[^"]+"', f'CLAIRE_VERSION = "{version}"',
+                                   core.read_text(encoding="utf-8"), flags=re.M), encoding="utf-8")
+            (dest / "VERSION").write_text(version + "\n", encoding="utf-8")
+        return dest
+
+    def test_install_records_info_wrapper_and_pre_upgrade_backup(self):
+        a = self.repo_copy(self.tmp / "a")
+        out = self.run_sh("bash", str(a / "install.sh")).stdout
+        self.assertIn("설치 완료", out)
+        info = json.loads((self.tmp / "skill" / "INSTALL_INFO.json").read_text(encoding="utf-8"))
+        self.assertEqual(info["version"], claire_core.CLAIRE_VERSION)
+        wrapper = (self.tmp / "bin" / "claire-update").read_text(encoding="utf-8")
+        self.assertIn(str(self.tmp / "skill" / "get.sh"), wrapper)
+        self.assertTrue(os.access(self.tmp / "bin" / "claire-update", os.X_OK))
+        self.assertTrue((self.tmp / "skill" / "get.sh").exists()); self.assertTrue((self.tmp / "data" / "claire.db").exists())
+        # 같은 버전 재적용 → 사본 없음, 새 버전 → 스키마 변환 전 DB 사본
+        self.run_sh("bash", str(a / "install.sh"))
+        self.assertFalse(list((self.tmp / "data" / "backups").glob("pre-upgrade-*")))
+        b = self.repo_copy(self.tmp / "b", "9.9.9")
+        out = self.run_sh("bash", str(b / "install.sh")).stdout
+        self.assertIn(f"{claire_core.CLAIRE_VERSION} → 9.9.9", out)
+        pre = list((self.tmp / "data" / "backups").glob(f"pre-upgrade-{claire_core.CLAIRE_VERSION}-to-9.9.9-*"))
+        self.assertEqual(len(pre), 1); self.assertTrue((pre[0] / "claire.db").exists())
+        self.assertTrue((self.tmp / "data" / "skill-prev" / "scripts" / "claire_core.py").exists())
+
+    def test_get_sh_installs_latest_tag_pins_and_checks(self):
+        origin = self.repo_copy(self.tmp / "origin")
+        g = lambda *a: self.run_sh("git", *a, cwd=origin)   # noqa: E731
+        g("init", "-q", "-b", "main"); g("add", "-A"); g("commit", "-qm", "base"); g("tag", "v0.0.1")
+        core = origin / "scripts" / "claire_core.py"
+        cur = claire_core.CLAIRE_VERSION
+        g("tag", f"v{cur}")
+        self.env["CLAIRE_REPO_URL"] = str(origin)
+        out = self.run_sh("bash", str(origin / "get.sh"), "--skip-tests").stdout
+        self.assertIn(f"대상: v{cur}", out)
+        info = json.loads((self.tmp / "skill" / "INSTALL_INFO.json").read_text(encoding="utf-8"))
+        self.assertEqual((info["git_tag"], info["installer"]), (f"v{cur}", f"get.sh v{cur}"))
+        self.assertIn("최신 릴리스: v" + cur, self.run_sh("bash", str(origin / "get.sh"), "--check").stdout)
+        # 새 릴리스가 올라오면 --check 가 알리고, claire-update 가 올린다
+        core.write_text(core.read_text(encoding="utf-8").replace(f'CLAIRE_VERSION = "{cur}"', 'CLAIRE_VERSION = "99.0.0"'),
+                        encoding="utf-8")
+        (origin / "VERSION").write_text("99.0.0\n", encoding="utf-8")
+        g("commit", "-qam", "next"); g("tag", "v99.0.0")
+        self.assertIn("업데이트 가능", self.run_sh("bash", str(origin / "get.sh"), "--check").stdout)
+        self.run_sh(str(self.tmp / "bin" / "claire-update"), "--skip-tests")
+        self.assertIn('CLAIRE_VERSION = "99.0.0"', (self.tmp / "skill" / "scripts" / "claire_core.py").read_text(encoding="utf-8"))
+        # 특정 버전으로 되돌리기
+        self.run_sh(str(self.tmp / "bin" / "claire-update"), "--version", cur, "--skip-tests")
+        self.assertIn(f'CLAIRE_VERSION = "{cur}"', (self.tmp / "skill" / "scripts" / "claire_core.py").read_text(encoding="utf-8"))
+        # 없는 버전·설치 전용 클론 수정은 거부
+        self.assertIn("태그 v7.7.7 이 없습니다", self.run_sh("bash", str(origin / "get.sh"), "--version", "7.7.7", ok=False).stdout)
+        (self.tmp / "src" / "README.md").write_text("x", encoding="utf-8")
+        self.assertIn("손으로 고친 파일", self.run_sh("bash", str(origin / "get.sh"), "--skip-tests", ok=False).stdout)
 
 
 if __name__ == "__main__":

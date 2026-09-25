@@ -6,8 +6,12 @@
           본문의 번호 복사 블록(```CLR-0031```)이 있던 줄은 "줄 + 오른쪽 버튼"(section) 이 되고,
           블록이 없는 본문은 번호가 처음 나온 줄마다 버튼을 붙인다. Discord 한도(메시지당 컴포넌트 40개,
           텍스트 4,000자)에 맞춰 여러 메시지로 나눈다. 각 메시지에는 버튼이 없을 때 쓸 fallback 본문도 준다.
-  actions --item CLR-0031 | --question Q-0007
-          번호 버튼을 눌렀을 때 보낼 "항목 카드": 한 줄 요약과 다음 행동 버튼(끝냈어·진행 중·보류·취소·등록…).
+  actions --item CLR-0031 [--detail] | --question Q-0007
+          번호 버튼을 눌렀을 때 보낼 "항목 카드": 한 줄 요약(업무 상태와 달력·Tasks 반영 상태를 따로)과
+          다음 행동 버튼(완료·진행 중·보류·취소·상세·등록…). --detail 은 출처·질문·최근 이력까지 보인다.
+  approvals [--include-past]
+          승인 대기 목록 메시지(0.5.0): 달력 등록 대기와 Tasks 등록 대기를 나눠 제목·일시와
+          `등록`·`선택`·`등록 안 함`·`상세` 버튼, 끝에 `선택한 것 등록`·`전부 등록`. 지난 일정은 빼고 건수만.
 
 버튼을 누르면 OpenClaw 가 Claire 에게 `Clicked "라벨".` 을 교수님 메시지로 넣어 준다. 라벨은 그대로 교수님이
 타이핑한 지시("CLR-0031 끝냈어")로 읽히도록 만든다. 클립보드가 없는 iPhone·iPad 에서도 탭 한 번이면 된다.
@@ -22,7 +26,8 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from claire_core import ClaireError, connect, get_item, now_dt, parse_iso, run_cli, tz_of  # noqa: E402
+from claire_core import ClaireError, connect, get_item, normalize_ref, now_dt, parse_iso, run_cli, tz_of  # noqa: E402
+import claire_ops as ops  # noqa: E402
 
 NUMBER_RE = re.compile(r"(?<![A-Za-z0-9-])((?:CLR|Q)-\d{3,6})(?!\d)")   # 한글이 바로 붙어도(CLR-0031로) 잡는다
 ONE_LINE_BLOCK_RE = re.compile(r"^\s*```\s*((?:CLR|Q)-\d{3,6})\s*```\s*$")
@@ -36,9 +41,9 @@ DEFAULT_MAX_CHARS = 3800
 BUTTON_STYLE = "secondary"
 LABEL_MAX = 80                                    # Discord 버튼 라벨 한도
 
-STATUS_KO = {"captured": "포착", "needs_info": "확인 필요", "todo": "할 일", "in_progress": "진행 중",
-             "waiting": "대기", "on_hold": "보류", "done": "완료", "cancelled": "취소"}
-KIND_KO = {"meeting": "회의·면담", "deadline": "마감", "reply": "회신", "task": "할 일", "reference": "참고"}
+STATUS_KO = ops.STATUS_KO
+KIND_KO = {"meeting": "회의·면담", "deadline": "마감", "reply": "회신", "task": "할 일", "prep": "준비",
+           "waiting": "대기", "reference": "참고"}
 
 
 # --------------------------------------------------------------------------
@@ -236,6 +241,15 @@ def _when(it: dict, cfg) -> str:
         return d.strftime("%m/%d") if all_day else d.strftime("%m/%d %H:%M")
 
     parts = []
+    deadline_block = it.get("kind") != "meeting" and it.get("due_at")
+    if deadline_block:
+        # 마감 시각과 달력 표시 구간은 다른 값이다: "09/26 15:00 마감 (달력 14:00–15:00)"
+        due = it["due_at"]
+        parts.append(f"{fmt(due)[:5] if it.get('due_precision') == 'date' else fmt(due)} 마감")
+        if it.get("start_at") and len(it["start_at"]) > 10:
+            a, b = fmt(it["start_at"]), fmt(it.get("end_at")) if it.get("end_at") else ""
+            parts[-1] += f" (달력 {a[6:]}–{b[6:]})" if b and a[:5] == b[:5] else f" (달력 {a}{'–' + b if b else ''})"
+        return " · ".join(parts)
     if it.get("start_at"):
         s = fmt(it["start_at"], bool(it.get("all_day")))
         e = fmt(it["end_at"], bool(it.get("all_day"))) if it.get("end_at") else ""
@@ -253,43 +267,70 @@ def _row(labels: list[tuple[str, str]]) -> dict:
     return {"type": "actions", "buttons": [{"label": l, "style": s} for l, s in labels][:5]}
 
 
-def cmd_actions_item(conn, cfg, ref: str) -> dict:
-    it = dict(get_item(conn, ref))
+def _state_rows(ref: str, status: str) -> list[dict]:
+    if status in ("captured", "needs_info", "todo", "in_progress"):
+        return [_row([(f"{ref} 완료", "success"), (f"{ref} 진행 중", "primary"), (f"{ref} 보류", "secondary"),
+                      (f"{ref} 취소", "danger"), (f"{ref} 상세", "secondary")])]
+    if status in ("waiting", "on_hold"):
+        return [_row([(f"{ref} 완료", "success"), (f"{ref} 재개", "primary"), (f"{ref} 취소", "danger"),
+                      (f"{ref} 상세", "secondary")])]
+    return [_row([(f"{ref} 다시 열어", "primary"), (f"{ref} 상세", "secondary")])]
+
+
+def cmd_actions_item(conn, cfg, ref: str, detail: bool = False) -> dict:
+    row = get_item(conn, ref)
+    it = dict(row)
     ref = it["ref"]
     status = it["status"]
     head = f"{ref} · {it['title']}"
-    meta = [KIND_KO.get(it.get("kind"), it.get("kind") or ""), STATUS_KO.get(status, status), _when(it, cfg)]
+    meta = [KIND_KO.get(it.get("kind"), it.get("kind") or ""), _when(it, cfg)]
     if it.get("waiting_on"):
         meta.append(f"{it['waiting_on']} 답 대기")
-    lines = [head, " · ".join(m for m in meta if m)]
+    lines = [head, " · ".join(m for m in meta if m), ops.describe_state(conn, cfg, row)]
     if it.get("next_action"):
         lines.append(f"다음 행동: {it['next_action']}")
     questions = [dict(q) for q in conn.execute(
         "SELECT ref, question, options FROM question WHERE item_id=? AND status='open' ORDER BY id", (it["id"],))]
     pending = [dict(r) for r in conn.execute(
         "SELECT op FROM outbox WHERE item_id=? AND status='awaiting_confirm' ORDER BY id", (it["id"],))]
+    sync = ops.sync_state_of(conn, row)
 
-    rows: list[dict] = []
-    if status in ("captured", "needs_info", "todo", "in_progress"):
-        rows.append(_row([(f"{ref} 끝냈어", "success"), (f"{ref} 진행 중", "primary"),
-                          (f"{ref} 보류", "secondary"), (f"{ref} 취소", "danger")]))
-    elif status in ("waiting", "on_hold"):
-        rows.append(_row([(f"{ref} 끝냈어", "success"), (f"{ref} 재개", "primary"), (f"{ref} 취소", "danger")]))
-    elif status in ("done", "cancelled"):
-        rows.append(_row([(f"{ref} 다시 열어", "primary")]))
+    if detail:
+        if it.get("done_criteria"):
+            lines.append(f"완료 기준: {it['done_criteria']}")
+        if it.get("completed_at"):
+            lines.append(f"완료: {ops.fmt_when(cfg, it['completed_at'])}"
+                         + (f" · Daily {it['daily_logged_on']} 기록" if it.get("daily_logged_on") else ""))
+        for src in conn.execute("SELECT e.platform, e.event_ts, e.excerpt FROM item_source s JOIN source_event e "
+                                "ON e.id=s.source_event_id WHERE s.item_id=? AND s.role='origin' ORDER BY e.id LIMIT 2",
+                                (it["id"],)):
+            lines.append(f"출처: {src['platform']} {src['event_ts'][:10]} — {(src['excerpt'] or '').splitlines()[0][:80]}")
+        if it.get("canonical_note"):
+            lines.append(f"노트: [[{it['canonical_note']}]]")
+        hist = conn.execute("SELECT action, field, new_value, created_at FROM activity_log WHERE item_id=? "
+                            "AND undone_at IS NULL ORDER BY id DESC LIMIT 3", (it["id"],)).fetchall()
+        if hist:
+            lines.append("최근: " + " / ".join(f"{h['created_at'][5:16].replace('T', ' ')} {h['action']}"
+                                              + (f" {h['field']}" if h["field"] and h["field"] != "status" else "")
+                                              for h in hist))
+
+    rows: list[dict] = _state_rows(ref, status)
     if pending:
-        ops = "·".join(sorted({("Calendar" if p["op"].startswith("calendar") else "Tasks") for p in pending}))
-        lines.append(f"반영 대기: {ops} (승인 필요)")
+        kinds = sorted({("달력" if p["op"].startswith("calendar") else "Tasks") for p in pending})
+        lines.append(f"승인 대기: {'·'.join(kinds)} 등록")
         rows.append(_row([(f"{ref} 등록", "success"), (f"{ref} 등록 안 함", "secondary")]))
+    elif status not in ("done", "cancelled") and sync["calendar"] in (None, "declined") and ops.calendar_eligible(cfg, row):
+        rows.append(_row([(f"{ref} 달력 등록", "primary")]))
     for q in questions[:2]:
         opts = json.loads(q["options"]) if q["options"] else []
         lines.append(f"{q['ref']} {q['question']}")
         if opts:
             rows.append(_row([(f"{q['ref']}: {o}", "primary") for o in opts[:5]]))
-    hint = "다른 지시(기한·우선순위·메모·답변)는 이 메시지에 답장으로 적어 주세요."
+    hint = ("다른 지시(기한·우선순위·메모·답변)는 이 메시지에 답장으로 적어 주세요. "
+            "버튼이 만료되면 번호와 함께 적으면 됩니다(예: 31 완료).")
     lines.append(hint)
     text = "\n".join(lines)
-    return {"ref": ref, "status": status, "message": text,
+    return {"ref": ref, "status": status, "sync": sync, "message": text,
             "components": {"reusable": True, "text": "\n".join(lines[:-1]), "blocks": rows + [{"type": "text", "text": hint}]},
             "buttons": [b["label"] for r in rows for b in r["buttons"]]}
 
@@ -317,10 +358,80 @@ def cmd_actions_question(conn, cfg, qref: str) -> dict:
 def cmd_actions(args, cfg):
     conn = connect(create=False)
     if args.item:
-        return cmd_actions_item(conn, cfg, args.item.strip().upper())
+        return cmd_actions_item(conn, cfg, args.item.strip(), detail=args.detail)
     if args.question:
-        return cmd_actions_question(conn, cfg, args.question.strip().upper())
+        return cmd_actions_question(conn, cfg, normalize_ref(args.question, default_prefix="Q"))
     raise ClaireError("bad_args", "--item 또는 --question 이 필요합니다.")
+
+
+# --------------------------------------------------------------------------
+# 승인 대기 목록 (0.5.0)
+# --------------------------------------------------------------------------
+
+def cmd_approvals(args, cfg):
+    """아침 보고용 승인 대기 메시지. 달력·Tasks 를 나누고, 항목마다 제목·일시·업무 상태와 버튼을 붙인다.
+    지난 일정은 목록에서 빼고(기록은 그대로) 건수만 알린다. 버튼 없이 보낼 때를 위한 본문(message)도 준다."""
+    conn = connect(create=False)
+    q = ops.approval_queue(conn, cfg, now_dt(cfg), include_past=args.include_past)
+    total = q["counts"]["calendar"] + q["counts"]["tasks"]
+    past = q["past_hidden"]
+    past_note = ("지난 일정 " + " · ".join(f"{'달력' if k == 'calendar' else 'Tasks'} {v}건" for k, v in past.items())
+                 + " 은 목록에서 뺐습니다(기록은 그대로)") if past else ""
+    if total == 0:
+        return {"count": 0, "messages": [], "past_hidden": past,
+                "text": ("승인 대기 없음" + (f" · {past_note}" if past_note else "")),
+                "note": "승인 대기가 없어 보낼 메시지가 없습니다."}
+    header = f"승인 대기 — 달력 {q['counts']['calendar']}건 · Tasks {q['counts']['tasks']}건"
+    units, fallback = [], [header]        # unit = 한 메시지 안에 붙어 있어야 하는 블록 묶음
+    for key, label in (("calendar", "달력 등록 대기 (Google Calendar)"), ("tasks", "Tasks 등록 대기 (Obsidian Daily)")):
+        rows = q[key]
+        if not rows:
+            continue
+        fallback.append(label)
+        heading = {"type": "text", "text": f"**{label}**"}
+        for n, e in enumerate(rows):
+            ref = e["item_ref"]
+            only = "달력" if key == "calendar" else "Tasks"
+            sel = " ☑ 선택됨" if e["selected"] else ""
+            state = f"업무 {e['work_status']}" + (f" · 참석 {e['attendance']}" if e.get("attendance") else "")
+            unit = [heading] if n == 0 else []           # 섹션 제목은 첫 항목과 함께 (메시지 끝에 홀로 남지 않게)
+            unit += [{"type": "text", "text": f"{ref} {e['title']}\n{e['when']} · {state}{sel}"},
+                     {"type": "actions", "buttons": [
+                         {"label": f"{ref} {only} 등록", "style": "success"}, {"label": f"{ref} 선택", "style": "primary"},
+                         {"label": f"{ref} 등록 안 함", "style": "secondary"}, {"label": f"{ref} 상세", "style": "secondary"}]}]
+            units.append(unit)
+            fallback.append(f"  {ref} {e['title']} — {e['when']} · {state}{sel}")
+            fallback.append(f"```{ref}```")
+    note = "번호로도 됩니다: `CLR-0045 등록`, `CLR-0045 CLR-0047 등록`, `CLR-0045 등록 안 함`, `다 등록`."
+    if past_note:
+        note = past_note + "\n" + note
+    tail = [{"type": "actions", "buttons": [{"label": "선택한 것 등록", "style": "success"},
+                                           {"label": "전부 등록", "style": "primary"},
+                                           {"label": "선택 해제", "style": "secondary"}]},
+            {"type": "text", "text": note}]
+    fallback += ["", note]
+
+    def cost(bs):
+        return sum(1 if b["type"] == "text" else 1 + len(b["buttons"]) for b in bs)
+
+    limit = int(args.max_components)
+    chunks, cur = [], []
+    for u in units + [tail]:
+        if cur and 2 + cost(cur) + cost(u) > limit:
+            chunks.append(cur); cur = []
+        cur = cur + u
+    if cur:
+        chunks.append(cur)
+    messages = []
+    for i, ch in enumerate(chunks, 1):
+        suffix = f" (계속 {i}/{len(chunks)})" if i > 1 else ""
+        messages.append({"index": i, "of": len(chunks),
+                         "message": "\n".join(fallback) if i == 1 else header + suffix,
+                         "components": {"reusable": True, "text": header + suffix, "blocks": ch},
+                         "component_count": 2 + cost(ch)})
+    return {"count": total, "counts": q["counts"], "past_hidden": past, "selected": q["selected"],
+            "messages": messages, "text": "\n".join(fallback),
+            "send_with": "message 도구로 messages[] 를 순서대로 보낸다(components 그대로). 버튼을 못 쓰면 text 를 그대로 보낸다."}
 
 
 # --------------------------------------------------------------------------
@@ -335,11 +446,15 @@ def build_parser():
     a = sub.add_parser("actions", help="항목·질문 카드와 다음 행동 버튼")
     a.add_argument("--item")
     a.add_argument("--question")
+    a.add_argument("--detail", action="store_true", help="상세 보기(출처·완료 기준·최근 이력)")
+    ap = sub.add_parser("approvals", help="승인 대기 목록 메시지 (달력/Tasks 구분)")
+    ap.add_argument("--include-past", action="store_true")
+    ap.add_argument("--max-components", type=int, default=DEFAULT_MAX_COMPONENTS)
     return p
 
 
 def dispatch(args, cfg):
-    return {"build": cmd_build, "actions": cmd_actions}[args.cmd](args, cfg)
+    return {"build": cmd_build, "actions": cmd_actions, "approvals": cmd_approvals}[args.cmd](args, cfg)
 
 
 if __name__ == "__main__":

@@ -7,6 +7,7 @@
   restore-test --from <backup dir 또는 db 파일>   건수·해시 대조 (TC20)
   doctor [--offline] [--format text]              §4.3 확인 사항 실측
   channel-prompt [--guild --channel]              Claire 채널 systemPrompt 패치 JSON (| openclaw config patch --stdin)
+  version [--remote]                              설치 버전·설치 출처, --remote 면 GitHub 최신 릴리스와 비교
   calibrate                 5단계 (표본이 없으면 근거 부족만 보고)
 """
 
@@ -32,6 +33,9 @@ from claire_core import (  # noqa: E402
 )
 
 DATA_SUBDIRS = ("secrets", "raw", "attachments", "exports", "backups", "logs")
+REPO_URL = "https://github.com/pilwonhur/claire-schedule-manager.git"
+INSTALL_INFO = Path(__file__).resolve().parent.parent / "INSTALL_INFO.json"    # install.sh 가 쓴다
+CHECKIN_EXPR = "0 12,18 * * *"
 CHANNEL_PROMPT_FILE = Path(__file__).resolve().parent.parent / "references" / "discord-channel-prompt.txt"
 CHANNEL_PROMPT_MARKER = "message(action=send)"
 
@@ -637,6 +641,21 @@ class Doctor:
                 self.add("openclaw", "cron_daily", "ok" if ok else "warn",
                          f"{job.get('name')} · {sch.get('expr')} @ {sch.get('tz')} · enabled={job.get('enabled')} · "
                          f"last={job.get('lastRunStatus') or job.get('state', {}).get('lastRunStatus')}")
+            # 0.5.0: 12:00·18:00 미등록 일정 확인 (주말 포함)
+            ck = [j for j in jobs if j.get("agentId") == "claire" and
+                  (j.get("declarationKey") == "claire-checkin" or "미등록" in (j.get("name") or ""))]
+            if not ck:
+                self.add("openclaw", "cron_checkin", "warn", "12:00·18:00 미등록 일정 확인 cron 없음",
+                         "references/doctor.md 의 '미등록 일정 확인 cron' 명령을 실행하세요")
+            else:
+                exprs = sorted({(j.get("schedule") or {}).get("expr") for j in ck})
+                ok = (exprs == [CHECKIN_EXPR] and len(ck) == 1) and all(j.get("enabled", True) for j in ck) and \
+                    all((j.get("schedule") or {}).get("tz") == "Asia/Seoul" for j in ck)
+                self.add("openclaw", "cron_checkin", "ok" if ok else "warn",
+                         f"{len(ck)}개 · {', '.join(str(e) for e in exprs)}" +
+                         ("" if ok else f" (권장: 하나의 cron '{CHECKIN_EXPR}' @ Asia/Seoul, declaration key claire-checkin. "
+                                        "Claire 가 임시로 만든 cron 이 있으면 지우고 다시 등록)"),
+                         None if ok else "references/doctor.md 의 '미등록 일정 확인 cron' 명령")
         except (subprocess.TimeoutExpired, json.JSONDecodeError, OSError) as e:
             self.add("openclaw", "cron_daily", "warn", f"cron 목록을 읽지 못함: {e}")
         self.check_openclaw_buttons()
@@ -731,6 +750,42 @@ def cmd_channel_prompt(args, cfg):
     sys.exit(0)
 
 
+def _semver(tag: str) -> tuple | None:
+    import re
+    m = re.fullmatch(r"v?(\d+)\.(\d+)\.(\d+)", tag.strip())
+    return tuple(int(x) for x in m.groups()) if m else None
+
+
+def latest_remote_tag(url: str = REPO_URL, timeout: int = 20) -> str | None:
+    out = subprocess.run(["git", "ls-remote", "--tags", "--refs", url], capture_output=True, text=True, timeout=timeout)
+    if out.returncode != 0:
+        raise ClaireError("remote_unavailable", f"GitHub 태그를 읽지 못했습니다: {out.stderr.strip()[:200]}")
+    tags = [line.rsplit("/", 1)[-1] for line in out.stdout.splitlines() if "refs/tags/" in line]
+    tags = [t for t in tags if _semver(t)]
+    return max(tags, key=_semver) if tags else None
+
+
+def cmd_version(args, cfg):
+    """설치된 스킬 버전·출처. --remote 면 GitHub 최신 릴리스 태그와 비교해 업데이트 명령을 알려 준다."""
+    info = json.loads(INSTALL_INFO.read_text(encoding="utf-8")) if INSTALL_INFO.exists() else None
+    db_ver = None
+    if db_path().exists():
+        try:
+            db_ver = int(connect(create=False).execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()[0])
+        except Exception:  # noqa: BLE001
+            db_ver = None
+    out = {"version": CLAIRE_VERSION, "schema_version": SCHEMA_VERSION, "db_schema_version": db_ver,
+           "installed": info, "skill_dir": str(Path(__file__).resolve().parent.parent)}
+    if args.remote:
+        latest = latest_remote_tag()
+        out["latest"] = latest
+        cur, new = _semver(CLAIRE_VERSION), _semver(latest or "")
+        out["update_available"] = bool(cur and new and new > cur)
+        out["message"] = (f"새 버전 {latest} 이 있습니다 (설치 {CLAIRE_VERSION}). 업데이트: claire-update"
+                          if out["update_available"] else f"최신입니다 ({CLAIRE_VERSION}).")
+    return out
+
+
 def cmd_calibrate(args, cfg):
     conn = connect(create=False)
     n = conn.execute("SELECT COUNT(*) c FROM outbox WHERE op LIKE 'calendar.%' AND requires_confirm=1").fetchone()["c"]
@@ -761,6 +816,9 @@ def build_parser():
     cp.add_argument("--guild")
     cp.add_argument("--channel")
     cp.set_defaults(fn=cmd_channel_prompt)
+    v = sub.add_parser("version", help="설치 버전·출처 (--remote: GitHub 최신 릴리스와 비교)")
+    v.add_argument("--remote", action="store_true")
+    v.set_defaults(fn=cmd_version)
     c = sub.add_parser("calibrate", help="임계값 조정 근거 (5단계)")
     c.set_defaults(fn=cmd_calibrate)
     return p

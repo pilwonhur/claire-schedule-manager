@@ -3,6 +3,60 @@
 형식은 [Keep a Changelog](https://keepachangelog.com/ko/1.1.0/)를 따르고 버전은 SemVer다.
 데이터 형식 버전(`SCHEMA_VERSION`)은 따로 관리한다.
 
+## [0.5.0] — 2026-09-25
+
+교수님 개선 요청 정식 반영(ISSUE_20260925). 운영 중 Claire 가 스킬을 직접 고치려다 거부됐던 항목을 도구·규칙으로 편입했다.
+설계 핵심: **업무 상태와 외부 도구 반영 상태를 분리**한다. 스키마 v2.
+
+### 1. 마감 시각을 달력에 표시하는 규칙
+- 마감 시각만 있으면 마감 1시간 전~마감을 달력에 `[마감] 제목`으로 표시한다(`apply.deadline_window_minutes`, 기본 60). 별도 시작·기간 지시가 우선.
+  마감 시각(`due_at`)과 달력 표시 구간(`start_at`·`end_at`)을 별도 필드로 관리하고 `item.due_precision`(date/time)·`window_auto`로 구분한다.
+- **버그 수정: 동기화가 마감 시각을 23:59 로 덮던 문제.** Obsidian Tasks 줄(날짜만)의 미러링이 확정된 시각을 덮지 않는다 — 같은 날이면 그대로, 날짜가 바뀌면 날짜만 옮기고 시각 유지(달력 블록도 outbox 로 이동).
+  `update --set due_at=YYYY-MM-DD`도 확정 시각을 지우지 않는다(지우려면 `due_precision=date`).
+- 날짜만 있으면 확인 질문: `unknown_fields: ["due_time"]` 질문 형식 추가, 답하면 구간 생성·달력 예약. `deadline`이 날짜만이면 propose 결과 `warnings.due_time_missing`.
+- 교수님이 달력에서 블록을 옮기면 구간만 따라오고(자동 계산 중지) 마감·제목은 그대로(`[마감] ` 접두어 제거).
+- Tasks 줄에 `(15:00 마감)` 표기.
+
+### 2. 승인 대기 조회·승인과 아침 보고
+- `claire_apply --approvals` / `claire_buttons approvals`: 달력 등록 대기와 Tasks 등록 대기를 나눈 전체 목록(제목·일시·업무 상태·참석). 아침 브리핑 직후 별도 메시지로 보낸다(SKILL §2 8단계, §5.1).
+- 지난 일정은 목록에서 빼고 건수만 보인다. 기록은 지우거나 완료·취소하지 않는다(`--include-past`로 조회).
+- 개별 승인(`CLR 달력 등록`/`Tasks 등록`), **선택 일괄 승인**(`선택` → `선택한 것 등록`, `outbox.selected_at`), `전부 등록`(보이는 것만), `등록 안 함`(declined 로 표시).
+  `--confirm`이 여러 번호·`selected`·`--only calendar|tasks`를 받는다. `--request CLR`: 교수님이 "달력에 넣어줘" 한 항목을 바로 예약(등록 안 함 이후에도).
+- 업무 상태 ↔ 반영 상태 분리: `claire_ops.sync_state_of`·`describe_state` → 조회 결과마다 `sync`·`state_line`(`업무 할 일 · 달력 승인 대기 · 참석 미정`). `item.attendance`(Calendar 참석 응답에서 채움).
+
+### 3. 갑작스러운 일정·구두 약속 수집
+- `claire_run checkin --slot 12:00|18:00`: 하루·슬롯 1회 확인 메시지(오늘 등록분 표시, `미등록 일정 없음` 버튼), `checkin-mark`로 결과 기록. 표 `checkin`.
+- 답변 처리: `ingest-discord --intent register --checkin …`(접두어 없이 지시로 저장), `claire_search dupcheck --title --date`로 기존 기록과 중복 확인 후 등록, 부족한 정보는 질문(SKILL §2.1).
+- doctor `openclaw.cron_checkin`(`0 12,18 * * *`, declaration key `claire-checkin`)과 등록 명령(`references/doctor.md`).
+
+### 4. 모바일 버튼 UI
+- 항목 카드 버튼: `완료`·`진행 중`·`보류`·`취소`·`상세`(+ `등록`/`등록 안 함` 또는 `달력 등록`). 카드에 업무 상태와 반영 상태를 따로 적는다. `actions --detail`(출처·완료 기준·최근 이력).
+- 버튼 만료(24h, OpenClaw 최대) 뒤: 짧은 번호 입력(`31 완료`, `clr31`, `q7`)을 도구가 정식 번호로 읽는다(`claire_core.normalize_ref`). "버튼 다시"로 새 버튼. 옛 `끝냈어` 버튼도 계속 동작.
+
+### 5. 완료 기록의 Obsidian Daily 연동
+- 완료하면 **실제 완료일** Daily 의 `## 완료한 일`에 `- ✅ HH:MM 업무명 (CLR-0031) · [[관련 노트]]` 한 줄(`%%claire-done:CLR%%` 표식). 별도 완료일을 말하면 그 날짜(시각 없이).
+- **기록 시점 결정: 완료 즉시(outbox, `claire_store complete --apply`) + 매일 점검에서 누락 대조.** 자정 일괄보다 나은 이유 — 완료 직후 Daily 에 바로 보이고, 다른 Obsidian 쓰기와 같은 재시도·미반영 표시 경로를 쓰며, mac mini 가 자정에 잠들어도 기록이 빠지지 않고, 완료일 정정·취소는 어차피 기록 수정이 필요하다.
+- 중복 없음(버튼 여러 번), 완료일 정정은 줄 이동, 완료 취소·되돌리기는 줄 삭제. 저장 실패는 백오프 재시도, `review.daily_unsynced`·`state_line`에 "Daily 재시도 중/실패". Obsidian 에서 직접 체크한 완료도 기록.
+- 도입 전(`meta.daily_done_since`)에 기록된 완료는 옛 Daily 에 소급하지 않는다.
+
+### 버전 관리·설치
+- `get.sh`: `curl … | bash` 한 줄 설치·업그레이드. Dropbox 밖 설치 전용 클론, 최신 릴리스 태그(또는 `--version`/`--main`), 설치 전 테스트, `--check`.
+- `install.sh`: `claire-update` 명령 설치(`~/.local/bin`), `INSTALL_INFO.json`(버전·태그·커밋), 버전이 바뀌면 스키마 변환 전 DB 사본(`backups/pre-upgrade-*`), Python 3.11 확인.
+- `VERSION` 파일, `release.sh bump|check|tag`, GitHub Actions(ci: ubuntu·macOS × 3.11·3.14 테스트·설치, release: 태그 → Release 노트).
+- `claire_check version [--remote]`. 스키마 v1→v2 자동 변환(`claire_core.migrate`, 열 추가만·멱등).
+
+### 수정
+- `claire_export md`: f-string 안 역슬래시로 Python 3.11 에서 SyntaxError → 백업(`claire_check backup`, `claire_run end --backup`)이 3.11 에서 실패하던 문제.
+
+### 테스트
+- 81건(+16): 마감 구간·명시 우선·날짜만 질문·Obsidian 시각 보존·달력 드래그, 승인 목록·선택·등록 안 함·지난 일정·버튼 메시지·요청, 미등록 확인·중복 확인, 짧은 번호·상세 카드,
+  Daily 기록·중복·정정·취소·되돌리기·실패 재시도·대조·Tasks 체크, v1→v2 변환, install.sh(기록·사본)·get.sh(태그 설치·고정·확인·거부).
+
+### 적용 (mac mini)
+1. 커밋·push 후 `./release.sh tag` → 처음 한 번 `curl … get.sh | bash` (이후 `claire-update`).
+2. `claire_check doctor --format text` → `cron_checkin` 안내대로 Claire 가 만든 임시 12·18시 자동화를 지우고 `claire-checkin` cron 등록.
+3. iPhone 에서 확인: 06:00 브리핑 뒤 승인 대기 목록 버튼, 12·18시 확인 메시지, `완료` 버튼 뒤 Daily `## 완료한 일`.
+
 ## [0.4.5] — 2026-09-16
 
 번호 버튼이 며칠 만에 다시 사라지고 텍스트(코드 블록)로만 오던 퇴행(교수님 피드백: "어제는 버튼이 왔는데 오늘은 예전처럼 보인다").

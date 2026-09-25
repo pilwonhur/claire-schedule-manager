@@ -229,9 +229,12 @@ def line_checked(line: str, done_day: str) -> str:
 
 
 def format_task_line(title: str, due: str | None, ref: str, note_link: str | None = None,
-                     tag: str = "#tasks") -> str:
-    """todo-list-management 규약 + 🆔 (D12). `- [ ] #tasks [[정본 노트]]: 설명 📅 YYYY-MM-DD 🆔 clrNNNN`"""
+                     tag: str = "#tasks", due_time: str | None = None) -> str:
+    """todo-list-management 규약 + 🆔 (D12). `- [ ] #tasks [[정본 노트]]: 설명 📅 YYYY-MM-DD 🆔 clrNNNN`
+    마감 시각이 확정된 항목은 설명 끝에 `(15:00 마감)` 을 붙인다 (Tasks 문법에는 시각 필드가 없다)."""
     body = f"[[{note_link}]]: {title}" if note_link else title
+    if due_time:
+        body += f" ({due_time} 마감)"
     line = f"- [ ] {tag} {body}"
     if due:
         line += f" 📅 {due[:10]}"
@@ -294,3 +297,111 @@ def add_task_to_daily(cfg: dict, day: str, line: str) -> dict:
     os.replace(tmp, p)
     return {"path": str(p), "added": True, "created": created,
             "line_no": (lines.index(line) + 1)}
+
+
+# --------------------------------------------------------------------------
+# 완료 기록 (0.5.0) — 완료한 날 Daily 의 `## 완료한 일` 섹션에 항목당 한 줄
+# --------------------------------------------------------------------------
+
+def done_marker(ref: str) -> str:
+    """Obsidian 주석(읽기·미리보기에서 숨김)으로 줄을 찾는 표식. 같은 표식 줄은 한 Daily 에 하나만 둔다."""
+    return f"%%claire-done:{ref}%%"
+
+
+def format_done_line(ref: str, title: str, time_label: str | None, note_link: str | None) -> str:
+    """`- ✅ 14:32 심사 의견 정리 (CLR-0031) · [[20260911 논문 심사]] %%claire-done:CLR-0031%%`
+    체크박스가 아니므로 Tasks 플러그인·Claire 수집 대상이 아니다."""
+    parts = ["- ✅"]
+    if time_label:
+        parts.append(time_label)
+    parts.append(f"{title} ({ref})")
+    line = " ".join(parts)
+    if note_link:
+        line += f" · [[{note_link}]]"
+    return f"{line} {done_marker(ref)}"
+
+
+def _write_lines(p: Path, lines: list[str], mtime: float) -> None:
+    if abs(p.stat().st_mtime - mtime) > 1e-6:
+        raise ClaireError("file_changed", "읽은 뒤 파일이 바뀌어 쓰지 않았습니다.", path=str(p))
+    tmp = p.with_name(f".{p.name}.claire-tmp")
+    tmp.write_text("\n".join(lines), encoding="utf-8")
+    os.replace(tmp, p)
+
+
+def _section_bounds(lines: list[str], heading: str) -> tuple[int, int] | None:
+    """heading 줄 번호와 섹션 끝(같거나 높은 레벨의 다음 헤딩, 없으면 파일 끝)."""
+    hm = HEADING_RE.match(heading)
+    level = len(hm.group(1)) if hm else 2
+    title = hm.group(2).strip() if hm else heading.strip()
+    for i, l in enumerate(lines):
+        m = HEADING_RE.match(l)
+        if m and len(m.group(1)) == level and m.group(2).strip() == title:
+            end = next((j for j in range(i + 1, len(lines))
+                        if (HEADING_RE.match(lines[j]) and len(HEADING_RE.match(lines[j]).group(1)) <= level)), len(lines))
+            return i, end
+    return None
+
+
+def upsert_done_line(cfg: dict, day: str, ref: str, line: str) -> dict:
+    """완료일 Daily 에 기록 줄을 둔다. 같은 표식 줄이 있으면 내용만 맞추고(중복 없음), 없으면 섹션 끝에 추가한다.
+    섹션이 없으면 `## Tasks` 섹션 뒤(없으면 frontmatter 뒤)에 만든다. Daily 가 없으면 템플릿으로 만든다."""
+    dd = cfg.get("daily_done", {})
+    section = dd.get("section", "## 완료한 일")
+    after = dd.get("after_section", "## Tasks")
+    p, created = ensure_daily(cfg, day)
+    mtime = p.stat().st_mtime
+    lines = p.read_text(encoding="utf-8").split("\n")
+    marker = done_marker(ref)
+    hits = [i for i, l in enumerate(lines) if marker in l]
+    if hits:
+        first = hits[0]
+        changed = lines[first] != line or len(hits) > 1
+        if not changed:
+            return {"path": str(p), "action": "unchanged", "created": created}
+        lines[first] = line
+        for i in reversed(hits[1:]):
+            del lines[i]
+        _write_lines(p, lines, mtime)
+        return {"path": str(p), "action": "updated", "created": created}
+    b = _section_bounds(lines, section)
+    if b is None:
+        anchor = _section_bounds(lines, after)
+        if anchor is not None:
+            insert_at = anchor[1]
+            while insert_at > anchor[0] + 1 and not lines[insert_at - 1].strip():
+                insert_at -= 1
+            block = ["", section, line, ""]
+        else:
+            insert_at = 0
+            if lines and lines[0].strip() == "---":
+                try:
+                    insert_at = lines.index("---", 1) + 1
+                except ValueError:
+                    insert_at = 0
+            block = ["", section, line, ""]
+        lines[insert_at:insert_at] = block
+    else:
+        start, end = b
+        last = start
+        for i in range(start + 1, end):
+            if lines[i].strip():
+                last = i
+        lines.insert(last + 1, line)
+    _write_lines(p, lines, mtime)
+    return {"path": str(p), "action": "added", "created": created}
+
+
+def remove_done_line(cfg: dict, day: str, ref: str) -> dict:
+    """그 날 Daily 에서 표식 줄을 지운다. 파일·줄이 없으면 할 일이 없다(성공)."""
+    p = daily_path(cfg, day)
+    if not p.exists():
+        return {"path": str(p), "action": "absent"}
+    mtime = p.stat().st_mtime
+    lines = p.read_text(encoding="utf-8").split("\n")
+    marker = done_marker(ref)
+    keep = [l for l in lines if marker not in l]
+    if len(keep) == len(lines):
+        return {"path": str(p), "action": "absent"}
+    _write_lines(p, keep, mtime)
+    return {"path": str(p), "action": "removed", "count": len(lines) - len(keep)}

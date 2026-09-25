@@ -25,6 +25,7 @@
 | discord | message_id_passthrough | 항상 warn. 2단계 첫 실제 메시지로 닫는다 | — |
 | openclaw | workspace_skill | `~/.openclaw/workspace-claire/skills/claire-schedule-manager/SKILL.md`가 설치본과 같음 | `install.sh` |
 | openclaw | cron_daily | agent=claire, `0 6 * * *` @ Asia/Seoul, enabled | 아래 cron 등록 명령 |
+| openclaw | cron_checkin | agent=claire, 하나의 cron `0 12,18 * * *` @ Asia/Seoul (0.5.0 미등록 일정 확인) | 아래 "미등록 일정 확인 cron" |
 | openclaw | message_tool | Claire 에이전트에 `message` 도구 허용 (`tools.alsoAllow`) | fix 명령 (`openclaw config patch --stdin`) |
 | openclaw | button_ttl | 버튼 콜백 수명 ≥ 12시간 (`agentComponents.ttlMs`) | fix 명령 |
 | openclaw | channel_prompt | Claire 채널의 `systemPrompt`가 `references/discord-channel-prompt.txt`와 같음 | 아래 "채널 systemPrompt" |
@@ -63,6 +64,34 @@ openclaw cron list | grep "Claire 일일"      # 확인
 openclaw cron run <id>                        # 즉시 실행(디버그)
 ```
 
+### 미등록 일정 확인 cron (0.5.0, 12:00·18:00, 주말 포함)
+
+Claire 가 9/25 에 임시로 만든 반복 자동화가 있으면 먼저 지운다(`openclaw cron list` 에서 Claire 의 12·18시 항목 → `openclaw cron remove <id>`).
+그 뒤 declaration key 를 붙여 한 개로 등록한다. doctor `cron_checkin` 이 이 key 또는 이름의 "미등록"으로 찾는다.
+
+```bash
+openclaw cron add --agent claire --name "Claire 미등록 일정 확인" \
+  --cron "0 12,18 * * *" --tz Asia/Seoul --exact --session isolated \
+  --channel discord --account claire --to "channel:<Claire 채널 ID>" --announce --best-effort-deliver \
+  --timeout-seconds 600 --declaration-key claire-checkin \
+  --message "미등록 일정 확인을 보내세요. claire-schedule-manager 스킬 §2.1 '12:00·18:00 미등록 일정 확인'을 따르세요 (claire_run checkin --slot 은 지금 시각 12:00 또는 18:00)."
+```
+
+06:00 cron 문구는 그대로 두어도 된다(승인 대기 목록 전송은 SKILL §2 8단계에 들어 있다).
+
+## 설치·업데이트 (0.5.0)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/pilwonhur/claire-schedule-manager/main/get.sh | bash   # 처음 한 번
+claire-update                    # 이후: 최신 릴리스 태그로 (테스트 통과 시에만 설치)
+claire-update --check            # 설치 버전 vs 최신 릴리스
+claire-update --version v0.4.5   # 특정 버전으로 되돌리기
+$S/claire_check version --remote # JSON: version·schema·설치 출처(INSTALL_INFO.json)·최신 릴리스
+```
+
+소스는 `~/.claire-schedule-manager/src`(Dropbox 밖 설치 전용 클론)에 받는다. Dropbox 안 개발 저장소에서 `./install.sh`를
+직접 돌려도 되지만(개발 중 시험), 그때 설치 기록에 "커밋 안 된 변경 포함"이 남는다.
+
 ## OpenClaw 설정 3건 (번호 버튼, v0.4.3·v0.4.5)
 
 `install.sh`는 OpenClaw 설정을 건드리지 않는다. doctor가 빠진 것을 warn 으로 알리고 fix 명령을 준다. 세 건 모두
@@ -71,7 +100,7 @@ openclaw cron run <id>                        # 즉시 실행(디버그)
 | 설정 | 값 | 이유 |
 |---|---|---|
 | `agents.entries.claire.tools.alsoAllow` | `["message"]` | Claire는 `tools.profile: coding`이라 message 도구가 없다 |
-| `channels.discord.accounts.claire.agentComponents.ttlMs` | `86400000` | 06:00 브리핑 버튼이 하루 동안 살아 있어야 한다 (기본 30분) |
+| `channels.discord.accounts.claire.agentComponents.ttlMs` | `86400000` | 06:00 브리핑 버튼이 하루 동안 살아 있어야 한다 (기본 30분, OpenClaw 최대 24시간). 만료 뒤에는 번호 입력(`31 완료`)·답장·"버튼 다시"로 처리 |
 | `channels.discord.accounts.claire.guilds.<guild>.channels.<channel>.systemPrompt` | `references/discord-channel-prompt.txt` 원문 | 아래 |
 
 ### 채널 systemPrompt (v0.4.5) — 왜 필요한가

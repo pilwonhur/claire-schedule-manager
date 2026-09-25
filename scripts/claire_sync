@@ -33,6 +33,7 @@ from claire_core import (  # noqa: E402
     now_dt, now_iso, parse_iso, reindex_item, run_cli, sha256_text, sync_state_get,
     sync_state_upsert, tokenize, tz_of, tx,
 )
+import claire_ops as ops  # noqa: E402
 import google_api  # noqa: E402
 import obsidian_tasks  # noqa: E402
 import discord_files  # noqa: E402
@@ -401,7 +402,18 @@ def _mirror_calendar_to_item(conn, cfg, link_row, ev: dict, hdrs: dict, sid: int
         return changes
     start, all_day = _ev_time(ev.get("start"))
     end, _ = _ev_time(ev.get("end"))
-    fields = {"start_at": start, "end_at": end, "all_day": int(all_day), "title": ev.get("summary") or item["title"]}
+    title = ev.get("summary") or item["title"]
+    if item["kind"] != "meeting":
+        # 마감 표시 블록: 달력 제목의 "[마감] " 은 표시용이다. 항목 제목·마감 시각(due_at)은 건드리지 않는다.
+        prefix = cfg.get("apply", {}).get("deadline_title_prefix", "[마감] ")
+        if prefix and title.startswith(prefix):
+            title = title[len(prefix):]
+    fields = {"start_at": start, "end_at": end, "all_day": int(all_day), "title": title}
+    if item["kind"] != "meeting" and item["window_auto"] and (item["start_at"] != start or item["end_at"] != end):
+        fields["window_auto"] = 0          # 교수님이 달력에서 블록을 옮겼다: 이후 마감이 바뀌어도 구간을 다시 계산하지 않는다
+    resp = hdrs.get("user_response")
+    if resp in ops.RESPONSE_TO_ATTENDANCE and hdrs.get("attendees"):
+        fields["attendance"] = ops.RESPONSE_TO_ATTENDANCE[resp]
     # 충돌 (§6.2): 교수님 지시(calendar.update)가 반영 대기 중인데 Calendar 쪽도 바뀌었다 → 덮어쓰지 않고 묻는다
     pending = conn.execute("SELECT * FROM outbox WHERE item_id=? AND op='calendar.update' AND status IN ('pending','awaiting_confirm')",
                            (item["id"],)).fetchone()
@@ -578,7 +590,24 @@ def _mirror_task_to_item(conn, cfg, link_row, t: dict, sid: int, now_s: str, run
         return []
     changes = []
     due = f"{t['due']}T23:59:59{now_s[-6:]}" if t.get("due") else None
+    if due and item["due_at"] and item["due_precision"] == "time":
+        # Tasks 줄은 날짜만 안다. 확정된 마감 시각(예: 15:00)을 23:59 로 덮지 않는다 (0.5.0).
+        # 같은 날짜면 그대로, 날짜가 바뀌었으면 날짜만 옮기고 시각은 유지한다.
+        local_day = ops.local_day(cfg, item["due_at"])
+        due = item["due_at"] if local_day == t["due"] else ops.with_time_of(t["due"], item["due_at"])
     fields = {"due_at": due, "scheduled_on": t.get("scheduled")}
+    if due and due != item["due_at"] and ops.wants_window(item) and item["window_auto"]:
+        ws, we = ops.deadline_window(cfg, due)
+        linked = conn.execute("SELECT 1 FROM link WHERE item_id=? AND system='calendar' AND sync_status<>'missing'",
+                              (item["id"],)).fetchone()
+        if linked and item["status"] not in ("done", "cancelled"):
+            # 달력 블록은 Calendar 가 원본: 마감 이동에 맞춰 옮기는 것은 outbox 로
+            ops.apply_update(conn, cfg, item, {"due_at": due}, actor="sync", ts=now_s,
+                             reason="Obsidian Tasks 마감 날짜 변경 → 달력 표시 구간 이동", evidence_sid=sid, run_id=run_id)
+            item = conn.execute("SELECT * FROM item WHERE id=?", (item["id"],)).fetchone()
+            changes.append("due_at")
+        elif not linked:
+            fields.update({"start_at": ws, "end_at": we})
     for k, v in fields.items():
         if v is not None and item[k] != v:
             log_activity(conn, item_id=item["id"], action="update", actor="sync", ts=now_s, field=k,
@@ -596,6 +625,7 @@ def _mirror_task_to_item(conn, cfg, link_row, t: dict, sid: int, now_s: str, run
         conn.execute("UPDATE item SET status='done', completed_at=?, updated_at=? WHERE id=?",
                      (completed, now_s, item["id"]))
         conn.execute("UPDATE question SET status='withdrawn' WHERE item_id=? AND status='open'", (item["id"],))
+        ops.plan_daily_done(conn, cfg, conn.execute("SELECT * FROM item WHERE id=?", (item["id"],)).fetchone(), now_s)
         changes.append("done")
     conn.execute("UPDATE link SET version=?, last_seen_at=?, last_synced_at=?, sync_status='ok' WHERE id=?",
                  (t["line_hash"], now_s, now_s, link_row["id"]))
@@ -716,9 +746,15 @@ def cmd_ingest_discord(args, cfg):
     for p in cfg["discord"]["register_prefixes"]:
         if text.startswith(p):
             intent = "register"
+    if args.intent == "register" and intent is None:
+        intent = "register"            # 12:00·18:00 미등록 일정 확인에 대한 답 등 접두어 없는 교수님 지시
+    elif args.intent == "reference":
+        intent, reason = "reference", "reference"
     susp = _suspicious(text)
     hdrs = {"author_id": args.author_id, "channel_id": args.channel_id, "reply_to_id": args.reply_to,
             "intent": intent, "has_image": bool(attachments or urls), "text_chars": len(text)}
+    if args.checkin:
+        hdrs["checkin"] = args.checkin
     if susp:
         hdrs["suspicious"] = susp
 
@@ -949,6 +985,9 @@ def build_parser():
     d.add_argument("--message-id"); d.add_argument("--text"); d.add_argument("--attachment", action="append")
     d.add_argument("--attachment-url", action="append"); d.add_argument("--captured-at")
     d.add_argument("--author-id"); d.add_argument("--channel-id"); d.add_argument("--reply-to")
+    d.add_argument("--intent", choices=["register", "reference"],
+                   help="접두어 없이도 지시(register)·참고(reference)로 저장. 미등록 일정 확인 답변은 register")
+    d.add_argument("--checkin", help="미등록 일정 확인 슬롯(예: 2026-09-25@18:00)에 대한 답이면 그 표시")
     d.set_defaults(fn=cmd_ingest_discord)
     rt = sub.add_parser("retriage", help="수집된 Gmail 이벤트에 사전 필터 재적용")
     rt.add_argument("--backlog-days", type=int, help="이보다 오래된 미처리 메일을 initial_backlog 로")

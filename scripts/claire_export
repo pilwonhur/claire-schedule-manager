@@ -58,8 +58,8 @@ def cmd_md(args, cfg):
     for r in rows:
         when = r.get("due_at") or r.get("start_at") or ""
         title = (r["title"] or "").replace("|", "\\|")
-        lines.append(f"| {r['ref']} | {r['kind']} | {r['status']} | {title} | {when[:16]} | "
-                     f"{(r.get('project') or '').replace('|', '\\|')} |")
+        project = (r.get("project") or "").replace("|", "\\|")    # f-string 안 역슬래시는 3.12 부터만 허용
+        lines.append(f"| {r['ref']} | {r['kind']} | {r['status']} | {title} | {when[:16]} | {project} |")
     atomic_write_text(out_dir / "claire-items.md", "\n".join(lines) + "\n")
     return {"out": str(out_dir), "files": ["claire-items.md"], "items": len(rows)}
 

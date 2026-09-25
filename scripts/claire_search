@@ -12,6 +12,9 @@
   history --item CLR-0001                변경 이력
   trace --source-event 981 | --item CLR  원문 역추적 (원문 → 항목 → 이력)
   waiting [--who "김 교수"]               답변 대기 항목
+  dupcheck --title "김 교수 면담" [--date YYYY-MM-DD]   등록 전 중복 후보 (미등록 일정 확인 답변용, 0.5.0)
+
+0.5.0: 항목마다 업무 상태(status)와 별개로 외부 반영 상태(sync: calendar·tasks·daily)와 한 줄 요약(state_line)을 낸다.
 """
 
 from __future__ import annotations
@@ -29,15 +32,31 @@ from claire_core import (  # noqa: E402
     ClaireError, OPEN_STATUSES, connect, fts_query, get_item, hits, now_dt, now_iso, parse_iso, ref_order_sql,
     run_cli, tokenize, tz_of,
 )
+import claire_ops as ops  # noqa: E402
+
+_CTX: dict = {}          # 명령 하나 동안의 conn·cfg (항목마다 반영 상태를 붙이기 위해)
 
 OPEN_SQL = "status IN (" + ",".join(f"'{s}'" for s in OPEN_STATUSES) + ")"
 
 
 def _item(r) -> dict:
     d = dict(r)
-    return {k: d.get(k) for k in ("ref", "title", "kind", "status", "priority", "project", "start_at", "end_at",
-                                  "all_day", "due_at", "scheduled_on", "tentative", "confidence", "waiting_on",
-                                  "next_check_at", "next_action", "done_criteria", "updated_at")}
+    out = {k: d.get(k) for k in ("ref", "title", "kind", "status", "priority", "project", "start_at", "end_at",
+                                 "all_day", "due_at", "due_precision", "scheduled_on", "tentative", "attendance",
+                                 "confidence", "waiting_on", "next_check_at", "next_action", "done_criteria",
+                                 "completed_at", "updated_at")}
+    if d.get("window_auto"):
+        out["calendar_window"] = "auto"      # start_at·end_at 은 마감에서 만든 달력 표시 구간
+    conn, cfg = _CTX.get("conn"), _CTX.get("cfg")
+    if conn is not None and "id" in d and "daily_logged_on" in d:
+        out["sync"] = ops.sync_state_of(conn, r)
+        out["state_line"] = ops.describe_state(conn, cfg, r)
+    return out
+
+
+def _ctx(conn, cfg):
+    _CTX.update(conn=conn, cfg=cfg)
+    return conn
 
 
 def _day_bounds(cfg, day: str) -> tuple[str, str]:
@@ -140,7 +159,7 @@ def _open_questions(conn, now_s: str, due_now: bool) -> list[dict]:
 
 
 def cmd_review(args, cfg):
-    conn = connect(create=False)
+    conn = _ctx(connect(create=False), cfg)
     now = now_dt(cfg); now_s = now.isoformat(); today = now.strftime("%Y-%m-%d")
     d0, d1 = _day_bounds(cfg, today)
     imminent_end = _day_bounds(cfg, (now + timedelta(days=int(cfg["briefing"]["imminent_days"]))).strftime("%Y-%m-%d"))[1]
@@ -192,6 +211,14 @@ def cmd_review(args, cfg):
             outbox["failed"].append(entry)
         else:
             outbox["pending"] += 1
+    daily_unsynced = []
+    for r in conn.execute("SELECT o.*, i.ref AS item_ref, i.title AS item_title FROM outbox o JOIN item i ON i.id=o.item_id "
+                          "WHERE o.op='obsidian.daily_done' AND o.status IN ('pending','failed') ORDER BY o.id"):
+        p = json.loads(r["payload"])
+        daily_unsynced.append({"item_ref": r["item_ref"], "title": r["item_title"], "day": p.get("day"),
+                               "state": ops._op_state(r), "attempts": r["attempts"], "last_error": r["last_error"]})
+    checkins = [dict(r) for r in conn.execute("SELECT day, slot, created_at, answered_at, result FROM checkin "
+                                             "WHERE day >= ? ORDER BY id", ((now - timedelta(days=1)).strftime("%Y-%m-%d"),))]
     sync = [dict(r) for r in conn.execute("SELECT * FROM sync_state ORDER BY platform, account")]
     stale = [s for s in sync if not s["last_success_at"] or s["last_success_at"] < d0]
     pending = {r["platform"]: r["c"] for r in conn.execute(
@@ -212,13 +239,14 @@ def cmd_review(args, cfg):
         "new_items": new_items, "changed_items": changed, "captured": captured,
         "waiting_check": waiting, "questions": _open_questions(conn, now_s, due_now=True),
         "links_attention": links, "ignored_since_last": ignored, "suspicious": suspicious, "outbox": outbox,
+        "approvals": ops.approval_queue(conn, cfg, now), "daily_unsynced": daily_unsynced, "checkins": checkins,
         "limits": {"section_limit": cfg["briefing"]["section_limit"], "imminent_days": cfg["briefing"]["imminent_days"]},
         "data_as_of": max([s["last_success_at"] or "" for s in sync] + [""]) or None,
     }
 
 
 def cmd_today(args, cfg):
-    conn = connect(create=False)
+    conn = _ctx(connect(create=False), cfg)
     now = now_dt(cfg); day = args.date or now.strftime("%Y-%m-%d")
     d0, d1 = _day_bounds(cfg, day)
     if args.basis:
@@ -250,7 +278,7 @@ def cmd_today(args, cfg):
 
 
 def cmd_week(args, cfg):
-    conn = connect(create=False)
+    conn = _ctx(connect(create=False), cfg)
     now = now_dt(cfg); start_day = args.date or now.strftime("%Y-%m-%d")
     d0 = _day_bounds(cfg, start_day)[0]
     end_day = (datetime.strptime(start_day, "%Y-%m-%d") + timedelta(days=6)).strftime("%Y-%m-%d")
@@ -264,19 +292,21 @@ def cmd_week(args, cfg):
 
 
 def cmd_overdue(args, cfg):
-    conn = connect(create=False)
+    conn = _ctx(connect(create=False), cfg)
     return {"basis": "due", "overdue": _overdue(conn, cfg, now_iso(cfg)), "data_as_of": _data_as_of(conn)}
 
 
 def cmd_questions(args, cfg):
-    conn = connect(create=False)
+    conn = _ctx(connect(create=False), cfg)
     return {"questions": _open_questions(conn, now_iso(cfg), due_now=args.due_now)}
 
 
 def cmd_show(args, cfg):
-    conn = connect(create=False)
+    conn = _ctx(connect(create=False), cfg)
     it = get_item(conn, args.item, allow_deleted=True)
     d = dict(it)
+    d["sync"] = ops.sync_state_of(conn, it)
+    d["state_line"] = ops.describe_state(conn, cfg, it)
     d["sources"] = [dict(r) for r in conn.execute(
         "SELECT s.role, e.id AS source_event_id, e.platform, e.account, e.event_ts, e.excerpt, e.triage "
         "FROM item_source s JOIN source_event e ON e.id=s.source_event_id WHERE s.item_id=? ORDER BY e.id", (it["id"],))]
@@ -297,7 +327,7 @@ def cmd_show(args, cfg):
 
 def cmd_find(args, cfg):
     """한국어 검색. Clio §7.1 가중합(제목·프로젝트·다음 행동·출처 발췌·FTS·최신성)을 항목에 맞게 적용."""
-    conn = connect(create=False)
+    conn = _ctx(connect(create=False), cfg)
     toks = tokenize(args.q)
     if not toks:
         raise ClaireError("empty_query", "검색어가 비어 있습니다")
@@ -356,7 +386,7 @@ def cmd_find(args, cfg):
 
 
 def cmd_history(args, cfg):
-    conn = connect(create=False)
+    conn = _ctx(connect(create=False), cfg)
     it = get_item(conn, args.item, allow_deleted=True)
     rows = [dict(r) for r in conn.execute(
         "SELECT a.id, a.action, a.actor, a.field, a.old_value, a.new_value, a.reason, a.evidence_source_event_id, "
@@ -367,7 +397,7 @@ def cmd_history(args, cfg):
 
 def cmd_trace(args, cfg):
     """원문 역추적: source_event → 연결 항목 → 그 항목의 이력. 또는 항목 → 원문들."""
-    conn = connect(create=False)
+    conn = _ctx(connect(create=False), cfg)
     if args.source_event:
         ev = conn.execute("SELECT * FROM source_event WHERE id=?", (args.source_event,)).fetchone()
         if ev is None:
@@ -392,7 +422,7 @@ def cmd_trace(args, cfg):
 
 
 def cmd_waiting(args, cfg):
-    conn = connect(create=False)
+    conn = _ctx(connect(create=False), cfg)
     now_s = now_iso(cfg)
     sql = "SELECT * FROM item WHERE deleted_at IS NULL AND status='waiting'"
     params = []
@@ -407,6 +437,35 @@ def cmd_waiting(args, cfg):
         d["check_due"] = bool(r["next_check_at"] and r["next_check_at"] <= now_s)
         out.append(d)
     return {"who": args.who, "count": len(out), "waiting": out, "data_as_of": _data_as_of(conn)}
+
+
+def cmd_dupcheck(args, cfg):
+    """등록 전 중복 확인: 제목 어절이 겹치는 열린 항목, 최근 완료 항목, 같은 날짜의 항목을 근거와 함께 낸다.
+    판단(같은 일인지)은 Claire 가 한다. 후보가 있으면 새로 만들지 말고 교수님께 확인한다."""
+    conn = _ctx(connect(create=False), cfg)
+    toks = tokenize(args.title)
+    if not toks:
+        raise ClaireError("empty_query", "제목이 비어 있습니다")
+    now = now_dt(cfg)
+    recent = (now - timedelta(days=int(args.recent_days))).isoformat()
+    out = []
+    for r in conn.execute("SELECT * FROM item WHERE deleted_at IS NULL AND (status NOT IN ('done','cancelled') "
+                          "OR updated_at >= ?)", (recent,)):
+        title = unicodedata.normalize("NFC", r["title"] or "")
+        matched = [t for t in toks if hits(t, title)]
+        days = {_local_day(r[c], cfg) for c in ("start_at", "due_at", "scheduled_on") if r[c]}
+        same_day = bool(args.date and args.date in days)
+        strong = len(matched) >= max(1, (len(toks) + 1) // 2)
+        if not (strong or (same_day and matched)):
+            continue
+        d = _item(r)
+        d["why"] = ", ".join(x for x in (f"제목 {len(matched)}/{len(toks)} 어절" if matched else "",
+                                         "같은 날짜" if same_day else "") if x)
+        d["score"] = len(matched) / len(toks) + (0.5 if same_day else 0)
+        out.append(d)
+    out.sort(key=lambda x: (-x["score"], x["ref"]))
+    return {"title": args.title, "date": args.date, "candidates": out[:5], "count": len(out),
+            "message": "중복 후보가 있습니다. 같은 일이면 새로 만들지 말고 번호를 알려 드리세요." if out else "중복 후보 없음"}
 
 
 def _data_as_of(conn):
@@ -430,6 +489,10 @@ def build_parser():
     o = sub.add_parser("overdue"); o.set_defaults(fn=cmd_overdue)
     q = sub.add_parser("questions"); q.add_argument("--due-now", action="store_true"); q.set_defaults(fn=cmd_questions)
     s = sub.add_parser("show"); s.add_argument("--item", required=True); s.set_defaults(fn=cmd_show)
+    dc = sub.add_parser("dupcheck", help="등록 전 중복 후보")
+    dc.add_argument("--title", required=True); dc.add_argument("--date", help="YYYY-MM-DD (일정·마감 날짜)")
+    dc.add_argument("--recent-days", type=int, default=14, help="완료·취소 항목은 최근 N일 안에 바뀐 것만")
+    dc.set_defaults(fn=cmd_dupcheck)
     return p
 
 

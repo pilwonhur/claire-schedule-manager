@@ -16,6 +16,10 @@
   missed [--notify]
          마지막 성공 daily가 missed_hours 이전인지 판정. --notify 면 outbox 에 안내문을
          하루 1건만 남긴다 (§8.4).
+  checkin --slot 12:00|18:00 [--date YYYY-MM-DD]
+         미등록 일정·구두 약속 확인 메시지(0.5.0). 하루·슬롯마다 한 번만 만든다(duplicate=true 면 보내지 않는다).
+  checkin-mark --slot 18:00 [--date] [--message-id ID] [--result none|registered|asked|dismissed] [--refs CLR-…]
+         보낸 메시지 번호·답변 결과를 남긴다.
 """
 
 from __future__ import annotations
@@ -290,6 +294,68 @@ def cmd_missed(args, cfg):
     return res
 
 
+def _slot(value: str) -> str:
+    v = value.strip()
+    if v.isdigit():
+        v = f"{int(v):02d}:00"
+    if len(v) == 4 and v[1] == ":":
+        v = "0" + v
+    if len(v) != 5 or v[2] != ":":
+        raise ClaireError("bad_slot", f"--slot 은 HH:MM (예: 12:00, 18:00): {value}")
+    return v
+
+
+def cmd_checkin(args, cfg):
+    """12:00·18:00 미등록 일정 확인 (0.5.0). 판단 없이 메시지 재료만 만든다. 답은 Claire 가 SKILL §4.2 대로 처리한다."""
+    conn = connect(create=False)
+    now = now_dt(cfg); now_s = now.isoformat()
+    day = args.date or now.strftime("%Y-%m-%d")
+    slot = _slot(args.slot)
+    with tx(conn):
+        row = conn.execute("SELECT * FROM checkin WHERE day=? AND slot=?", (day, slot)).fetchone()
+        if row is not None:
+            return {"duplicate": True, "day": day, "slot": slot, "created_at": row["created_at"],
+                    "message": "이 시간대 확인은 오늘 이미 보냈습니다. 다시 보내지 마세요."}
+        conn.execute("INSERT INTO checkin(day,slot,created_at) VALUES(?,?,?)", (day, slot, now_s))
+    today_new = [dict(r) for r in conn.execute(
+        "SELECT DISTINCT i.ref, i.title FROM activity_log a JOIN item i ON i.id=a.item_id WHERE a.action='create' "
+        "AND substr(a.created_at,1,10)=? AND i.status NOT IN ('captured','cancelled') ORDER BY i.id", (day,))]
+    lines = [f"[{slot} 확인] 오늘 새로 생긴 일정이나 구두 약속 중 아직 등록하지 않은 것이 있나요?",
+             "있으면 이 메시지에 답장으로 적어 주세요. 예: `금요일 3시 김 교수 면담`, `다음 주 화요일까지 추천서`.",
+             "날짜·시각이 빠지면 여쭙고, 이미 있는 일정과 겹치면 알려 드립니다."]
+    if today_new:
+        shown = ", ".join(f"{r['ref']} {r['title']}" for r in today_new[:5])
+        lines.append(f"오늘 등록된 것: {shown}" + (f" 외 {len(today_new) - 5}건" if len(today_new) > 5 else ""))
+    text = "\n".join(lines)
+    components = {"reusable": True, "text": lines[0], "blocks": [
+        {"type": "text", "text": "\n".join(lines[1:])},
+        {"type": "actions", "buttons": [{"label": f"{slot} 미등록 일정 없음", "style": "secondary"}]}]}
+    return {"duplicate": False, "day": day, "slot": slot, "checkin": f"{day}@{slot}", "message": text,
+            "components": components, "today_registered": today_new,
+            "send_with": "message 도구로 message·components 를 보낸다. 보낸 뒤 checkin-mark --message-id 로 번호를 남긴다."}
+
+
+def cmd_checkin_mark(args, cfg):
+    conn = connect(create=False)
+    now = now_dt(cfg); now_s = now.isoformat()
+    day = args.date or now.strftime("%Y-%m-%d")
+    slot = _slot(args.slot)
+    with tx(conn):
+        row = conn.execute("SELECT * FROM checkin WHERE day=? AND slot=?", (day, slot)).fetchone()
+        if row is None:
+            raise ClaireError("checkin_not_found", f"{day} {slot} 확인 기록이 없습니다")
+        sets, vals = [], []
+        if args.message_id:
+            sets.append("message_id=?"); vals.append(args.message_id)
+        if args.result:
+            result = {"result": args.result, "refs": args.refs or []}
+            sets += ["answered_at=?", "result=?"]; vals += [now_s, json.dumps(result, ensure_ascii=False)]
+        if sets:
+            conn.execute(f"UPDATE checkin SET {', '.join(sets)} WHERE id=?", (*vals, row["id"]))
+    return {"day": day, "slot": slot, "message_id": args.message_id or row["message_id"], "result": args.result,
+            "refs": args.refs or []}
+
+
 def build_parser():
     p = argparse.ArgumentParser(prog="claire_run", description="Claire 실행 관리 (PRD §8)")
     sub = p.add_subparsers(dest="cmd")
@@ -321,6 +387,14 @@ def build_parser():
     m = sub.add_parser("missed", help="미실행 감지")
     m.add_argument("--notify", action="store_true")
     m.set_defaults(fn=cmd_missed)
+    ci = sub.add_parser("checkin", help="12:00·18:00 미등록 일정 확인 메시지")
+    ci.add_argument("--slot", required=True); ci.add_argument("--date")
+    ci.set_defaults(fn=cmd_checkin)
+    cm = sub.add_parser("checkin-mark", help="확인 메시지 번호·답변 결과 기록")
+    cm.add_argument("--slot", required=True); cm.add_argument("--date"); cm.add_argument("--message-id")
+    cm.add_argument("--result", choices=["none", "registered", "asked", "dismissed"])
+    cm.add_argument("--refs", nargs="*")
+    cm.set_defaults(fn=cmd_checkin_mark)
     return p
 
 

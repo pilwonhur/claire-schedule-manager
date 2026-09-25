@@ -43,7 +43,7 @@ Claire는 자유 텍스트로 DB를 바꾸지 않는다. 해석 결과를 이 �
 
 | op | 필수 | 선택 | 2단계 |
 |---|---|---|---|
-| `create` | `source_event_ids`, `kind`, `title`, `evidence`(1개 이상) | `project`, `priority`(high/normal/low), `owner`(user/claire/other), `next_action`, `done_criteria`, `start_at`, `end_at`, `all_day`, `due_at`, `scheduled_on`, `tentative`, `confidence`(0~1), `waiting_on`, `next_check_at`, `canonical_note`, `ledger_note`, `series_key`, `occurrence_at`, `unknown_fields`, `questions`, `note` | ✅ |
+| `create` | `source_event_ids`, `kind`, `title`, `evidence`(1개 이상) | `project`, `priority`(high/normal/low), `owner`(user/claire/other), `next_action`, `done_criteria`, `start_at`, `end_at`, `all_day`, `due_at`, `scheduled_on`, `tentative`, `confidence`(0~1), `waiting_on`, `next_check_at`, `canonical_note`, `ledger_note`, `series_key`, `occurrence_at`, `attendance`(undecided/attending/declined), `unknown_fields`, `questions`, `note` | ✅ |
 | `ignore` | `source_event_ids`, `reason` | `note` | ✅ |
 | `update` | `item_ref`, `source_event_ids`, `changes`(필드→값), `evidence` | `reason` | ✅ 같은 스레드·시리즈·연결 원문만. 아니면 `--force-cross-thread` |
 | `complete` | `item_ref`, `source_event_ids`, `evidence` | `reason`, `evidence_code`(기본 `criteria_evidence:<첫 source_event_id>`) | ✅ 보낸 메일·제출 확인 등 완료 증거 |
@@ -62,7 +62,11 @@ Claire는 자유 텍스트로 DB를 바꾸지 않는다. 해석 결과를 이 �
 7. Calendar·Obsidian 원문으로 만든 항목은 자동으로 `link`가 생긴다. 이미 연결된 원문으로 다시 `create`하면 거부.
 8. 같은 원문(`source_event_id`)으로 여러 항목을 만들 수 있다(메일 1통에 요청 3개, TC3). 단 Calendar·Obsidian 원문은 항목 하나만.
 9. 한 원문을 `ignore`와 `create`에 동시에 넣을 수 없다.
-10. `update`의 `changes` 값은 `claire_store update`와 같은 형식 검증을 받는다. `status`는 바꿀 수 없다(전이는 `complete`/`cancel`로).
+10. **마감 시각 규칙(0.5.0)**: 회의가 아닌 항목에 시각 있는 `due_at`만 주면 도구가 `start_at`·`end_at`을 마감 1시간 전~마감(`apply.deadline_window_minutes`)으로 채운다(달력 표시 구간, `window_auto`).
+    `start_at`을 주면 그 값이 우선이고 `end_at`이 없으면 마감까지. 날짜만인 `due_at`은 `due_precision=date`로 저장되고 달력에 올리지 않는다.
+    날짜는 알고 시각을 모르면 `unknown_fields: ["due_time"]` + `field: "due_time"` 질문(`due_at`에 날짜를 넣어도 된다). 시각이 이미 있는데 `due_time`을 물으면 거부.
+    `kind: deadline`인데 날짜만이고 `due_time` 질문도 없으면 반환 `warnings`에 `due_time_missing`이 붙는다(거부는 아님).
+11. `update`의 `changes` 값은 `claire_store update`와 같은 형식 검증을 받는다. `status`는 바꿀 수 없다(전이는 `complete`/`cancel`로).
     Calendar 연결 항목의 `start_at`/`end_at`은 Calendar가 원본이라 거부된다(4단계 outbox).
 
 ## 반환
@@ -72,6 +76,8 @@ Claire는 자유 텍스트로 DB를 바꾸지 않는다. 해석 결과를 이 �
  "questions": [{"ref": "Q-0007", "item_ref": "CLR-0031", "question": "..."}],
  "ignored": [...], "summary": {...}, "message": "... 이제 번호를 말해도 됩니다."}
 ```
+
+`created[]`에는 `due_precision`, `start_at`·`end_at`, `calendar_window: "auto"`(자동 구간일 때), `planned`(예약된 외부 반영)가 실린다.
 
 **이 반환 전에는 번호를 말하지 않는다.** `ok: false`면 오류 메시지를 고쳐 다시 제안하거나, 고칠 수 없으면
 브리핑에 "해석 미반영 N건"으로 적는다.

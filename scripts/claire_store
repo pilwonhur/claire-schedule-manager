@@ -23,9 +23,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
+import subprocess
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -39,7 +41,8 @@ import claire_ops as ops  # noqa: E402
 ALLOWED_OPS = {"create", "ignore", "update", "complete", "cancel", "relate"}
 CREATE_FIELDS = {"kind", "title", "project", "priority", "owner", "next_action", "done_criteria",
                  "start_at", "end_at", "all_day", "due_at", "scheduled_on", "tentative", "confidence",
-                 "waiting_on", "next_check_at", "canonical_note", "ledger_note", "series_key", "occurrence_at"}
+                 "waiting_on", "next_check_at", "canonical_note", "ledger_note", "series_key", "occurrence_at",
+                 "attendance"}
 ISO_DT = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2})?([+-]\d{2}:\d{2}|Z)$")
 ISO_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 DEFAULT_CRITERIA = {"deadline": "제출·발송 완료", "reply": "회신 발송", "prep": "자료 준비 완료",
@@ -98,7 +101,11 @@ def _validate_create(p: dict, idx: int, cfg, evs=None) -> dict:
         "next_check_at": _norm_dt(p.get("next_check_at"), "next_check_at", cfg, True),
         "canonical_note": p.get("canonical_note"), "ledger_note": p.get("ledger_note"),
         "series_key": p.get("series_key"), "occurrence_at": p.get("occurrence_at"),
+        "due_precision": ops.precision_of(p.get("due_at")), "window_auto": 0,
+        "attendance": p.get("attendance"),
     }
+    if fields["attendance"] is not None and fields["attendance"] not in ops.ATTENDANCE:
+        _bad(f"제안 {idx}: attendance 는 {ops.ATTENDANCE} 중 하나", attendance=fields["attendance"])
     # Calendar 원문이면 이벤트 값이 원본이다(§5.1). 제안에 없으면 이벤트에서 채운다.
     cal_evs = [e for e in (evs or []) if e["platform"] == "calendar"]
     if cal_evs:
@@ -109,6 +116,17 @@ def _validate_create(p: dict, idx: int, cfg, evs=None) -> dict:
             fields["all_day"] = 1 if h.get("all_day") else 0
         if p.get("tentative") is None:
             fields["tentative"] = 0
+        if fields["attendance"] is None and h.get("user_response"):
+            fields["attendance"] = ops.RESPONSE_TO_ATTENDANCE.get(h["user_response"])
+    # 0.5.0 마감 규칙: 마감 시각만 있으면 달력 표시 구간은 마감 1시간 전~마감. 시작·기간을 따로 주면 그것이 우선.
+    if kind != "meeting" and fields["due_at"] and fields["due_precision"] == "time":
+        if not fields["start_at"]:
+            fields["start_at"], fields["end_at"] = ops.deadline_window(cfg, fields["due_at"])
+            fields["window_auto"] = 1
+        elif not fields["end_at"]:
+            start = datetime.fromisoformat(fields["start_at"])
+            due = datetime.fromisoformat(fields["due_at"])
+            fields["end_at"] = (due if due > start else start + timedelta(hours=1)).isoformat()
     if fields["priority"] not in PRIORITIES:
         _bad(f"제안 {idx}: priority 가 잘못되었습니다", priority=fields["priority"])
     if fields["owner"] not in OWNERS:
@@ -146,8 +164,17 @@ def _validate_create(p: dict, idx: int, cfg, evs=None) -> dict:
     for q in questions:
         if not (q.get("question") or "").strip():
             _bad(f"제안 {idx}: 질문 문장이 비어 있습니다")
+    if "due_time" in unknown and not fields["due_at"]:
+        _bad(f"제안 {idx}: due_time 질문은 마감 날짜(due_at: YYYY-MM-DD)가 있을 때만 씁니다. 날짜도 모르면 due_at 을 unknown_fields 에")
+    if "due_time" in unknown and fields["due_precision"] == "time":
+        _bad(f"제안 {idx}: 마감 시각이 이미 있는데 due_time 을 묻고 있습니다")
+    warnings = []
+    if kind == "deadline" and fields["due_precision"] == "date" and "due_time" not in unknown:
+        warnings.append({"code": "due_time_missing", "title": title,
+                         "message": "마감 날짜만 있고 시각이 없습니다. 달력에 표시하려면 unknown_fields 에 due_time 을 넣고 "
+                                    "시각을 물으세요 (Obsidian Tasks 에서 온 날짜 마감이면 그대로 두어도 됩니다)."})
     return {"fields": fields, "unknown": unknown, "questions": questions, "evidence": evidence,
-            "relations": p.get("relations") or [], "note": p.get("note")}
+            "relations": p.get("relations") or [], "note": p.get("note"), "warnings": warnings}
 
 
 def _load_events(conn, ids, idx):
@@ -274,6 +301,7 @@ def cmd_propose(args, cfg):
     # 2차: 한 트랜잭션으로 반영
     created, questions, ignored, captured = [], [], [], []
     updated, completed, cancelled, related = [], [], [], []
+    warnings = []
     min_conf = float(cfg["min_confidence"])
     with tx(conn):
         for plan in plans:
@@ -357,8 +385,12 @@ def cmd_propose(args, cfg):
             new_item = conn.execute("SELECT * FROM item WHERE id=?", (iid,)).fetchone()
             planned = ops.plan_external(conn, cfg, new_item, now_s)
             entry = {"ref": ref, "title": f["title"], "kind": f["kind"], "status": status,
-                     "due_at": f["due_at"], "start_at": f["start_at"], "confidence": conf, "questions": q_refs,
+                     "due_at": f["due_at"], "due_precision": f["due_precision"], "start_at": f["start_at"],
+                     "end_at": f["end_at"], "calendar_window": "auto" if f["window_auto"] else None,
+                     "confidence": conf, "questions": q_refs,
                      "source_event_ids": [e["id"] for e in plan["events"]], "planned": planned}
+            for w in plan.get("warnings", []):
+                warnings.append({**w, "ref": ref})
             (captured if status == "captured" else created).append(entry)
 
     summary = {"created": sum(c.get("occurrences", 1) for c in created), "series": sum(1 for c in created if "series" in c),
@@ -367,7 +399,7 @@ def cmd_propose(args, cfg):
                "updated": len(updated), "completed": len(completed), "cancelled": len(cancelled), "related": len(related)}
     return {"run_id": run_id, "created": created, "captured": captured, "questions": questions, "ignored": ignored,
             "updated": updated, "completed": completed, "cancelled": cancelled, "related": related,
-            "summary": summary,
+            "summary": summary, "warnings": warnings,
             "message": f"항목 {summary['created']}건 생성, 변경 {summary['updated']}건, 완료 {summary['completed']}건, "
                        f"취소 {summary['cancelled']}건, 참고 {summary['captured']}건, 질문 {summary['questions']}건, "
                        f"제외 {summary['ignored_events']}건. 이제 번호를 말해도 됩니다."}
@@ -444,6 +476,35 @@ def _item_by_ref_or_find(conn, cfg, ref: str | None, find: str | None, open_only
                       candidates=[{"ref": c["ref"], "title": c["title"], "status": c["status"], "due_at": c["due_at"]} for c in cands[:5]])
 
 
+def _apply_now(args, ref: str) -> dict | None:
+    """--apply: 방금 바뀐 항목의 외부 반영(Tasks 체크·Daily 완료 기록 등)을 바로 실행한다. 실패해도 저장은 유지된다."""
+    if not getattr(args, "apply", False):
+        return None
+    cmd = [sys.executable, str(Path(__file__).resolve().parent / "claire_apply"), "--item", ref]
+    if args.run:
+        cmd += ["--run", str(args.run)]
+    proc = subprocess.run(cmd, capture_output=True, text=True, env=dict(os.environ))
+    try:
+        out = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        return {"ok": False, "error": (proc.stderr or proc.stdout)[-300:]}
+    return {"ok": out.get("ok", False), "summary": out.get("summary"), "done": [d["op"] for d in out.get("done", [])],
+            "retry": out.get("retry", []), "failed": out.get("failed", []), "skipped": out.get("skipped", []),
+            "error": (out.get("error") or {}).get("message")}
+
+
+def _daily_note(r: dict) -> str:
+    d = r.get("daily") or {}
+    ap = r.get("applied") or {}
+    if not d:
+        return ""
+    if "obsidian.daily_done" in (ap.get("done") or []):
+        return f" Daily {d['day']} 에 기록했습니다." if d.get("day") else " Daily 완료 기록을 지웠습니다."
+    if d.get("state") == "pending":
+        return " Daily 기록은 반영 대기(다음 claire_apply)." if not ap else " Daily 기록 미반영 — 재시도합니다."
+    return ""
+
+
 def cmd_update(args, cfg):
     conn = connect(create=False); now_s = now_iso(cfg)
     with tx(conn):
@@ -466,7 +527,13 @@ def cmd_complete(args, cfg):
         item = _item_by_ref_or_find(conn, cfg, args.item, args.find)
         r = ops.complete_item(conn, cfg, item, args.evidence, actor=args.actor, ts=now_s, note=args.note,
                               completed_at=args.completed_at, run_id=args.run)
-    r["message"] = f"{r['ref']} 완료 처리했습니다." + (f" 질문 {', '.join(r['questions_withdrawn'])} 닫음." if r.get("questions_withdrawn") else "")
+    r["applied"] = _apply_now(args, r["ref"])
+    if r.get("corrected_from"):
+        r["message"] = f"{r['ref']} 완료일을 {r['completed_at'][:10]} 로 정정했습니다." + _daily_note(r)
+    elif not r.get("changed"):
+        r["message"] = f"{r['ref']} 는 이미 완료되어 있습니다. 다시 기록하지 않았습니다."
+    else:
+        r["message"] = f"{r['ref']} 완료 처리했습니다." + (f" 질문 {', '.join(r['questions_withdrawn'])} 닫음." if r.get("questions_withdrawn") else "") + _daily_note(r)
     return r
 
 
@@ -480,7 +547,9 @@ def _status_cmd(args, cfg, target: str, action: str, extra=None):
 
 
 def cmd_reopen(args, cfg):
-    return _status_cmd(args, cfg, "todo", "reopen")
+    r = _status_cmd(args, cfg, "todo", "reopen")
+    r["applied"] = _apply_now(args, r["ref"])
+    return r
 
 
 def cmd_cancel(args, cfg):
@@ -706,6 +775,7 @@ def cmd_undo(args, cfg):
             if act is None:
                 _bad("되돌릴 작업이 없습니다")
         r = ops.undo_action(conn, cfg, act, ts=now_s, actor=args.actor)
+    r["applied"] = _apply_now(args, r["ref"])
     r["message"] = f"{r['ref']} 의 {r['action']} 을 되돌렸습니다."
     return r
 
@@ -734,10 +804,14 @@ def build_parser():
     u.add_argument("--set", action="append", required=True, help="key=value (반복 가능)"); u.add_argument("--reason")
     u.set_defaults(fn=cmd_update)
     c = _common(sub.add_parser("complete")); c.add_argument("--item"); c.add_argument("--find")
-    c.add_argument("--evidence", required=True); c.add_argument("--note"); c.add_argument("--completed-at")
+    c.add_argument("--evidence", required=True); c.add_argument("--note")
+    c.add_argument("--completed-at", help="실제 완료일(YYYY-MM-DD 또는 ISO). 이미 완료된 항목이면 완료일 정정")
+    c.add_argument("--apply", action="store_true", help="저장 뒤 이 항목의 외부 반영(Tasks 체크·Daily 기록)을 바로 실행")
     c.set_defaults(fn=cmd_complete)
     for name, fn in (("reopen", cmd_reopen), ("cancel", cmd_cancel), ("hold", cmd_hold)):
         x = _common(sub.add_parser(name)); x.add_argument("--item", required=True); x.add_argument("--reason")
+        if name == "reopen":
+            x.add_argument("--apply", action="store_true")
         x.set_defaults(fn=fn)
     w = _common(sub.add_parser("wait")); w.add_argument("--item", required=True); w.add_argument("--waiting-on", required=True)
     w.add_argument("--next-check"); w.add_argument("--reason"); w.set_defaults(fn=cmd_wait)
@@ -757,7 +831,8 @@ def build_parser():
     s.add_argument("--kind", default="task"); s.add_argument("--due-at"); s.add_argument("--reason"); s.set_defaults(fn=cmd_split)
     rd = _common(sub.add_parser("redact")); rd.add_argument("--source-event", type=int, required=True)
     rd.add_argument("--confirm", action="store_true"); rd.add_argument("--reason"); rd.set_defaults(fn=cmd_redact)
-    un = _common(sub.add_parser("undo")); un.add_argument("--action-id", type=int); un.set_defaults(fn=cmd_undo)
+    un = _common(sub.add_parser("undo")); un.add_argument("--action-id", type=int)
+    un.add_argument("--apply", action="store_true"); un.set_defaults(fn=cmd_undo)
     mt = sub.add_parser("maintain"); mt.add_argument("--run", type=int); mt.set_defaults(fn=cmd_maintain)
     return p
 
