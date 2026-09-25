@@ -100,8 +100,9 @@ fi
 # 3) 그 버전의 테스트 (실패하면 설치하지 않는다)
 if [ "$RUN_TESTS" = 1 ]; then
   echo "테스트 실행 중… (30초 안팎, --skip-tests 로 생략)"
-  LOG="$(mktemp -t claire-get-tests.XXXXXX)"
-  if ! (cd "$SRC_DIR" && python3 tests/test_claire.py >"$LOG" 2>&1); then
+  LOG="$(mktemp "${TMPDIR:-/tmp}/claire-get-tests.XXXXXX")"
+  # macOS 기본 열린 파일 한도(256)는 테스트 81건에 빠듯하다. 이 하위 셸에서만 올린다.
+  if ! (ulimit -n 4096 2>/dev/null || true; cd "$SRC_DIR" && python3 tests/test_claire.py >"$LOG" 2>&1); then
     echo "테스트 실패 — 설치하지 않았습니다. 로그: $LOG"
     tail -20 "$LOG"
     exit 1

@@ -3,6 +3,17 @@
 형식은 [Keep a Changelog](https://keepachangelog.com/ko/1.1.0/)를 따르고 버전은 SemVer다.
 데이터 형식 버전(`SCHEMA_VERSION`)은 따로 관리한다.
 
+## [0.5.1] — 2026-09-25
+
+mac mini 첫 설치(`get.sh`)가 테스트 단계에서 멈춘 문제. 코드 동작 변경 없음.
+
+### 수정
+- 테스트 도우미 `db()`가 부를 때마다 SQLite 연결을 새로 열고 닫지 않았다. Python 3.14 는 버린 연결을 늦게 닫아
+  macOS 기본 열린 파일 한도(256)에서 `OSError: [Errno 24] Too many open files`로 18~21건이 실패했다(3.11 에서는 재현 안 됨).
+  테스트마다 연결 하나를 재사용하고 tearDown 에서 닫는다. Python 3.14 + `ulimit -n 256`/`128`에서 81건 통과 확인.
+- `get.sh`: 테스트 하위 셸에서만 열린 파일 한도를 4096 으로 올린다. 로그 파일 이름이 macOS `mktemp -t`에서
+  `XXXXXX`가 그대로 남던 것 수정.
+
 ## [0.5.0] — 2026-09-25
 
 교수님 개선 요청 정식 반영(ISSUE_20260925). 운영 중 Claire 가 스킬을 직접 고치려다 거부됐던 항목을 도구·규칙으로 편입했다.

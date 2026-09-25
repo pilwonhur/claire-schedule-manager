@@ -1,6 +1,6 @@
 ---
 name: claire-schedule-manager
-version: 0.5.0
+version: 0.5.1
 description: >-
   교수님의 일정·업무를 Gmail(기관 메일 포워드 포함)·Google Calendar·Obsidian Tasks·Discord 이미지에서
   하나의 장부(SQLite)로 모아 아침 브리핑·확인 질문·진행 추적·검색을 제공한다. Claire 전용 Discord 채널에서
@@ -10,7 +10,7 @@ description: >-
   수집·해석·브리핑·질문 답변·완료(Daily 완료 기록)·진행·되돌리기·검색과 Calendar·Obsidian 반영(승인 대기열)까지 동작한다.
 ---
 
-# Claire 통합 일정·업무 관리 (v0.5.0 — 마감 시각 규칙·승인 목록·미등록 확인·Daily 완료 기록)
+# Claire 통합 일정·업무 관리 (v0.5.1 — 마감 시각 규칙·승인 목록·미등록 확인·Daily 완료 기록)
 
 정본 설계: 프로젝트의 `PRD.md` v1.8. 이 문서는 판단 계층(Claire)이 지켜야 할 규칙과 절차만 적는다.
 **스킬 파일은 고치지 않는다.** 규칙을 바꿔야 하면 교수님께 제안만 하고, 변경은 저장소 → 릴리스 → `claire-update`로 들어온다(§8).

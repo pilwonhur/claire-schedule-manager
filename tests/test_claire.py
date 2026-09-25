@@ -59,6 +59,9 @@ class BaseTest(unittest.TestCase):
         os.environ.pop("CLAIRE_NOW", None)
 
     def tearDown(self):
+        if getattr(self, "_conn", None) is not None:
+            self._conn.close()
+            self._conn = None
         for d in (self.data, self.mirror, self.vault, self.inbound):
             shutil.rmtree(d, ignore_errors=True)
 
@@ -84,9 +87,12 @@ class BaseTest(unittest.TestCase):
         return payload
 
     def db(self):
-        conn = sqlite3.connect(self.data / "claire.db")
-        conn.row_factory = sqlite3.Row
-        return conn
+        """테스트마다 연결 하나를 재사용하고 tearDown 에서 닫는다. Python 3.14 는 버린 연결을 늦게 닫아
+        macOS 기본 한도(256)에서 'Too many open files' 가 났다 (0.5.1)."""
+        if getattr(self, "_conn", None) is None:
+            self._conn = sqlite3.connect(self.data / "claire.db")
+            self._conn.row_factory = sqlite3.Row
+        return self._conn
 
     def init(self):
         return self.sh("claire_check", "init")

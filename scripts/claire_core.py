@@ -27,7 +27,7 @@ from zoneinfo import ZoneInfo
 #
 # 스킬 전체의 배포 버전 (SemVer). 동작이나 문서가 바뀌면 반드시 올리고
 # CHANGELOG.md에 항목을 남긴다. tests/test_claire.py가 둘의 일치를 검사한다.
-CLAIRE_VERSION = "0.5.0"
+CLAIRE_VERSION = "0.5.1"
 
 # 데이터 파일 형식의 버전. 스키마가 바뀌면 올리고 MIGRATIONS 에 기존 DB 변환을 적는다.
 # v2 (0.5.0): item.due_precision·window_auto·attendance·daily_logged_on, outbox.selected_at, checkin 표.
