@@ -3,8 +3,12 @@
 
   propose --run ID --file proposals.json   제안 JSON 검증·반영 (create / ignore / update / complete / cancel / relate)
   update   --item CLR --set k=v ... --reason   교수님 지시로 필드 변경
-  complete --item CLR | --find "문구"  --evidence user_report|tasks_checked|criteria_evidence:<id> [--note]
-  reopen | cancel | hold --item CLR --reason
+  complete --item CLR[,CLR…] | --find "문구"  --evidence user_report|tasks_checked|criteria_evidence:<id> [--note]
+  reopen | cancel --item CLR --reason
+  hold     --item CLR [--until YYYY-MM-DD] --reason      보류: 재확인일에 다시 묻는다 (기본 tracking.hold_default_days)
+  dismiss  --item CLR[,CLR…] --why not_needed|not_mine [--reason]   처리 불필요 / 내 할 일 아님 (0.6.0, 이력 보관·되돌리기 가능)
+  link-task --item <일정 CLR> --role prep|followup --title "..." [--due-at] [--kind prep|task] [--next-action]
+           일정에 연결된 준비·후속 업무 (0.6.0). 일정 완료가 이 업무를 완료시키지 않는다
   wait     --item CLR --waiting-on "김 교수" [--next-check YYYY-MM-DD]   (기본 +3영업일, D6)
   progress --item CLR --note "절반 했어" [--next-action ...]
   answer   --question Q-0007 --answer "..." [--resolve '{"start_at": "..."}']   | --auto (열린 질문 1건일 때만)
@@ -37,12 +41,13 @@ from claire_core import (  # noqa: E402
     tx, tz_of,
 )
 import claire_ops as ops  # noqa: E402
+import claire_track as track  # noqa: E402
 
 ALLOWED_OPS = {"create", "ignore", "update", "complete", "cancel", "relate"}
 CREATE_FIELDS = {"kind", "title", "project", "priority", "owner", "next_action", "done_criteria",
                  "start_at", "end_at", "all_day", "due_at", "scheduled_on", "tentative", "confidence",
                  "waiting_on", "next_check_at", "canonical_note", "ledger_note", "series_key", "occurrence_at",
-                 "attendance"}
+                 "attendance", "request_scope", "priority_reason"}
 ISO_DT = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2})?([+-]\d{2}:\d{2}|Z)$")
 ISO_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 DEFAULT_CRITERIA = {"deadline": "제출·발송 완료", "reply": "회신 발송", "prep": "자료 준비 완료",
@@ -129,6 +134,13 @@ def _validate_create(p: dict, idx: int, cfg, evs=None) -> dict:
             fields["end_at"] = (due if due > start else start + timedelta(hours=1)).isoformat()
     if fields["priority"] not in PRIORITIES:
         _bad(f"제안 {idx}: priority 가 잘못되었습니다", priority=fields["priority"])
+    # 0.6.0 R3 — 중요도: Claire 가 정했으면 그 판단(근거 필수 권장), 아니면 출처·요청 범위 규칙. 마감 유무와 무관.
+    scope = p.get("request_scope")
+    if scope is not None and scope not in ops.REQUEST_SCOPES:
+        _bad(f"제안 {idx}: request_scope 는 {ops.REQUEST_SCOPES} 중 하나", request_scope=scope)
+    imp = track.classify_default(cfg, [{"platform": e["platform"], "headers": {}} for e in (evs or [])], scope,
+                                 p.get("priority"), p.get("priority_reason"))
+    fields.update(imp)
     if fields["owner"] not in OWNERS:
         _bad(f"제안 {idx}: owner 가 잘못되었습니다", owner=fields["owner"])
     if fields["scheduled_on"] and not ISO_DATE.match(str(fields["scheduled_on"])):
@@ -169,6 +181,13 @@ def _validate_create(p: dict, idx: int, cfg, evs=None) -> dict:
     if "due_time" in unknown and fields["due_precision"] == "time":
         _bad(f"제안 {idx}: 마감 시각이 이미 있는데 due_time 을 묻고 있습니다")
     warnings = []
+    if imp["priority_source"] == "unreviewed":
+        warnings.append({"code": "request_scope_missing", "title": title,
+                         "message": "메일에서 만든 업무에 request_scope(direct|group|self|none)가 없어 중요도를 '검토 필요'로 두었습니다. "
+                                    "교수님을 특정한 요청이면 direct(매일 확인), 단체 공통 요청이면 group 으로 update 하세요."})
+    if p.get("priority") and not p.get("priority_reason"):
+        warnings.append({"code": "priority_reason_missing", "title": title,
+                         "message": "priority 를 정했으면 priority_reason(분류 근거)을 함께 적으세요 (R3)."})
     if kind == "deadline" and fields["due_precision"] == "date" and "due_time" not in unknown:
         warnings.append({"code": "due_time_missing", "title": title,
                          "message": "마감 날짜만 있고 시각이 없습니다. 달력에 표시하려면 unknown_fields 에 due_time 을 넣고 "
@@ -385,6 +404,7 @@ def cmd_propose(args, cfg):
             new_item = conn.execute("SELECT * FROM item WHERE id=?", (iid,)).fetchone()
             planned = ops.plan_external(conn, cfg, new_item, now_s)
             entry = {"ref": ref, "title": f["title"], "kind": f["kind"], "status": status,
+                     "priority": f["priority"], "priority_reason": f["priority_reason"], "request_scope": f["request_scope"],
                      "due_at": f["due_at"], "due_precision": f["due_precision"], "start_at": f["start_at"],
                      "end_at": f["end_at"], "calendar_window": "auto" if f["window_auto"] else None,
                      "confidence": conf, "questions": q_refs,
@@ -521,7 +541,21 @@ def cmd_update(args, cfg):
     return {"ref": item["ref"], "changes": applied, "planned": planned, "message": msg}
 
 
+def _refs(value: str | None) -> list[str]:
+    return [x for x in re.split(r"[,\s]+", value or "") if x]
+
+
 def cmd_complete(args, cfg):
+    refs = _refs(args.item)
+    if len(refs) > 1:
+        # 여러 건 (예: "지난 일정 모두 완료" 버튼). 한 건씩 같은 규칙으로, 결과를 모아서.
+        results = []
+        for ref in refs:
+            one = argparse.Namespace(**{**vars(args), "item": ref, "find": None})
+            results.append(cmd_complete(one, cfg))
+        done = [r["ref"] for r in results if r.get("changed")]
+        return {"results": results, "completed": done,
+                "message": f"{len(done)}건 완료 처리했습니다: {', '.join(done)}" if done else "바뀐 항목이 없습니다."}
     conn = connect(create=False); now_s = now_iso(cfg)
     with tx(conn):
         item = _item_by_ref_or_find(conn, cfg, args.item, args.find)
@@ -555,12 +589,73 @@ def cmd_reopen(args, cfg):
 def cmd_cancel(args, cfg):
     if not (args.reason or "").strip():
         _bad("cancel 에는 --reason 이 필요합니다")
-    return _status_cmd(args, cfg, "cancelled", "cancel")
+    r = _status_cmd(args, cfg, "cancelled", "cancel")
+    r["message"] = f"{r['ref']} 를 취소(업무 자체 취소)로 기록했습니다. 할 필요가 없는 일이면 '처리 불필요'가 더 맞습니다."
+    return r
 
 
 def cmd_hold(args, cfg):
-    return _status_cmd(args, cfg, "on_hold", "hold",
-                       extra=lambda conn, item, ts: {"blocked_reason": args.reason})
+    """보류: 재확인 날짜에 다시 묻는다(R5). 날짜를 안 주면 tracking.hold_default_days 뒤. 그 전에는 진행 질문을 하지 않는다."""
+    def extra(conn, item, ts):
+        if args.until:
+            nxt = ops.norm_value("next_check_at", args.until, cfg)
+        else:
+            nxt = (now_dt(cfg) + timedelta(days=int(cfg.get("tracking", {}).get("hold_default_days", 7)))) \
+                .replace(hour=int(cfg["run"]["daily_hour"]), minute=0, second=0).isoformat()
+        return {"blocked_reason": args.reason, "next_check_at": nxt}
+    r = _status_cmd(args, cfg, "on_hold", "hold", extra=extra)
+    conn = connect(create=False)
+    nxt = get_item(conn, r["ref"])["next_check_at"]
+    r["next_check_at"] = nxt
+    r["message"] = f"{r['ref']} 보류했습니다. {int(nxt[5:7])}/{int(nxt[8:10])}에 다시 여쭙겠습니다 (날짜를 바꾸려면 답장으로)."
+    return r
+
+
+def cmd_dismiss(args, cfg):
+    """처리 불필요 / 내 할 일 아님 (R5). 활성 목록·진행 확인에서 빠지고 사유·이력은 남는다. reopen·undo 로 되돌린다.
+    업무 취소(cancel)와 다르다: 업무 자체가 없어진 것이 아니라 교수님이 할 필요가 없다는 뜻이다."""
+    refs = _refs(args.item)
+    if not refs:
+        _bad("--item 이 필요합니다")
+    label = ops.CLOSE_KO[args.why]
+    out = []
+    conn = connect(create=False); now_s = now_iso(cfg)
+    with tx(conn):
+        for ref in refs:
+            item = get_item(conn, ref)
+            if item["status"] == "done":
+                _bad(f"{item['ref']} 는 완료된 항목입니다. 완료를 취소하려면 reopen")
+            r = ops.set_status(conn, cfg, item, "cancelled", actor=args.actor, ts=now_s,
+                               reason=f"{label}: {args.reason}" if args.reason else label, action="dismiss",
+                               run_id=args.run, close_reason=args.why)
+            out.append({"ref": item["ref"], **r})
+    refs_done = [o["ref"] for o in out if o.get("changed")]
+    return {"results": out, "close_reason": args.why,
+            "message": (f"{', '.join(refs_done)} 를 '{label}'(으)로 정리했습니다. 활성 목록과 진행 확인에서 빠지고 기록은 남습니다 "
+                        "(되돌리려면 '다시 열어')." if refs_done else "바뀐 항목이 없습니다.")}
+
+
+def cmd_link_task(args, cfg):
+    """일정(회의·수업)에 준비·후속 업무를 따로 연결한다 (R1). 결과물이 다른 일은 같은 번호로 묶지 않는다."""
+    conn = connect(create=False); now_s = now_iso(cfg)
+    with tx(conn):
+        meeting = get_item(conn, args.item)
+        if meeting["status"] in ("cancelled",):
+            _bad(f"{meeting['ref']} 는 취소된 일정입니다")
+        due = ops.norm_value("due_at", args.due_at, cfg) if args.due_at else None
+        ref = track.create_linked(conn, cfg, meeting, role=args.role, title=args.title.strip(), ts=now_s,
+                                  kind=args.kind, due_at=due, due_precision=ops.precision_of(args.due_at),
+                                  next_action=args.next_action, actor=args.actor)
+        item = get_item(conn, ref)
+        if item["due_at"] and item["due_precision"] == "time":
+            ops.apply_update(conn, cfg, item, {"due_at": item["due_at"]}, actor=args.actor, ts=now_s,
+                             reason="마감 시각 → 달력 표시 구간")     # 0.5.0 규칙: 마감 1시간 전~마감 (window_auto)
+            item = get_item(conn, ref)
+        planned = ops.plan_external(conn, cfg, item, now_s, directed=args.actor == "user")
+    what = "준비" if args.role == "prep" else "후속"
+    return {"ref": ref, "linked_to": meeting["ref"], "role": args.role, "title": args.title.strip(), "planned": planned,
+            "message": f"{meeting['ref']} {meeting['title']}의 {what} 업무로 {ref} 를 등록했습니다. "
+                       f"일정을 완료해도 {ref} 는 따로 완료해야 합니다."}
 
 
 def cmd_wait(args, cfg):
@@ -770,7 +865,7 @@ def cmd_undo(args, cfg):
         else:
             act = conn.execute(
                 "SELECT * FROM activity_log WHERE undone_at IS NULL AND actor IN ('user','claire') "
-                "AND action IN ('update','status','complete','reopen','cancel','hold','wait','progress','answer') "
+                "AND action IN ('update','status','complete','reopen','cancel','hold','wait','progress','answer','dismiss') "
                 "AND payload LIKE '%\"before\"%' ORDER BY id DESC LIMIT 1").fetchone()
             if act is None:
                 _bad("되돌릴 작업이 없습니다")
@@ -784,6 +879,9 @@ def cmd_maintain(args, cfg):
     conn = connect(create=False); now_s = now_iso(cfg)
     with tx(conn):
         r = ops.expire_and_withdraw(conn, cfg, now_s)
+        # 0.6.0: 기존 업무 중요도 소급 분류(한 번) · 승인된 준비 템플릿으로 다가오는 회차의 준비 업무
+        r["importance_backfill"] = track.backfill_importance(conn, cfg, now_s)
+        r["prep_created"] = track.apply_prep_templates(conn, cfg, now_dt(cfg), now_s)
     return {**r, "run_id": args.run}
 
 
@@ -812,7 +910,17 @@ def build_parser():
         x = _common(sub.add_parser(name)); x.add_argument("--item", required=True); x.add_argument("--reason")
         if name == "reopen":
             x.add_argument("--apply", action="store_true")
+        if name == "hold":
+            x.add_argument("--until", help="재확인 날짜 YYYY-MM-DD (기본 tracking.hold_default_days 뒤)")
         x.set_defaults(fn=fn)
+    ds = _common(sub.add_parser("dismiss", help="처리 불필요 / 내 할 일 아님"))
+    ds.add_argument("--item", required=True); ds.add_argument("--why", choices=["not_needed", "not_mine"], required=True)
+    ds.add_argument("--reason"); ds.set_defaults(fn=cmd_dismiss)
+    lt = _common(sub.add_parser("link-task", help="일정에 준비·후속 업무 연결"))
+    lt.add_argument("--item", required=True); lt.add_argument("--role", choices=["prep", "followup"], required=True)
+    lt.add_argument("--title", required=True); lt.add_argument("--due-at"); lt.add_argument("--kind", default="prep",
+                                                                                            choices=["prep", "task", "deadline", "reply"])
+    lt.add_argument("--next-action"); lt.set_defaults(fn=cmd_link_task)
     w = _common(sub.add_parser("wait")); w.add_argument("--item", required=True); w.add_argument("--waiting-on", required=True)
     w.add_argument("--next-check"); w.add_argument("--reason"); w.set_defaults(fn=cmd_wait)
     rs = _common(sub.add_parser("resume")); rs.add_argument("--item", required=True); rs.add_argument("--reason"); rs.set_defaults(fn=cmd_resume)

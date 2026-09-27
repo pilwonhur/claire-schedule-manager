@@ -8,8 +8,12 @@
   step   --run <id> --name <step> --status ok|failed|skipped [--detail ...] [--error ...]
          단계별 상태를 run.steps 에 누적한다.
   brief  --run <id> --file briefing.md [--kind morning|on_demand|answer_ack]
-         content_hash 로 중복 발송을 막고 briefing 행을 남긴다. 질문 asked_count 갱신은
-         3단계에서 붙는다.
+         content_hash 로 중복 발송을 막고 briefing 행과 전달 기록(생성됨)을 남긴다. 0.6.0: 생성은 전송이 아니다 —
+         질문 asked_count·업무 노출은 deliver --status sent 뒤에만 갱신된다.
+  deliver --id N [--id M …] --status sent|failed [--message-id X …] [--error "..."] [--via message|reply]
+  deliver --report KEY --status sent|failed      (그 보고의 모든 페이지)
+  deliver --pending                              전송 실패·확인 없는 페이지 (claire_buttons resend 로 그 쪽만 다시)
+         보고 전달 결과 (0.6.0, R8). 실패한 페이지의 업무는 "보여 줌"·"진행 확인함"으로 기록하지 않는다.
   end    --run <id> [--status ...] [--summary <json>] [--reason ...]
          필수 단계(sync·propose·brief)가 빠졌거나 실패한 단계가 있으면 partial 로 닫는다.
   status 진행 중 실행, 마지막 daily, 미실행 여부.
@@ -35,6 +39,7 @@ from claire_core import (  # noqa: E402
     ClaireError, RUN_KINDS, connect, get_run, hours_between, now_dt, now_iso, parse_iso,
     run_cli, sha256_text, tx,
 )
+import claire_track as track  # noqa: E402
 
 STEP_STATUSES = ["ok", "failed", "skipped"]
 
@@ -139,56 +144,57 @@ def cmd_brief(args, cfg):
         cur = conn.execute(
             "INSERT INTO briefing(run_id,kind,content_hash,item_refs,question_refs,sent_at,delivery) "
             "VALUES(?,?,?,?,?,?,?)",
-            (run["id"], args.kind, h, json.dumps(item_refs), json.dumps(q_refs), now_s, "sent"))
-        asked = _mark_questions_asked(conn, cfg, q_refs, now_s)
+            (run["id"], args.kind, h, json.dumps(item_refs), json.dumps(q_refs), now_s, "generated"))
+        # 전달 기록 한 쪽(본문 그대로). claire_buttons build --record brief --briefing <id> 가 버튼 페이지로 바꾼다.
+        rec = track.register_delivery(conn, cfg, "brief", [{"message": text.strip(), "components": None,
+                                                            "numbers": item_refs}],
+                                      now_s, report_key=f"brief:{cur.lastrowid}", question_refs=q_refs)
         steps = _steps(run)
         steps.append({"name": "brief", "status": "ok", "at": now_s,
-                      "detail": {"briefing_id": cur.lastrowid, "chars": len(text), "questions_asked": asked}})
+                      "detail": {"briefing_id": cur.lastrowid, "chars": len(text), "report_key": rec["report_key"]}})
         conn.execute("UPDATE run SET steps=? WHERE id=?",
                      (json.dumps(steps, ensure_ascii=False), run["id"]))
     return {"run_id": run["id"], "duplicate": False, "briefing_id": cur.lastrowid,
-            "content_hash": h, "item_refs": item_refs, "question_refs": q_refs, "questions_asked": asked,
-            "message": "브리핑을 기록했습니다. 채널에 전송하세요."}
-
-
-WEEKDAYS = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6}
-
-
-def _next_ask(cfg, now, asked_count: int, due_at: str | None) -> str:
-    """D6: 첫 질문 뒤 두 번의 아침까지 매일, 이후 주 1회(월). 마감 48h 이내면 매일."""
-    fu = cfg["followup"]
-    tomorrow = (now + timedelta(days=1)).replace(hour=int(cfg["run"]["daily_hour"]), minute=0, second=0)
-    urgent = False
-    if due_at:
-        try:
-            urgent = (parse_iso(due_at) - now).total_seconds() <= fu["reask_urgent_hours"] * 3600
-        except ValueError:
-            urgent = False
-    if urgent or asked_count <= int(fu["reask_daily_days"]):
-        return tomorrow.isoformat()
-    wd = WEEKDAYS.get(str(fu.get("reask_weekday", "mon")).lower(), 0)
-    days = (wd - now.weekday()) % 7 or 7
-    return (now + timedelta(days=days)).replace(hour=int(cfg["run"]["daily_hour"]), minute=0, second=0).isoformat()
+            "content_hash": h, "item_refs": item_refs, "question_refs": q_refs,
+            "report_key": rec["report_key"], "delivery_id": rec["messages"][0]["delivery_id"],
+            "message": "브리핑을 기록했습니다(생성). claire_buttons build --file … --record brief --briefing "
+                       f"{cur.lastrowid} 로 버튼 페이지를 만들어 보내고, 쪽마다 claire_run deliver 로 전송 결과를 남기세요."}
 
 
 def _mark_questions_asked(conn, cfg, q_refs: list[str], now_s: str) -> list[dict]:
-    """같은 질문을 하루에 두 번 보내지 않는다. 오늘 이미 물었으면 카운트하지 않는다."""
-    now = now_dt(cfg)
-    out = []
-    for ref in q_refs:
-        q = conn.execute("SELECT q.*, i.due_at FROM question q LEFT JOIN item i ON i.id=q.item_id WHERE q.ref=?",
-                         (ref,)).fetchone()
-        if q is None or q["status"] != "open":
-            continue
-        if q["last_asked_at"] and q["last_asked_at"][:10] == now_s[:10]:
-            out.append({"ref": ref, "asked_count": q["asked_count"], "note": "오늘 이미 질문함"})
-            continue
-        count = q["asked_count"] + 1
-        nxt = _next_ask(cfg, now, count, q["due_at"])
-        conn.execute("UPDATE question SET asked_count=?, first_asked_at=COALESCE(first_asked_at,?), "
-                     "last_asked_at=?, next_ask_at=? WHERE id=?", (count, now_s, now_s, nxt, q["id"]))
-        out.append({"ref": ref, "asked_count": count, "next_ask_at": nxt})
-    return out
+    """(0.6.0) claire_track.mark_questions_asked 로 옮겼다. 질문은 전달 성공(deliver --status sent) 때만 센다."""
+    return track.mark_questions_asked(conn, cfg, q_refs, now_s)
+
+
+def cmd_deliver(args, cfg):
+    """보고 전달 결과 (R8). sent → 그 쪽 업무 노출·진행 확인·질문 기록. failed → 아무것도 기록하지 않고 재전송 대상."""
+    conn = connect(create=False)
+    now = now_dt(cfg); now_s = now.isoformat()
+    if args.pending:
+        issues = track.delivery_issues(conn, cfg, now)
+        issues["message"] = (f"다시 보낼 쪽 {issues['count']}개 — claire_buttons resend 로 그 쪽만 보내세요"
+                             if issues["count"] else "전송 실패·확인 없는 쪽이 없습니다.")
+        return issues
+    if not args.status:
+        raise ClaireError("bad_args", "--status sent|failed 가 필요합니다 (또는 --pending)")
+    ids = list(args.id or [])
+    if args.report:
+        ids += [r["id"] for r in conn.execute("SELECT id FROM delivery WHERE report_key=? AND status<>'superseded' ORDER BY page",
+                                              (args.report,))]
+    if not ids:
+        raise ClaireError("bad_args", "--id 또는 --report 가 필요합니다")
+    with tx(conn):
+        r = track.mark_delivery(conn, cfg, ids, args.status, now_s, message_ids=args.message_id, error=args.error,
+                                via=args.via)
+    if args.status == "sent":
+        r["message"] = (f"전송 기록: {len(r['sent'])}쪽 · 업무 {len(r['exposed'])}건 노출"
+                        + (f" · 진행 확인 {len(r['asked'])}건" if r["asked"] else "")
+                        + (f" · 질문 {len(r['questions'])}건" if r["questions"] else ""))
+    else:
+        n = sum(len(f["items"]) for f in r["failed"])
+        r["message"] = (f"전송 실패 {len(r['failed'])}쪽 기록 — 그 쪽의 업무 {n}건은 전달된 것으로 보지 않습니다. "
+                        "claire_buttons resend 로 그 쪽만 다시 보내세요.")
+    return r
 
 
 def _compute_status(cfg, run, steps) -> tuple[str, list[str]]:
@@ -317,6 +323,7 @@ def cmd_checkin(args, cfg):
             return {"duplicate": True, "day": day, "slot": slot, "created_at": row["created_at"],
                     "message": "이 시간대 확인은 오늘 이미 보냈습니다. 다시 보내지 마세요."}
         conn.execute("INSERT INTO checkin(day,slot,created_at) VALUES(?,?,?)", (day, slot, now_s))
+    issues = track.delivery_issues(conn, cfg, now)
     today_new = [dict(r) for r in conn.execute(
         "SELECT DISTINCT i.ref, i.title FROM activity_log a JOIN item i ON i.id=a.item_id WHERE a.action='create' "
         "AND substr(a.created_at,1,10)=? AND i.status NOT IN ('captured','cancelled') ORDER BY i.id", (day,))]
@@ -330,9 +337,20 @@ def cmd_checkin(args, cfg):
     components = {"reusable": True, "text": lines[0], "blocks": [
         {"type": "text", "text": "\n".join(lines[1:])},
         {"type": "actions", "buttons": [{"label": f"{slot} 미등록 일정 없음", "style": "secondary"}]}]}
-    return {"duplicate": False, "day": day, "slot": slot, "checkin": f"{day}@{slot}", "message": text,
-            "components": components, "today_registered": today_new,
-            "send_with": "message 도구로 message·components 를 보낸다. 보낸 뒤 checkin-mark --message-id 로 번호를 남긴다."}
+    to = (cfg.get("discord") or {}).get("send_to")
+    with tx(conn):
+        rec = track.register_delivery(conn, cfg, "checkin", [{"message": text, "components": components, "numbers": []}],
+                                      now_s, report_key=f"checkin:{day}@{slot}")
+    out = {"duplicate": False, "day": day, "slot": slot, "checkin": f"{day}@{slot}", "message": text,
+           "components": components, "today_registered": today_new, "send_to": to,
+           "delivery_id": rec["messages"][0]["delivery_id"], "delivery_issues": issues,
+           "send_with": "message 도구로 to=send_to, message·components 를 보낸다(cron 턴에는 대화 중인 채널이 없으니 반드시 "
+                        "send_to). 보낸 뒤 claire_run deliver --id <delivery_id> --status sent --message-id <id> 와 "
+                        "checkin-mark --message-id. delivery_issues 가 있으면 claire_buttons resend 로 그 쪽만 먼저 다시 보낸다."}
+    if not to:
+        out["send_to_note"] = ("config discord.send_to 가 없어 보낼 채널을 모릅니다(0.6.0 전의 '전송 대상 미지정' 실패). "
+                               "claire_check channel-target --write 로 설정하세요.")
+    return out
 
 
 def cmd_checkin_mark(args, cfg):
@@ -395,6 +413,15 @@ def build_parser():
     cm.add_argument("--result", choices=["none", "registered", "asked", "dismissed"])
     cm.add_argument("--refs", nargs="*")
     cm.set_defaults(fn=cmd_checkin_mark)
+    dv = sub.add_parser("deliver", help="보고 전달 결과 기록 (0.6.0)")
+    dv.add_argument("--id", type=int, action="append", help="delivery_id (여러 번)")
+    dv.add_argument("--report", help="report_key — 그 보고의 모든 쪽")
+    dv.add_argument("--status", choices=["sent", "failed"])
+    dv.add_argument("--message-id", action="append", help="Discord 메시지 번호 (--id 순서대로)")
+    dv.add_argument("--error")
+    dv.add_argument("--via", choices=["message", "reply"], default=None)
+    dv.add_argument("--pending", action="store_true", help="전송 실패·확인 없는 쪽 목록")
+    dv.set_defaults(fn=cmd_deliver)
     return p
 
 

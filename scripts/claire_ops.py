@@ -26,7 +26,11 @@ UPDATABLE = {
     "scheduled_on": "date", "tentative": "bool", "waiting_on": "text", "next_check_at": "dt_eod",
     "blocked_reason": "text", "canonical_note": "text", "ledger_note": "text", "kind": "kind",
     "due_precision": "precision", "attendance": "attendance", "window_auto": "bool",
+    # 0.6.0 — 중요도·진행 확인 (교수님이 지정한 값은 priority_source='user' 로 기록되어 Claire 가 덮지 않는다)
+    "request_scope": "scope", "priority_reason": "text", "check_every_days": "int", "review_after": "date",
 }
+REQUEST_SCOPES = ["direct", "group", "self", "none"]
+CLOSE_REASONS = ["cancelled", "not_needed", "not_mine"]
 ATTENDANCE = ["undecided", "attending", "declined"]
 # Calendar 참석 응답 → 항목 attendance (업무 상태와 별개로 브리핑에 보인다)
 RESPONSE_TO_ATTENDANCE = {"needsAction": "undecided", "tentative": "undecided", "accepted": "attending",
@@ -72,6 +76,18 @@ def norm_value(field: str, value, cfg):
         if value not in ("date", "time"):
             _bad("bad_value", "due_precision 은 date | time", value=value)
         return value
+    if kind == "scope":
+        if value not in REQUEST_SCOPES:
+            _bad("bad_value", f"request_scope 는 {REQUEST_SCOPES} 중 하나", value=value)
+        return value
+    if kind == "int":
+        try:
+            n = int(value)
+        except (TypeError, ValueError):
+            _bad("bad_value", f"{field} 는 1 이상의 정수", value=value)
+        if n < 1 or n > 60:
+            _bad("bad_value", f"{field} 는 1~60 (일)", value=value)
+        return n
     if kind == "attendance":
         if value not in ATTENDANCE:
             _bad("bad_value", f"attendance 는 {ATTENDANCE} 중 하나", value=value)
@@ -149,9 +165,18 @@ def apply_update(conn, cfg, item, changes: dict, *, actor: str, ts: str, reason:
         _bad("item_deleted", f"삭제된 항목입니다: {item['ref']}")
     if item["status"] in ("done", "cancelled") and not allow_calendar_owned:
         _bad("item_closed", f"{item['ref']} 는 {item['status']} 상태입니다. 먼저 reopen 하세요")
+    changes = dict(changes)
+    if "priority" in changes and actor != "user" and item["priority_source"] == "user" \
+            and norm_value("priority", changes["priority"], cfg) != item["priority"]:
+        _bad("priority_user_set", f"{item['ref']} 의 중요도는 교수님이 정한 값입니다. Claire 가 바꾸지 않습니다 (R3)",
+             priority=item["priority"])
+    if "priority" in changes and "priority_source" not in changes:
+        # 누가 정했는지 남긴다: 교수님 지시는 user, Claire 판단은 claire (분류 근거는 priority_reason)
+        changes["priority_source"] = "user" if actor == "user" else "claire"
+    if "priority_reason" in changes and "priority" not in changes and item["priority_source"] == "unreviewed" and actor != "user":
+        changes.setdefault("priority_source", "claire")      # 소급 분류 검토: 값은 그대로 두고 근거만 확정
     cal_linked = conn.execute("SELECT 1 FROM link WHERE item_id=? AND system='calendar' AND sync_status<>'missing'",
                               (item["id"],)).fetchone() is not None
-    changes = dict(changes)
     derived: set[str] = set()                # 마감에서 계산한 달력 구간 (Claire 의 판단이 아니라 규칙)
     if "due_at" in changes:
         raw = changes["due_at"]
@@ -177,7 +202,7 @@ def apply_update(conn, cfg, item, changes: dict, *, actor: str, ts: str, reason:
     applied = []
     deferred = {}
     for field, raw in changes.items():
-        value = norm_value(field, raw, cfg)
+        value = raw if field == "priority_source" else norm_value(field, raw, cfg)
         if field in CALENDAR_OWNED and cal_linked and not allow_calendar_owned:
             if actor != "user" and field not in derived:
                 _bad("calendar_owned_field",
@@ -214,6 +239,8 @@ def apply_update(conn, cfg, item, changes: dict, *, actor: str, ts: str, reason:
     if applied:
         reindex_item(conn, item["id"])
         refresh_pending_create(conn, cfg, item["id"])
+        if actor == "user":
+            touch_reported(conn, item["id"], ts)
     if evidence_sid:
         conn.execute("INSERT OR IGNORE INTO item_source(item_id,source_event_id,role) VALUES(?,?,'update')",
                      (item["id"], evidence_sid))
@@ -222,27 +249,42 @@ def apply_update(conn, cfg, item, changes: dict, *, actor: str, ts: str, reason:
 
 def set_status(conn, cfg, item, new_status: str, *, actor: str, ts: str, reason: str | None,
                action: str | None = None, evidence_sid: int | None = None, run_id=None,
-               extra_fields: dict | None = None) -> dict:
-    """상태 전이 (§5.3). done 은 complete_item 으로만 간다."""
+               extra_fields: dict | None = None, close_reason: str | None = None) -> dict:
+    """상태 전이 (§5.3). done 은 complete_item 으로만 간다.
+    0.6.0: cancelled 는 close_reason 으로 뜻을 나눈다 — cancelled(업무 자체 취소) · not_needed(처리 불필요) ·
+    not_mine(내 할 일 아님). 셋 다 활성 목록·진행 확인에서 빠지고 이력은 남는다(검색 --status all)."""
     if new_status not in ITEM_STATUSES:
         _bad("bad_status", f"상태 값이 잘못되었습니다: {new_status}")
     if new_status == "done" and action != "complete":
         _bad("use_complete", "done 전이는 complete 로만 할 수 있습니다 (근거 코드 필수)")
     cur = item["status"]
-    if new_status == cur:
+    if close_reason is not None and close_reason not in CLOSE_REASONS:
+        _bad("bad_value", f"close_reason 은 {CLOSE_REASONS} 중 하나", value=close_reason)
+    if new_status == cur and not (cur == "cancelled" and close_reason and close_reason != item["close_reason"]):
         return {"changed": False, "status": cur}
+    if new_status == cur:
+        # 이미 닫힌 항목의 닫힌 뜻만 정정 (취소 → 처리 불필요 등)
+        conn.execute("UPDATE item SET close_reason=?, updated_at=? WHERE id=?", (close_reason, ts, item["id"]))
+        log_activity(conn, item_id=item["id"], action=action or "status", actor=actor, ts=ts, field="close_reason",
+                     old_value=item["close_reason"], new_value=close_reason, reason=reason, run_id=run_id,
+                     payload={"before": {"close_reason": item["close_reason"]}})
+        if actor == "user":
+            touch_reported(conn, item["id"], ts)
+        return {"changed": True, "from": cur, "status": cur, "close_reason": close_reason}
     if new_status not in TRANSITIONS.get(cur, set()):
         _bad("bad_transition", f"{item['ref']}: {cur} → {new_status} 전이는 허용되지 않습니다",
              allowed=sorted(TRANSITIONS.get(cur, set())))
     payload = {"before": {"status": cur, "completed_at": item["completed_at"], "cancelled_at": item["cancelled_at"],
                           "waiting_on": item["waiting_on"], "next_check_at": item["next_check_at"],
-                          "blocked_reason": item["blocked_reason"]}}
+                          "blocked_reason": item["blocked_reason"], "close_reason": item["close_reason"]}}
     sets = {"status": new_status}
     if new_status == "cancelled":
         sets["cancelled_at"] = ts
+        sets["close_reason"] = close_reason or "cancelled"
     if cur in ("done", "cancelled") and new_status == "todo":
         sets["completed_at"] = None
         sets["cancelled_at"] = None
+        sets["close_reason"] = None
     for k, v in (extra_fields or {}).items():
         sets[k] = v
     cols = ", ".join(f"{k}=?" for k in sets)
@@ -259,8 +301,13 @@ def set_status(conn, cfg, item, new_status: str, *, actor: str, ts: str, reason:
     if evidence_sid:
         conn.execute("INSERT OR IGNORE INTO item_source(item_id,source_event_id,role) VALUES(?,?,?)",
                      (item["id"], evidence_sid, "cancel" if new_status == "cancelled" else "update"))
+    if actor == "user":
+        touch_reported(conn, item["id"], ts)
     reindex_item(conn, item["id"])
-    return {"changed": True, "from": cur, "status": new_status}
+    out = {"changed": True, "from": cur, "status": new_status}
+    if new_status == "cancelled":
+        out["close_reason"] = sets["close_reason"]
+    return out
 
 
 def complete_item(conn, cfg, item, evidence: str, *, actor: str, ts: str, note: str | None = None,
@@ -308,6 +355,8 @@ def complete_item(conn, cfg, item, evidence: str, *, actor: str, ts: str, note: 
     if sid:
         conn.execute("INSERT OR IGNORE INTO item_source(item_id,source_event_id,role) VALUES(?,?,'evidence')",
                      (item["id"], sid))
+    if actor == "user":
+        touch_reported(conn, item["id"], ts)
     # 4단계 반영 예약: Obsidian 줄 체크 (requires_confirm=0). 지금은 대기열에만 둔다.
     for l in conn.execute("SELECT external_key FROM link WHERE item_id=? AND system='obsidian_task'", (item["id"],)):
         _enqueue(conn, "obsidian.check_task", item["id"], {"external_key": l["external_key"], "completed_on": done_at[:10]},
@@ -324,6 +373,12 @@ def _completed_ts(completed_at: str | None, ts: str) -> str:
     if len(done_at) == 10:
         done_at = f"{done_at}T23:59:59{ts[-6:]}"
     return done_at
+
+
+def touch_reported(conn, item_id: int, ts: str) -> None:
+    """교수님이 이 업무의 상태를 알려 준 시각 (완료·진행·보류·대기·변경·답변). 진행 확인 주기의 기준이 된다.
+    같은 날 이미 알려 준 업무는 그날 다시 묻지 않는다 (R3)."""
+    conn.execute("UPDATE item SET last_reported_at=? WHERE id=?", (ts, item_id))
 
 
 def _withdraw_questions(conn, item_id: int, ts: str, why: str) -> list[str]:
@@ -381,6 +436,8 @@ def answer_question(conn, cfg, q, answer: str, resolve: dict | None, *, actor: s
         item = conn.execute("SELECT * FROM item WHERE id=?", (item["id"],)).fetchone()
     conn.execute("UPDATE question SET status='answered', answered_at=?, answer=?, resolution=? WHERE id=?",
                  (ts, answer, json.dumps(resolve or {}, ensure_ascii=False), q["id"]))
+    if item is not None and actor == "user":
+        touch_reported(conn, item["id"], ts)
     transition = None
     transition_aid = None
     prev_status = item["status"] if item is not None else None
@@ -408,7 +465,7 @@ def undo_action(conn, cfg, act, *, ts: str, actor: str = "user") -> dict:
     payload = json.loads(act["payload"]) if act["payload"] else {}
     before = payload.get("before")
     if act["action"] not in ("update", "status", "complete", "reopen", "cancel", "hold", "wait", "progress", "answer",
-                             "merge") or before is None:
+                             "merge", "dismiss") or before is None:
         _bad("not_undoable", f"이력 {act['id']}({act['action']}) 는 되돌릴 수 없습니다")
     item = conn.execute("SELECT * FROM item WHERE id=?", (act["item_id"],)).fetchone()
     if item is None:
@@ -614,9 +671,19 @@ def _enqueue_new(conn, op, item_id, payload, key, ts, requires_confirm) -> bool:
 STATUS_KO = {"captured": "포착", "needs_info": "확인 필요", "todo": "할 일", "in_progress": "진행 중",
              "waiting": "대기", "on_hold": "보류", "done": "완료", "cancelled": "취소"}
 SYNC_KO = {"linked": "등록됨", "awaiting_confirm": "승인 대기", "pending": "반영 예정", "retrying": "재시도 중",
-           "failed": "실패", "declined": "등록 안 함", "missing": "캘린더에서 사라짐", "conflict": "충돌 확인 필요",
+           "failed": "실패", "declined": "표시 안 함(교수님 제외)", "missing": "캘린더에서 사라짐", "conflict": "충돌 확인 필요",
            "recorded": "기록됨", "unrecorded": "미반영"}
 ATTENDANCE_KO = {"undecided": "미정", "attending": "참석", "declined": "불참"}
+CLOSE_KO = {"cancelled": "취소", "not_needed": "처리 불필요", "not_mine": "내 할 일 아님"}
+
+
+def status_label(item) -> str:
+    """업무 상태 한국어. 닫힌 항목은 닫힌 뜻까지 (취소 / 처리 불필요 / 내 할 일 아님)."""
+    st = item["status"]
+    if st == "cancelled":
+        cr = item["close_reason"] if "close_reason" in item.keys() else None
+        return CLOSE_KO.get(cr or "cancelled", "취소")
+    return STATUS_KO.get(st, st)
 
 
 def _op_state(row) -> str:
@@ -667,7 +734,7 @@ def daily_state(conn, item, ops=None) -> str | None:
 def describe_state(conn, cfg, item) -> str:
     """브리핑 한 줄용: `업무 할 일 · 달력 승인 대기 · Tasks 등록됨 · 참석 미정`."""
     st = sync_state_of(conn, item)
-    parts = [f"업무 {STATUS_KO.get(item['status'], item['status'])}"]
+    parts = [f"업무 {status_label(item)}"]
     if st["calendar"]:
         parts.append(f"달력 {SYNC_KO.get(st['calendar'], st['calendar'])}")
     if st["tasks"]:

@@ -27,11 +27,13 @@ from zoneinfo import ZoneInfo
 #
 # 스킬 전체의 배포 버전 (SemVer). 동작이나 문서가 바뀌면 반드시 올리고
 # CHANGELOG.md에 항목을 남긴다. tests/test_claire.py가 둘의 일치를 검사한다.
-CLAIRE_VERSION = "0.5.1"
+CLAIRE_VERSION = "0.6.0"
 
 # 데이터 파일 형식의 버전. 스키마가 바뀌면 올리고 MIGRATIONS 에 기존 DB 변환을 적는다.
 # v2 (0.5.0): item.due_precision·window_auto·attendance·daily_logged_on, outbox.selected_at, checkin 표.
-SCHEMA_VERSION = 2
+# v3 (0.6.0): item.request_scope·priority_source·priority_reason·check_every_days·review_after·close_reason·
+#             last_exposed_at·last_asked_at·last_reported_at, delivery 표 (완료까지 추적·전달 기록).
+SCHEMA_VERSION = 3
 
 # --------------------------------------------------------------------------
 # 설정 (PRD §12, §15)
@@ -93,6 +95,9 @@ DEFAULT_CONFIG = {
         "inbound_media_dir": "~/.openclaw/media/inbound",
         "reference_prefixes": ["참고:"],
         "register_prefixes": ["등록:", "일정:", "할일:"],
+        # 0.6.0 — cron 턴(06:00 보고·12/18시 확인)처럼 "지금 대화 중인 채널"이 없을 때 보낼 곳. "channel:<id>".
+        # 비어 있으면 doctor 가 claire_check channel-target --write 로 채우라고 안내한다.
+        "send_to": None,
     },
 
     # §4.3 — gog CLI의 OAuth 클라이언트를 재사용하되 토큰은 읽기 전용 범위로 따로 발급
@@ -149,6 +154,22 @@ DEFAULT_CONFIG = {
 
     # 0.5.0 — 12:00·18:00 미등록 일정 확인 (OpenClaw cron 이 claire_run checkin 을 부른다)
     "checkin": {"slots": ["12:00", "18:00"]},
+
+    # 0.6.0 — 완료까지 추적 (ISSUE 2026-09-27). 등록 여부가 아니라 완료까지 노출·진행 확인을 보장한다.
+    "tracking": {
+        # 진행 확인 주기(일). 마감 유무와 무관하다. 전날·당일·기한 경과·재확인일은 주기와 관계없이 확인한다.
+        "interval_days": {"high": 1, "normal": 2, "low": 7},
+        # 이 중요도의 주기는 주말을 세지 않는다 (높음·전날·당일·기한 경과는 주말에도 확인)
+        "skip_weekends_for": ["normal", "low"],
+        "hold_default_days": 7,              # 보류 재확인일을 말하지 않으면 N일 뒤
+        "exposure_grace_hours": 30,          # 높은 중요도 업무가 이 시간 넘게 전달되지 않으면 누락으로 표시
+        "delivery_confirm_minutes": 60,      # 생성 뒤 이 시간 안에 전송 확인이 없으면 "전달 확인 안 됨"
+        "upcoming_meeting_days": 7,          # 전체 목록에 개별로 보일 앞으로의 일정 범위 (그 뒤는 건수 + "이번 주" 조회)
+        "deadline_cluster_min": 2,           # 1시간 안에 몰린 마감이 N건 이상이면 작업량 안내 (충돌 경고 아님)
+    },
+    # 0.6.0 — 정기 일정 회차의 준비 업무 템플릿 (교수님이 승인한 것만). 비어 있으면 만들지 않는다.
+    # 예: {"match": "로봇공학", "title": "{title} 준비", "days_before": 1, "kind": "prep"}
+    "prep_templates": [],
 
     # §7.1, §9
     "min_confidence": 0.4,
@@ -288,6 +309,15 @@ CREATE TABLE IF NOT EXISTS item (
   window_auto    INTEGER NOT NULL DEFAULT 0,
   attendance     TEXT CHECK (attendance IN ('undecided','attending','declined')),
   daily_logged_on TEXT,
+  request_scope  TEXT CHECK (request_scope IN ('direct','group','self','none')),
+  priority_source TEXT CHECK (priority_source IN ('rule','claire','user','unreviewed')),
+  priority_reason TEXT,
+  check_every_days INTEGER,
+  review_after   TEXT,
+  close_reason   TEXT CHECK (close_reason IN ('cancelled','not_needed','not_mine')),
+  last_exposed_at TEXT,
+  last_asked_at  TEXT,
+  last_reported_at TEXT,
   created_at     TEXT NOT NULL,
   updated_at     TEXT NOT NULL,
   completed_at   TEXT,
@@ -481,6 +511,31 @@ CREATE TABLE IF NOT EXISTS checkin (
   UNIQUE (day, slot)
 );
 
+-- 보고 전달 기록 (0.6.0). 보고 생성과 실제 전송 성공을 나눈다. 페이지마다 한 행.
+-- 전송 성공(sent)한 페이지의 항목만 "보여 줌"(item.last_exposed_at)·"진행 확인함"(item.last_asked_at)으로 기록한다.
+CREATE TABLE IF NOT EXISTS delivery (
+  id            INTEGER PRIMARY KEY,
+  report_key    TEXT NOT NULL,
+  kind          TEXT NOT NULL,
+  page          INTEGER NOT NULL,
+  pages         INTEGER NOT NULL,
+  item_refs     TEXT,
+  check_refs    TEXT,
+  question_refs TEXT,
+  payload       TEXT NOT NULL,
+  content_hash  TEXT NOT NULL,
+  problems      TEXT,
+  status        TEXT NOT NULL DEFAULT 'generated' CHECK (status IN ('generated','sent','failed','superseded')),
+  via           TEXT,
+  message_id    TEXT,
+  error         TEXT,
+  attempts      INTEGER NOT NULL DEFAULT 0,
+  created_at    TEXT NOT NULL,
+  sent_at       TEXT,
+  UNIQUE (report_key, page)
+);
+CREATE INDEX IF NOT EXISTS ix_delivery_status ON delivery(status);
+
 -- 한국어 검색 (Clio의 어간 근사 처리 재사용)
 CREATE VIRTUAL TABLE IF NOT EXISTS search_fts USING fts5(
   ref, title, project, next_action, waiting_on, excerpts,
@@ -491,7 +546,7 @@ CREATE VIRTUAL TABLE IF NOT EXISTS search_fts USING fts5(
 # 백업·복구 대조와 무결성 집계에 쓰는 표 목록 (TC20)
 COUNT_TABLES = ["item", "source_event", "item_source", "attachment", "question",
                 "activity_log", "relation", "link", "sync_state", "run", "outbox",
-                "briefing", "checkin"]
+                "briefing", "checkin", "delivery"]
 
 # 내용 해시에 참여하는 표. 복구 후 "건수·해시 일치"의 해시가 이것이다 (TC20).
 HASH_TABLES = ["item", "source_event", "item_source", "question", "activity_log",
@@ -523,8 +578,8 @@ def connect(create: bool = True) -> sqlite3.Connection:
         (str(SCHEMA_VERSION),),
     )
     if fresh:
-        conn.execute("INSERT INTO meta(key,value) VALUES('daily_done_since',?) ON CONFLICT(key) DO NOTHING",
-                     (_meta_now(),))
+        for key in ("daily_done_since", "tracking_since"):
+            conn.execute("INSERT INTO meta(key,value) VALUES(?,?) ON CONFLICT(key) DO NOTHING", (key, _meta_now()))
     conn.execute(
         "INSERT INTO meta(key,value) VALUES('created_by_version',?) "
         "ON CONFLICT(key) DO NOTHING",
@@ -557,13 +612,25 @@ MIGRATION_COLUMNS = {
         ("window_auto", "INTEGER NOT NULL DEFAULT 0"),
         ("attendance", "TEXT CHECK (attendance IN ('undecided','attending','declined'))"),
         ("daily_logged_on", "TEXT"),
+        # v3 (0.6.0)
+        ("request_scope", "TEXT CHECK (request_scope IN ('direct','group','self','none'))"),
+        ("priority_source", "TEXT CHECK (priority_source IN ('rule','claire','user','unreviewed'))"),
+        ("priority_reason", "TEXT"),
+        ("check_every_days", "INTEGER"),
+        ("review_after", "TEXT"),
+        ("close_reason", "TEXT CHECK (close_reason IN ('cancelled','not_needed','not_mine'))"),
+        ("last_exposed_at", "TEXT"),
+        ("last_asked_at", "TEXT"),
+        ("last_reported_at", "TEXT"),
     ],
     "outbox": [("selected_at", "TEXT")],
 }
 
 
 def migrate(conn) -> list[str]:
-    """스키마 v1 → v2. 바꾼 것을 돌려준다. install.sh 가 migrate 전에 백업한다."""
+    """스키마 v1 → v2 → v3. 바꾼 것을 돌려준다. install.sh 가 migrate 전에 백업한다.
+    값은 지우거나 바꾸지 않는다: 원본 ID·상태·완료 이력·"등록 안 함" 기록은 그대로다. 기존 업무의 중요도 소급 분류는
+    설정이 필요해서 claire_store maintain 이 한 번 한다(claire_track.backfill_importance)."""
     done = []
     row = conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone() if _has_table(conn, "meta") else None
     before = int(row[0]) if row else 1
@@ -585,6 +652,9 @@ def migrate(conn) -> list[str]:
         conn.execute("INSERT INTO meta(key,value) VALUES('daily_done_since',?) ON CONFLICT(key) DO NOTHING",
                      (_meta_now(),))
         conn.execute("INSERT INTO meta(key,value) VALUES('migrated_v%d',?) ON CONFLICT(key) DO NOTHING" % SCHEMA_VERSION,
+                     (_meta_now(),))
+        # 노출·진행 확인 추적의 기준 시각: 이전 기록이 없는 기존 업무를 업그레이드 첫날 "누락"으로 잡지 않는다
+        conn.execute("INSERT INTO meta(key,value) VALUES('tracking_since',?) ON CONFLICT(key) DO NOTHING",
                      (_meta_now(),))
         done.append(f"schema_version {before} → {SCHEMA_VERSION}")
     return done

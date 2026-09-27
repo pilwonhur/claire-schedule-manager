@@ -15,6 +15,7 @@ Claire는 자유 텍스트로 DB를 바꾸지 않는다. 해석 결과를 이 �
       "project": "IROS 2026 워크숍",
       "due_at": "2026-09-12",
       "done_criteria": "명단 회신 발송",
+      "request_scope": "direct",
       "confidence": 0.86,
       "evidence": ["Could you send the final speaker list by Friday, Sept 12?"],
       "unknown_fields": [],
@@ -43,7 +44,7 @@ Claire는 자유 텍스트로 DB를 바꾸지 않는다. 해석 결과를 이 �
 
 | op | 필수 | 선택 | 2단계 |
 |---|---|---|---|
-| `create` | `source_event_ids`, `kind`, `title`, `evidence`(1개 이상) | `project`, `priority`(high/normal/low), `owner`(user/claire/other), `next_action`, `done_criteria`, `start_at`, `end_at`, `all_day`, `due_at`, `scheduled_on`, `tentative`, `confidence`(0~1), `waiting_on`, `next_check_at`, `canonical_note`, `ledger_note`, `series_key`, `occurrence_at`, `attendance`(undecided/attending/declined), `unknown_fields`, `questions`, `note` | ✅ |
+| `create` | `source_event_ids`, `kind`, `title`, `evidence`(1개 이상). 메일 원문이면 `request_scope`(0.6.0) | `request_scope`(direct/group/self/none), `priority_reason`(분류 근거), `project`, `priority`(high/normal/low), `owner`(user/claire/other), `next_action`, `done_criteria`, `start_at`, `end_at`, `all_day`, `due_at`, `scheduled_on`, `tentative`, `confidence`(0~1), `waiting_on`, `next_check_at`, `canonical_note`, `ledger_note`, `series_key`, `occurrence_at`, `attendance`(undecided/attending/declined), `unknown_fields`, `questions`, `note` | ✅ |
 | `ignore` | `source_event_ids`, `reason` | `note` | ✅ |
 | `update` | `item_ref`, `source_event_ids`, `changes`(필드→값), `evidence` | `reason` | ✅ 같은 스레드·시리즈·연결 원문만. 아니면 `--force-cross-thread` |
 | `complete` | `item_ref`, `source_event_ids`, `evidence` | `reason`, `evidence_code`(기본 `criteria_evidence:<첫 source_event_id>`) | ✅ 보낸 메일·제출 확인 등 완료 증거 |
@@ -66,6 +67,10 @@ Claire는 자유 텍스트로 DB를 바꾸지 않는다. 해석 결과를 이 �
     `start_at`을 주면 그 값이 우선이고 `end_at`이 없으면 마감까지. 날짜만인 `due_at`은 `due_precision=date`로 저장되고 달력에 올리지 않는다.
     날짜는 알고 시각을 모르면 `unknown_fields: ["due_time"]` + `field: "due_time"` 질문(`due_at`에 날짜를 넣어도 된다). 시각이 이미 있는데 `due_time`을 물으면 거부.
     `kind: deadline`인데 날짜만이고 `due_time` 질문도 없으면 반환 `warnings`에 `due_time_missing`이 붙는다(거부는 아님).
+12. **중요도 (0.6.0, R3)**: `priority`를 주지 않으면 도구가 정한다 — Discord 직접 등록 → high, `request_scope: direct` → high,
+    `group`/`self`/`none` → normal, 메일인데 `request_scope`가 없으면 normal + "검토 필요"(`warnings.request_scope_missing`).
+    마감 유무는 보지 않는다. `priority`를 주면 Claire 판단(`priority_source=claire`)이고 `priority_reason`이 없으면 `warnings.priority_reason_missing`.
+    단체 메일이라도 개인 의무(결재·필수 제출)는 `request_scope: group` + `priority: high` + `priority_reason`.
 11. `update`의 `changes` 값은 `claire_store update`와 같은 형식 검증을 받는다. `status`는 바꿀 수 없다(전이는 `complete`/`cancel`로).
     Calendar 연결 항목의 `start_at`/`end_at`은 Calendar가 원본이라 거부된다(4단계 outbox).
 
@@ -77,7 +82,8 @@ Claire는 자유 텍스트로 DB를 바꾸지 않는다. 해석 결과를 이 �
  "ignored": [...], "summary": {...}, "message": "... 이제 번호를 말해도 됩니다."}
 ```
 
-`created[]`에는 `due_precision`, `start_at`·`end_at`, `calendar_window: "auto"`(자동 구간일 때), `planned`(예약된 외부 반영)가 실린다.
+`created[]`에는 `due_precision`, `start_at`·`end_at`, `calendar_window: "auto"`(자동 구간일 때), `planned`(예약된 외부 반영),
+`priority`·`priority_reason`·`request_scope`가 실린다.
 
 **이 반환 전에는 번호를 말하지 않는다.** `ok: false`면 오류 메시지를 고쳐 다시 제안하거나, 고칠 수 없으면
 브리핑에 "해석 미반영 N건"으로 적는다.
@@ -86,4 +92,5 @@ Claire는 자유 텍스트로 DB를 바꾸지 않는다. 해석 결과를 이 �
 
 `notice`(공지·안내), `promotion`, `newsletter`, `receipt`(영수증·자동 알림), `not_for_user`(요청 대상이 다른 사람),
 `duplicate`(이미 항목 있음 — 같은 스레드면 3단계 `update`가 맞다), `sent_by_user`(교수님이 보낸 메일, 근거만),
+(0.6.0: 교수님이 해야 할 행동이 있는 메일은 확신이 약해도 `ignore`하지 않고 `create` — 교수님이 `처리 불필요`로 뺀다)
 `overlay`(겹침 확인용 캘린더), `no_action`(정보만 있고 할 일 없음), `reference`.

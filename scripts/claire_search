@@ -13,8 +13,12 @@
   trace --source-event 981 | --item CLR  원문 역추적 (원문 → 항목 → 이력)
   waiting [--who "김 교수"]               답변 대기 항목
   dupcheck --title "김 교수 면담" [--date YYYY-MM-DD]   등록 전 중복 후보 (미등록 일정 확인 답변용, 0.5.0)
+  agenda                                 업무 현황 재료 (활성 미완료 전체·구역·진행 확인 대상, 0.6.0). 보낼 때는 claire_buttons agenda
+  importance-review                      중요도 검토 필요(소급 분류·요청 범위 미분류) 업무와 판단 근거 (0.6.0)
 
 0.5.0: 항목마다 업무 상태(status)와 별개로 외부 반영 상태(sync: calendar·tasks·daily)와 한 줄 요약(state_line)을 낸다.
+0.6.0: 항목마다 중요도·근거·진행 확인 계획(tracking)과 시간 종류(time_kind: appointment|work|deadline_marker).
+       겹침(overlaps)은 실제 약속·작업 예약·overlay 끼리만. 자동 마감 표시끼리 겹친 것은 deadline_clusters(작업량 안내).
 """
 
 from __future__ import annotations
@@ -33,6 +37,7 @@ from claire_core import (  # noqa: E402
     run_cli, tokenize, tz_of,
 )
 import claire_ops as ops  # noqa: E402
+import claire_track as track  # noqa: E402
 
 _CTX: dict = {}          # 명령 하나 동안의 conn·cfg (항목마다 반영 상태를 붙이기 위해)
 
@@ -44,13 +49,22 @@ def _item(r) -> dict:
     out = {k: d.get(k) for k in ("ref", "title", "kind", "status", "priority", "project", "start_at", "end_at",
                                  "all_day", "due_at", "due_precision", "scheduled_on", "tentative", "attendance",
                                  "confidence", "waiting_on", "next_check_at", "next_action", "done_criteria",
-                                 "completed_at", "updated_at")}
+                                 "completed_at", "updated_at", "request_scope", "priority_source", "priority_reason",
+                                 "close_reason", "review_after", "check_every_days")}
     if d.get("window_auto"):
         out["calendar_window"] = "auto"      # start_at·end_at 은 마감에서 만든 달력 표시 구간
     conn, cfg = _CTX.get("conn"), _CTX.get("cfg")
     if conn is not None and "id" in d and "daily_logged_on" in d:
         out["sync"] = ops.sync_state_of(conn, r)
         out["state_line"] = ops.describe_state(conn, cfg, r)
+        out["status_label"] = ops.status_label(r)
+        out["time_kind"] = track.time_kind(r)
+        if "close_reason" in d:
+            plan = track.check_plan(cfg, r, now_dt(cfg))
+            out["tracking"] = {"priority": track.PRIORITY_KO.get(d["priority"]), "reason": d.get("priority_reason"),
+                               "source": d.get("priority_source"), "check_due": plan["due"], "check_reason": plan["reason"],
+                               "check_label": plan["label"],
+                               "next_check_on": plan["next_on"].isoformat() if plan.get("next_on") else None}
     return out
 
 
@@ -94,42 +108,7 @@ def _meetings_on(conn, cfg, day: str) -> list[dict]:
 
 
 def _overlay_on(conn, cfg, day: str) -> list[dict]:
-    """overlay 캘린더(Family·HUR Group)의 그날 이벤트. 항목은 없고 겹침 확인용."""
-    out = []
-    for r in conn.execute("SELECT id, headers, excerpt FROM source_event WHERE platform='calendar' "
-                          "AND ignore_reason='overlay' ORDER BY id"):
-        h = json.loads(r["headers"] or "{}")
-        if h.get("status") == "cancelled":
-            continue
-        if _local_day(h.get("start"), cfg) == day:
-            out.append({"source_event_id": r["id"], "calendar": h.get("calendar"), "summary": h.get("summary"),
-                        "start": h.get("start"), "end": h.get("end"), "all_day": h.get("all_day"),
-                        "location": h.get("location")})
-    # 같은 이벤트의 여러 버전(etag) 중 마지막만
-    dedup = {}
-    for o in out:
-        dedup[(o["calendar"], o["summary"], o["start"])] = o
-    return sorted(dedup.values(), key=lambda x: x["start"] or "")
-
-
-def _overlaps(meetings: list[dict], overlays: list[dict]) -> list[dict]:
-    def span(s, e):
-        if not s or len(s) == 10:
-            return None
-        try:
-            a = parse_iso(s); b = parse_iso(e) if e and len(e) > 10 else a + timedelta(hours=1)
-            return a, b
-        except ValueError:
-            return None
-    blocks = [(m["ref"], m["title"], span(m["start_at"], m["end_at"])) for m in meetings]
-    blocks += [(f"overlay:{o['calendar']}", o["summary"], span(o["start"], o["end"])) for o in overlays]
-    found = []
-    for i in range(len(blocks)):
-        for j in range(i + 1, len(blocks)):
-            a, b = blocks[i][2], blocks[j][2]
-            if a and b and a[0] < b[1] and b[0] < a[1]:
-                found.append({"a": blocks[i][0], "a_title": blocks[i][1], "b": blocks[j][0], "b_title": blocks[j][1]})
-    return found
+    return track.overlay_on(conn, cfg, day)
 
 
 def _due_between(conn, cfg, start: str, end: str) -> list[dict]:
@@ -169,6 +148,7 @@ def cmd_review(args, cfg):
 
     meetings = _meetings_on(conn, cfg, today)
     overlays = _overlay_on(conn, cfg, today)
+    day = track.day_conflicts(conn, cfg, now.date(), overlays)
     new_items, changed = [], []
     for r in conn.execute(
         "SELECT a.action, a.field, a.old_value, a.new_value, a.reason, a.created_at, i.* FROM activity_log a "
@@ -233,16 +213,63 @@ def cmd_review(args, cfg):
         "now": now_s, "today": today, "weekday": "월화수목금토일"[now.weekday()], "run": run,
         "last_briefing_at": last_brief["sent_at"] if last_brief else None,
         "sync_state": sync, "stale_sources": stale, "pending_unprocessed": pending,
-        "today_meetings": meetings, "today_overlay": overlays, "overlaps": _overlaps(meetings, overlays),
+        "today_meetings": meetings, "today_overlay": overlays, "overlaps": day["overlaps"],
+        "deadline_clusters": day["deadline_clusters"],
         "overdue": _overdue(conn, cfg, now_s),
         "imminent": _due_between(conn, cfg, d0, imminent_end),
         "new_items": new_items, "changed_items": changed, "captured": captured,
         "waiting_check": waiting, "questions": _open_questions(conn, now_s, due_now=True),
         "links_attention": links, "ignored_since_last": ignored, "suspicious": suspicious, "outbox": outbox,
         "approvals": ops.approval_queue(conn, cfg, now), "daily_unsynced": daily_unsynced, "checkins": checkins,
+        "tracking": _tracking_summary(conn, cfg, now),
         "limits": {"section_limit": cfg["briefing"]["section_limit"], "imminent_days": cfg["briefing"]["imminent_days"]},
         "data_as_of": max([s["last_success_at"] or "" for s in sync] + [""]) or None,
     }
+
+
+def _tracking_summary(conn, cfg, now) -> dict:
+    """0.6.0 — 업무 현황(claire_buttons agenda)이 전체 목록을 맡는다. 브리핑에는 건수와 점검 결과만."""
+    data = track.agenda_data(conn, cfg, now)
+    h = track.health(conn, cfg, now)
+    return {"counts": data["counts"], "check_refs": data["check_refs"], "exposure_gaps": h["exposure_gaps"],
+            "delivery_issues": h["delivery"], "importance_unreviewed": h["importance_unreviewed"]}
+
+
+def cmd_agenda(args, cfg):
+    conn = _ctx(connect(create=False), cfg)
+    now = now_dt(cfg)
+    data = track.agenda_data(conn, cfg, now, overlays=_overlay_on(conn, cfg, now.strftime("%Y-%m-%d")))
+    for key in ("today", "check", "upcoming"):
+        for e in data[key]:
+            e.pop("id", None)
+    for g in list(data["open"].values()) + list(data["parked"].values()):
+        for e in g:
+            e.pop("id", None)
+    data["health"] = track.health(conn, cfg, now)
+    data["data_as_of"] = _data_as_of(conn)
+    return data
+
+
+def cmd_importance_review(args, cfg):
+    """중요도 검토 필요 업무: 소급 분류로 잠정값만 있거나 요청 범위를 모르는 업무. 근거(받는 사람·발췌)를 함께 낸다.
+    Claire 는 원문을 보고 `claire_store update --actor claire --item CLR --set request_scope=direct|group|self|none
+    --set priority=high|normal --set priority_reason="..."` 로 확정한다. 교수님이 정한 중요도는 바꾸지 않는다."""
+    conn = _ctx(connect(create=False), cfg)
+    out = []
+    for r in conn.execute(f"SELECT * FROM item WHERE deleted_at IS NULL AND priority_source='unreviewed' AND {OPEN_SQL} "
+                          "ORDER BY id LIMIT ?", (args.limit,)):
+        d = _item(r)
+        d["sources"] = []
+        for e in conn.execute("SELECT e.platform, e.headers, e.excerpt FROM item_source s JOIN source_event e "
+                              "ON e.id=s.source_event_id WHERE s.item_id=? AND s.role='origin' ORDER BY e.id LIMIT 2", (r["id"],)):
+            h = json.loads(e["headers"] or "{}")
+            d["sources"].append({"platform": e["platform"], "from": h.get("from"), "to": h.get("to"), "cc": h.get("cc"),
+                                 "subject": h.get("subject"), "excerpt": (e["excerpt"] or "")[:300]})
+        out.append(d)
+    total = conn.execute(f"SELECT COUNT(*) c FROM item WHERE deleted_at IS NULL AND priority_source='unreviewed' AND {OPEN_SQL}").fetchone()["c"]
+    return {"count": total, "items": out,
+            "rule": "직접 요청(교수님을 특정한 회신·행동 요청) → high, 단체 공통 요청 → normal, 단체라도 개인 의무(결재·필수 제출) → high. "
+                    "수신자 수만으로 정하지 않는다. 근거를 priority_reason 에."}
 
 
 def cmd_today(args, cfg):
@@ -493,6 +520,9 @@ def build_parser():
     dc.add_argument("--title", required=True); dc.add_argument("--date", help="YYYY-MM-DD (일정·마감 날짜)")
     dc.add_argument("--recent-days", type=int, default=14, help="완료·취소 항목은 최근 N일 안에 바뀐 것만")
     dc.set_defaults(fn=cmd_dupcheck)
+    ag = sub.add_parser("agenda", help="업무 현황 재료 (0.6.0)"); ag.set_defaults(fn=cmd_agenda)
+    ir = sub.add_parser("importance-review", help="중요도 검토 필요 업무 (0.6.0)")
+    ir.add_argument("--limit", type=int, default=20); ir.set_defaults(fn=cmd_importance_review)
     return p
 
 

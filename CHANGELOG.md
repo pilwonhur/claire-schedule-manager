@@ -3,6 +3,104 @@
 형식은 [Keep a Changelog](https://keepachangelog.com/ko/1.1.0/)를 따르고 버전은 SemVer다.
 데이터 형식 버전(`SCHEMA_VERSION`)은 따로 관리한다.
 
+## [0.6.0] — 2026-09-27
+
+교수님 개선 요청 반영(`claire-follow-through-issue-2026-09-27.md`, Epic: 일정·할 일의 지속 노출 및 완료까지의 추적 강화).
+핵심 원칙: **등록 여부가 아니라, 완료될 때까지 노출·진행 확인이 보장되는지를 관리한다.** 스키마 v3.
+
+계기: 9/25 신규로 보고된 마감 없는 직접 회신 요청(CLR-0764 Aaron Young RiTA 2026 방한 안내)이 장부에 미완료로 있었지만 이후 보고에서
+보이지 않아, 9/27 교수님이 "이메일 온 것은 등록되었어? 안 보이네?"라고 따로 물어야 했다.
+
+### P0 — 등록되어 있으나 사라지는 업무 방지
+- **업무 현황**(`claire_buttons agenda`, `claire_search agenda`, 새 모듈 `scripts/claire_track.py`): 매일 아침 브리핑 뒤에
+  ① 오늘 일정·마감(준비·후속 상태) ② 오늘 진행 확인 ③ 그 외 활성 업무(진행 중·할 일·확인 필요·참고, **기한 없음** 표시, 다음 확인일, 앞으로의 일정)
+  ④ 답변 대기·보류(다음 확인일) ⑤ 승인 대기 목록 ⑥ 반영·전달 점검. 활성 미완료 업무는 "외 N건"으로 접지 않고 모두 번호 버튼과 함께 쪽으로 나눈다(R2).
+  한 업무는 주된 구역 한 곳에만. 브리핑은 신규·변경·질문·반영 상태·참고만 쓰고 목록을 반복하지 않는다(`briefing-format.md`).
+- **중요도와 진행 확인 주기**(R3): Discord 직접 등록 → 높음, 메일에서 교수님을 특정한 요청(`request_scope: direct`) → 높음,
+  단체 공통 요청(`group`) → 보통, 단체라도 개인 의무 → Claire 가 근거와 함께 높음. **마감 유무는 보지 않는다.**
+  높음 매일 · 보통 2영업일 · 낮음 7일, 전날·당일·기한 경과(정리될 때까지 매일)·보류/대기 재확인일은 주기와 무관.
+  같은 날 보고받은 업무는 다시 묻지 않고, 오늘 이미 물은 업무는 그날 내내 오늘의 확인 목록에 남는다(재실행해도 같은 보고).
+  교수님이 정한 중요도·주기(`check_every_days`)·다음 확인일(`review_after`)이 우선이고 Claire 가 덮지 못한다(`priority_source=user`).
+  분류 근거는 `priority_reason`, 누가 정했는지는 `priority_source`(rule/claire/user/unreviewed).
+- **외부 등록 상태와 무관한 추적**(R6): 달력·Tasks 미등록·승인 대기·표시 안 함·반영 실패여도 업무 현황과 진행 확인에 그대로 나온다.
+- **전달 기록**(R8, 표 `delivery`): 보고 생성과 전송 성공을 나눈다. 브리핑·업무 현황·승인 대기·12/18시 확인이 쪽마다 `delivery_id`를 갖고,
+  `claire_run deliver --status sent|failed`로 결과를 남긴다. **전송 성공한 쪽의 업무만** `last_exposed_at`(보여 줌)·`last_asked_at`(진행 확인함),
+  질문 `asked_count`가 갱신된다 — `claire_run brief`는 더 이상 질문 횟수를 세지 않는다. 실패·확인 없는 쪽은 `claire_buttons resend`로
+  그 쪽만 다시 보내고, 12·18시 확인이 먼저 재전송한다. 같은 날 같은 내용이면 `duplicate`(다 보냄) 또는 `resend`(안 간 쪽만). 새 보고가 옛 실패 쪽을 대체한다.
+- **누락 감시**: 높은 중요도 업무가 30시간(`tracking.exposure_grace_hours`) 넘게 전송 성공한 보고에 실리지 않았거나 진행 확인 주기를 넘기면
+  업무 현황 ⑥ "누락 감지"와 `review.tracking.exposure_gaps`에 나온다. `claire_check integrity`에 `delivery_failed`.
+- **메시지 검증**: 쪽마다 빈 본문·빈 블록·버튼 없는 섹션·번호 버튼 누락·Discord 한도 초과를 `problems`로 낸다(있으면 본문만 보낸다).
+
+### P1 — 상태·일정 모델 명확화
+- **동작의 뜻을 나눔**(R5): 카드 버튼 `완료`·`진행 중`·`보류`·`답변 대기`·`상세` / `처리 불필요`·`내 할 일 아님`·`취소`.
+  - `claire_store dismiss --why not_needed|not_mine` — 활성 목록·진행 확인에서 빠지고 사유·이력은 남는다(`status=cancelled` + `close_reason`,
+    `find --status all`로 검색, 표시 "처리 불필요"/"내 할 일 아님"). `reopen`·`undo`로 되돌린다. `cancel`은 "업무 자체 취소"(`close_reason=cancelled`).
+  - `claire_store hold --until YYYY-MM-DD` — 보류는 재확인일에 다시 묻는다(기본 7일 뒤, `tracking.hold_default_days`). 그 전에는 묻지 않는다.
+  - 승인 버튼 `등록 안 함` → **`달력에 표시 안 함` / `Tasks에 표시 안 함`**: 외부 표시만 빼고 업무 추적은 계속. 반영 상태 표기도
+    "등록 안 함" → "표시 안 함(교수님 제외)". 옛 `등록 안 함` 버튼·기록은 그대로 동작하고 업무 취소로 해석하지 않는다.
+- **일정과 준비·후속 업무**(R1): `claire_store link-task --item <일정> --role prep|followup` — 일정에 연결된 별도 업무(`prep_for`/`follow_up_of`).
+  일정 완료가 준비·후속을 완료시키지 않는다. 업무 현황 오늘 일정 줄에 "준비: …(CLR 상태) · 후속: …". 정기 일정 회차의 준비 업무는
+  교수님이 승인한 **준비 템플릿**(`prep_templates`, 기본 비어 있음)으로만 `maintain`이 만든다(이미 준비 업무가 있는 회차는 건너뜀, 멱등).
+  지난 일정은 자동 완료하지 않고 ② "지난 일정 — 완료 체크"로 묻는다. `complete --item A,B`로 여러 건 완료.
+- **마감 표시와 실제 시간 예약 분리**(R7): 항목마다 `time_kind` — `appointment`(회의·수업) · `work`(교수님이 잡은 작업 시간) ·
+  `deadline_marker`(마감 1시간 전 자동 표시). 충돌 경고(`overlaps`)는 약속·작업 예약·가족 일정끼리만. 자동 마감 표시끼리 겹친 것은
+  `deadline_clusters` → "⏱ 18:00 마감 2건 — 약속 충돌이 아니라 작업량 안내". (9/27 일본 출장 결과 보고서·전남고 강의 일정 변경 확정 사례)
+  마감 전 1시간 표시 규칙과 날짜만인 Obsidian 동기화가 확정 시각을 지우지 않는 0.5.0 동작은 그대로.
+- **메일 행동 요청은 기본 등록**(R4, SKILL §3): 행동이 필요한 요청은 확신이 약해도 업무로 만든다(교수님이 `처리 불필요`로 뺀다).
+  광고·단순 안내·영수증만 `ignore`. 내부 등록은 외부 반영 승인과 별개.
+
+### 전달·표시 실패 수정 (ISSUE §2.4)
+- **cron 턴 전송 대상 미지정**: 12·18시 확인·06시 보고는 "지금 대화 중인 채널"이 없어 버튼 전송이 실패했다. config `discord.send_to`
+  (`channel:<id>`)를 두고 모든 보고 출력에 `send_to`를 싣는다. `claire_check channel-target [--write]`가 OpenClaw Claire 계정의 채널에서
+  찾아 저장한다. doctor `discord.send_to`.
+- **승인 대기 후속 메시지가 제목만 보임**: 나뉜 메시지의 `message`(fallback 본문)가 머리글뿐이었다. 쪽마다 그 쪽 항목의 본문 전체를 싣는다.
+  (실제 클라이언트 렌더링은 mac mini 에서 확인 필요 — 아래 적용 3)
+
+### 조회·도구
+- `claire_search agenda`(업무 현황 재료·점검), `importance-review`(중요도 검토 필요 업무와 받는 사람·발췌).
+  조회 결과 항목마다 `status_label`·`time_kind`·`tracking`(중요도·근거·오늘 확인 여부·다음 확인일)·`close_reason` 등.
+- `claire_search review`: `overlaps`(실제 충돌만), `deadline_clusters`, `tracking`(건수·누락·전송 문제·검토 필요).
+- 항목 카드: 중요도·근거·다음 확인일 한 줄, 승인 대기면 "표시 안 함을 골라도 업무 추적은 계속됩니다".
+- `propose`: `request_scope`·`priority_reason` 필드, 경고 `request_scope_missing`·`priority_reason_missing`.
+
+### 스키마 v3 (기존 DB 는 열려 있을 때 자동 변환, 값은 바꾸지 않음)
+- `item`: `request_scope`, `priority_source`, `priority_reason`, `check_every_days`, `review_after`, `close_reason`,
+  `last_exposed_at`, `last_asked_at`, `last_reported_at`. 표 `delivery`. `meta.tracking_since`.
+- 원본 ID·상태·완료 이력·기존 "등록 안 함" 기록 보존, 중복 생성 없음. 기존 활성 업무(마감 없는 것 포함)는 첫 `maintain`이 **한 번** 중요도를
+  소급 분류한다: Discord 등록 → 높음, 메일 → 교수님만 받는 사람이면 잠정 높음·아니면 잠정 보통 + "검토 필요"(Claire 가 원문을 보고 확정),
+  캘린더·Obsidian → 보통, 이미 높음은 유지, 닫힌 업무는 건드리지 않음.
+
+### 구현 전 미결정 정책(ISSUE §8)에 둔 기본값 — 모두 설정으로 바꿀 수 있다
+| 항목 | 기본값 | 설정 |
+|---|---|---|
+| 보통 중요도 확인 간격·주말 | 2영업일(주말 제외). 높음·전날·당일·기한 경과는 주말 포함 | `tracking.interval_days`, `tracking.skip_weekends_for` |
+| 전체 목록 페이지 | Discord 한도(컴포넌트 38·3,800자)로 자동 분할, 구역 순서 고정 | `claire_buttons` 기본값 |
+| 보류·대기 중 전날·당일 | 교수님의 명시적 보류·대기가 우선: 진행 질문은 재확인일까지 하지 않는다. 당일이면 ① 오늘 일정·마감에(질문 표시 없이), 그 외에는 ④에 기한과 함께 보인다 | — |
+| 준비 템플릿·준비 마감 | 템플릿 없음(자동 생성 안 함). 템플릿은 `days_before`(기본 1)·`due_time` | `prep_templates` |
+| 일정 업무의 Tasks 자동 반영 | 하지 않음(회의는 달력만, 기존 승인 규칙 유지) | — |
+| 작업 시간 예약 전환 | `update --set start_at --set end_at`(교수님 지시) 또는 달력에서 블록을 옮기면 작업 예약(`work`)으로 보고 충돌 판정에 넣는다 | — |
+| 기존 업무 소급 분류 | 규칙으로 잠정값 + "검토 필요" → Claire 가 `importance-review`로 확정, 애매하면 보통으로 두되 목록·확인에서 빠지지 않음 | — |
+| 보류 기본 재확인 | 7일 | `tracking.hold_default_days` |
+| 누락 판정 | 높음 업무가 30시간 동안 전송 성공 보고에 없음 · 진행 확인이 주기보다 하루 이상 늦음 | `tracking.exposure_grace_hours` |
+
+### 테스트
+- 98건(+17). 수용 기준 §6: 마감 없는 직접 요청 매일 확인(Aaron 사례)·Discord 직접 등록 매일·단체 요청 목록은 매일/질문은 2영업일(주말 제외)·
+  개인 의무 높음과 근거·전날·당일·기한 경과·30건 숫자 접기 없음·준비/후속 분리와 자동 완료 없음·준비 템플릿·표시 제외 후 추적 유지/처리 불필요 제외와
+  이력·되돌리기·보류 재확인일·자동 마감 표시 겹침은 작업량 안내/실제 약속×작업 예약은 충돌·실패 쪽 미기록과 그 쪽만 재전송·재실행 중복 없음·
+  누락 감지·지난 일정 자동 완료 없음·소급 분류와 교수님 지정 우선·전송 대상·반복 회차 독립·v2→v3 업그레이드 보존(ID·상태·완료·등록 안 함).
+- 바뀐 기존 테스트: 질문 횟수는 전송 성공 뒤(`deliver`), 카드·승인 버튼 이름, 교수님 우선순위 변경의 `priority_source`, v1→v3 변환.
+
+### 적용 (mac mini)
+1. `git status`로 Dropbox 동기화 확인 → 커밋·push → `./release.sh tag` → `claire-update`.
+2. `claire_check channel-target --write`(Claire 채널을 `discord.send_to`에) → `claire_check doctor --format text`가 `send_to` ok 인지.
+3. 수동 점검: `claire_buttons agenda --no-record`로 CLR-0764 가 ②에 "매일 확인 · 기한 없음 · 직접 요청"으로 나오는지(첫 `maintain` 뒤 소급 분류가
+   "검토 필요"면 `importance-review`로 direct 확정). 승인 대기 목록이 두 메시지 이상일 때 iPhone 에서 둘째 메시지 본문·버튼이 보이는지
+   (§2.4 후자는 원인을 확정하지 않았으므로 실제 클라이언트로 재현 확인).
+4. 다음 06:00 보고 뒤 `claire_run deliver --pending`이 비어 있는지, 12:00 확인이 `send_to`로 전송되는지 확인.
+
+### 범위 밖
+이메일 발송·참석 수락·불필요 업무 일괄 취소·전체 일정 재등록은 하지 않는다. 중요도·주기 조정 전용 UI(P2 일부)는 채널 지시(`이건 3일마다만 물어봐`)로 대신한다.
+
 ## [0.5.1] — 2026-09-25
 
 mac mini 첫 설치(`get.sh`)가 테스트 단계에서 멈춘 문제. 코드 동작 변경 없음.

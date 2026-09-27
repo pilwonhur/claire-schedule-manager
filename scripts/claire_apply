@@ -6,7 +6,8 @@
   claire_apply --approvals [--include-past]                          승인 대기 목록 (달력 / Tasks 구분, 지난 일정 제외)
   claire_apply --confirm <outbox id | CLR-0045[,CLR-0047…] | selected | all> [--only calendar|tasks] [--include-past]
   claire_apply --select <CLR…> | --unselect <CLR… | all>            선택 일괄 승인용 표시 (모바일 버튼)
-  claire_apply --cancel <outbox id | CLR-0045[,…]> [--only …]        "등록 안 함" (기록은 남고 declined 로 보인다)
+  claire_apply --cancel <outbox id | CLR-0045[,…]> [--only …]        "달력/Tasks에 표시 안 함" (옛 "등록 안 함". 외부 표시만 빼고
+                                                                     업무 추적은 계속. 기록은 남고 declined 로 보인다)
   claire_apply --request <CLR> [--only calendar|tasks]               교수님이 "달력에 넣어줘" 한 항목을 바로 예약
 
 op
@@ -383,9 +384,11 @@ def cmd_cancel(args, cfg):
                              (r["item_id"],))
             if r["item_id"]:
                 log_activity(conn, item_id=r["item_id"], action="apply", actor="user", ts=now_s, field=r["op"],
-                             new_value="declined", reason="교수님: 등록 안 함", payload={"outbox_id": r["id"]})
+                             new_value="declined", reason="교수님: 표시 안 함(등록 안 함)", payload={"outbox_id": r["id"]})
             out.append({"outbox_id": r["id"], "op": r["op"], "status": "cancelled"})
-    return {"cancelled": out, "message": f"{len([o for o in out if o['status'] == 'cancelled'])}건 등록하지 않기로 했습니다. 업무 항목은 그대로 둡니다."}
+    n = len([o for o in out if o["status"] == "cancelled"])
+    return {"cancelled": out, "message": f"{n}건 달력·Tasks 에 표시하지 않기로 했습니다. 업무는 그대로 추적합니다 "
+                                         "(할 필요가 없는 일이면 '처리 불필요')."}
 
 
 def cmd_select(args, cfg, on: bool):

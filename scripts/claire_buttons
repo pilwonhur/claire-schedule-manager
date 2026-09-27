@@ -9,9 +9,18 @@
   actions --item CLR-0031 [--detail] | --question Q-0007
           번호 버튼을 눌렀을 때 보낼 "항목 카드": 한 줄 요약(업무 상태와 달력·Tasks 반영 상태를 따로)과
           다음 행동 버튼(완료·진행 중·보류·취소·상세·등록…). --detail 은 출처·질문·최근 이력까지 보인다.
-  approvals [--include-past]
+  approvals [--include-past] [--record]
           승인 대기 목록 메시지(0.5.0): 달력 등록 대기와 Tasks 등록 대기를 나눠 제목·일시와
-          `등록`·`선택`·`등록 안 함`·`상세` 버튼, 끝에 `선택한 것 등록`·`전부 등록`. 지난 일정은 빼고 건수만.
+          `등록`·`선택`·`달력에 표시 안 함`/`Tasks에 표시 안 함`·`상세` 버튼, 끝에 `선택한 것 등록`·`전부 등록`.
+          지난 일정은 빼고 건수만. 나뉜 메시지마다 그 쪽 항목의 본문 전체를 fallback 으로 준다(0.6.0: 제목만 보이던 문제).
+  agenda [--no-record]
+          업무 현황(0.6.0, 아침 보고 §5): 오늘 일정·마감 → 오늘 진행 확인 → 그 외 활성 업무(마감 없는 업무 포함) →
+          답변 대기·보류 → 승인 대기 → 반영·전달 점검. 활성 미완료 업무를 "외 N건"으로 숨기지 않고 페이지로 나눈다.
+          페이지마다 전달 기록(delivery_id)을 만들고, 보낸 뒤 claire_run deliver 로 성공·실패를 남긴다.
+  resend  전송 실패·확인 없는 페이지만 다시 보낼 페이로드 (같은 보고의 다른 페이지는 다시 보내지 않는다)
+
+--record KIND (build·approvals): 보낼 메시지를 전달 기록에 남긴다(KIND: brief|answer|list|approvals). 브리핑은
+--record brief --briefing <briefing_id>. 결과 messages[] 에 delivery_id·send_to 가 붙는다.
 
 버튼을 누르면 OpenClaw 가 Claire 에게 `Clicked "라벨".` 을 교수님 메시지로 넣어 준다. 라벨은 그대로 교수님이
 타이핑한 지시("CLR-0031 끝냈어")로 읽히도록 만든다. 클립보드가 없는 iPhone·iPad 에서도 탭 한 번이면 된다.
@@ -26,8 +35,9 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from claire_core import ClaireError, connect, get_item, normalize_ref, now_dt, parse_iso, run_cli, tz_of  # noqa: E402
+from claire_core import ClaireError, connect, get_item, normalize_ref, now_dt, now_iso, parse_iso, run_cli, tx, tz_of  # noqa: E402
 import claire_ops as ops  # noqa: E402
+import claire_track as track  # noqa: E402
 
 NUMBER_RE = re.compile(r"(?<![A-Za-z0-9-])((?:CLR|Q)-\d{3,6})(?!\d)")   # 한글이 바로 붙어도(CLR-0031로) 잡는다
 ONE_LINE_BLOCK_RE = re.compile(r"^\s*```\s*((?:CLR|Q)-\d{3,6})\s*```\s*$")
@@ -178,10 +188,7 @@ def _strip_private(block: dict) -> dict:
     return {k: v for k, v in block.items() if not k.startswith("_")}
 
 
-def cmd_build(args, cfg):
-    text = Path(args.file).read_text(encoding="utf-8") if args.file else sys.stdin.read()
-    if not text.strip():
-        raise ClaireError("empty_text", "본문이 비어 있습니다.")
+def build_messages(text: str, max_components: int = DEFAULT_MAX_COMPONENTS, max_chars: int = DEFAULT_MAX_CHARS) -> dict:
     units, mode = _parse_lines(text)
     blocks = _units_to_blocks(units)
     numbers: list[str] = []
@@ -193,7 +200,7 @@ def cmd_build(args, cfg):
     if not numbers:
         return {"mode": mode, "numbers": [], "messages": [],
                 "note": "번호가 없어 버튼을 만들지 않았습니다. 본문을 그대로 보내세요."}
-    chunks = _chunk(blocks, args.max_components, args.max_chars)
+    chunks = _chunk(blocks, max_components, max_chars)
     first_line = next((l.strip() for l in text.split("\n") if l.strip()), "")
     messages = []
     for idx, chunk in enumerate(chunks, 1):
@@ -217,9 +224,50 @@ def cmd_build(args, cfg):
                          "numbers": [n for n in numbers if any(
                              (b["type"] == "section" and b["accessory"]["button"]["label"] == n) or
                              (b["type"] == "actions" and any(x["label"] == n for x in b["buttons"])) for b in chunk)]})
-    return {"mode": mode, "numbers": numbers, "messages": messages,
-            "send_with": "message 도구: channel=discord, action=send, to=<채널>, message=<message>, components=<components>. "
-                         "보낸 뒤 최종 답변은 NO_REPLY. 도구가 없거나 실패하면 message 본문(복사 블록 포함)을 그대로 답한다."}
+    for m in messages:
+        m["problems"] = track.validate_message(m)
+    return {"mode": mode, "numbers": numbers, "messages": messages}
+
+
+SEND_WITH = ("message 도구: channel=discord, action=send, to=<send_to 또는 지금 대화 중인 채널>, message=<message>, "
+             "components=<components>. 한 쪽 보낼 때마다 claire_run deliver --id <delivery_id> --status sent "
+             "--message-id <결과 id> (실패면 --status failed --error). 다 보낸 뒤 최종 답변은 NO_REPLY. "
+             "도구가 없거나 실패하면 message 본문(복사 블록 포함)을 그대로 답하고 --status sent --via reply.")
+
+
+def _send_to(cfg) -> dict:
+    to = (cfg.get("discord") or {}).get("send_to")
+    return {"send_to": to} if to else {
+        "send_to": None,
+        "send_to_note": "config discord.send_to 가 없습니다. 대화 중이면 그 채널로, cron 턴이면 claire_check channel-target 으로 "
+                        "찾은 채널로 보내고 doctor 안내대로 설정하세요 (0.6.0: 전송 대상 미지정 실패)."}
+
+
+def _record(cfg, kind: str, messages: list[dict], *, report_key=None, check_refs=()) -> dict:
+    conn = connect(create=False)
+    with tx(conn):
+        return track.register_delivery(conn, cfg, kind, messages, now_iso(cfg), report_key=report_key, check_refs=check_refs)
+
+
+def cmd_build(args, cfg):
+    text = Path(args.file).read_text(encoding="utf-8") if args.file else sys.stdin.read()
+    if not text.strip():
+        raise ClaireError("empty_text", "본문이 비어 있습니다.")
+    out = build_messages(text, args.max_components, args.max_chars)
+    out.update(_send_to(cfg))
+    if args.record:
+        msgs = out["messages"] or [{"message": text.strip(), "components": None, "numbers": [], "index": 1, "of": 1,
+                                    "plain": True}]
+        key = f"brief:{args.briefing}" if args.record == "brief" and args.briefing else None
+        rec = _record(cfg, args.record, msgs, report_key=key)
+        out["report_key"] = rec["report_key"]
+        if out["messages"]:
+            out["messages"] = rec["messages"]
+        else:
+            out["plain_delivery_id"] = rec["messages"][0]["delivery_id"]
+            out["note"] += " 보낸 뒤 claire_run deliver --id <plain_delivery_id> --status sent --via reply."
+    out["send_with"] = SEND_WITH
+    return out
 
 
 # --------------------------------------------------------------------------
@@ -268,12 +316,15 @@ def _row(labels: list[tuple[str, str]]) -> dict:
 
 
 def _state_rows(ref: str, status: str) -> list[dict]:
+    """R5 — 동작마다 뜻이 다르다: 보류(재확인일에 다시 질문)·답변 대기(상대·다음 확인일)·처리 불필요/내 할 일 아님
+    (활성 목록에서 빠지고 이력 보관)·취소(업무 자체 취소). 달력·Tasks 표시 제외는 아래 승인 행에서 따로."""
     if status in ("captured", "needs_info", "todo", "in_progress"):
         return [_row([(f"{ref} 완료", "success"), (f"{ref} 진행 중", "primary"), (f"{ref} 보류", "secondary"),
-                      (f"{ref} 취소", "danger"), (f"{ref} 상세", "secondary")])]
+                      (f"{ref} 답변 대기", "secondary"), (f"{ref} 상세", "secondary")]),
+                _row([(f"{ref} 처리 불필요", "secondary"), (f"{ref} 내 할 일 아님", "secondary"), (f"{ref} 취소", "danger")])]
     if status in ("waiting", "on_hold"):
-        return [_row([(f"{ref} 완료", "success"), (f"{ref} 재개", "primary"), (f"{ref} 취소", "danger"),
-                      (f"{ref} 상세", "secondary")])]
+        return [_row([(f"{ref} 완료", "success"), (f"{ref} 재개", "primary"), (f"{ref} 상세", "secondary")]),
+                _row([(f"{ref} 처리 불필요", "secondary"), (f"{ref} 내 할 일 아님", "secondary"), (f"{ref} 취소", "danger")])]
     return [_row([(f"{ref} 다시 열어", "primary"), (f"{ref} 상세", "secondary")])]
 
 
@@ -289,6 +340,11 @@ def cmd_actions_item(conn, cfg, ref: str, detail: bool = False) -> dict:
     lines = [head, " · ".join(m for m in meta if m), ops.describe_state(conn, cfg, row)]
     if it.get("next_action"):
         lines.append(f"다음 행동: {it['next_action']}")
+    if status not in ("done", "cancelled"):
+        plan = track.check_plan(cfg, row, now_dt(cfg))
+        why = f" ({it['priority_reason']})" if it.get("priority_reason") else ""
+        nxt = f" · 다음 확인 {track.md(plan['next_on'])}" if plan.get("next_on") and not plan["due"] else ""
+        lines.append(f"중요도 {track.PRIORITY_KO.get(it['priority'], it['priority'])}{why}{nxt}")
     questions = [dict(q) for q in conn.execute(
         "SELECT ref, question, options FROM question WHERE item_id=? AND status='open' ORDER BY id", (it["id"],))]
     pending = [dict(r) for r in conn.execute(
@@ -317,8 +373,8 @@ def cmd_actions_item(conn, cfg, ref: str, detail: bool = False) -> dict:
     rows: list[dict] = _state_rows(ref, status)
     if pending:
         kinds = sorted({("달력" if p["op"].startswith("calendar") else "Tasks") for p in pending})
-        lines.append(f"승인 대기: {'·'.join(kinds)} 등록")
-        rows.append(_row([(f"{ref} 등록", "success"), (f"{ref} 등록 안 함", "secondary")]))
+        lines.append(f"승인 대기: {'·'.join(kinds)} 등록 (표시 안 함을 골라도 업무 추적은 계속됩니다)")
+        rows.append(_row([(f"{ref} 등록", "success")] + [(f"{ref} {k}에 표시 안 함", "secondary") for k in kinds]))
     elif status not in ("done", "cancelled") and sync["calendar"] in (None, "declined") and ops.calendar_eligible(cfg, row):
         rows.append(_row([(f"{ref} 달력 등록", "primary")]))
     for q in questions[:2]:
@@ -368,11 +424,11 @@ def cmd_actions(args, cfg):
 # 승인 대기 목록 (0.5.0)
 # --------------------------------------------------------------------------
 
-def cmd_approvals(args, cfg):
+def approval_messages(conn, cfg, include_past: bool = False, max_components: int = DEFAULT_MAX_COMPONENTS) -> dict:
     """아침 보고용 승인 대기 메시지. 달력·Tasks 를 나누고, 항목마다 제목·일시·업무 상태와 버튼을 붙인다.
-    지난 일정은 목록에서 빼고(기록은 그대로) 건수만 알린다. 버튼 없이 보낼 때를 위한 본문(message)도 준다."""
-    conn = connect(create=False)
-    q = ops.approval_queue(conn, cfg, now_dt(cfg), include_past=args.include_past)
+    지난 일정은 목록에서 빼고(기록은 그대로) 건수만 알린다. 버튼 없이 보낼 때를 위한 본문(message)도 준다.
+    나뉜 메시지마다 그 메시지에 실린 항목의 본문 전체를 message 로 준다 (0.6.0: 둘째 메시지부터 제목만 보이던 문제)."""
+    q = ops.approval_queue(conn, cfg, now_dt(cfg), include_past=include_past)
     total = q["counts"]["calendar"] + q["counts"]["tasks"]
     past = q["past_hidden"]
     past_note = ("지난 일정 " + " · ".join(f"{'달력' if k == 'calendar' else 'Tasks'} {v}건" for k, v in past.items())
@@ -381,8 +437,9 @@ def cmd_approvals(args, cfg):
         return {"count": 0, "messages": [], "past_hidden": past,
                 "text": ("승인 대기 없음" + (f" · {past_note}" if past_note else "")),
                 "note": "승인 대기가 없어 보낼 메시지가 없습니다."}
-    header = f"승인 대기 — 달력 {q['counts']['calendar']}건 · Tasks {q['counts']['tasks']}건"
+    header = f"승인 대기 — 달력 {q['counts']['calendar']}건 · Tasks {q['counts']['tasks']}건 (표시 안 함을 골라도 업무 추적은 계속됩니다)"
     units, fallback = [], [header]        # unit = 한 메시지 안에 붙어 있어야 하는 블록 묶음
+    unit_text: list[list[str]] = []       # unit 마다 fallback 줄 (나뉜 메시지의 본문)
     for key, label in (("calendar", "달력 등록 대기 (Google Calendar)"), ("tasks", "Tasks 등록 대기 (Obsidian Daily)")):
         rows = q[key]
         if not rows:
@@ -398,11 +455,13 @@ def cmd_approvals(args, cfg):
             unit += [{"type": "text", "text": f"{ref} {e['title']}\n{e['when']} · {state}{sel}"},
                      {"type": "actions", "buttons": [
                          {"label": f"{ref} {only} 등록", "style": "success"}, {"label": f"{ref} 선택", "style": "primary"},
-                         {"label": f"{ref} 등록 안 함", "style": "secondary"}, {"label": f"{ref} 상세", "style": "secondary"}]}]
+                         {"label": f"{ref} {only}에 표시 안 함", "style": "secondary"}, {"label": f"{ref} 상세", "style": "secondary"}]}]
             units.append(unit)
-            fallback.append(f"  {ref} {e['title']} — {e['when']} · {state}{sel}")
-            fallback.append(f"```{ref}```")
-    note = "번호로도 됩니다: `CLR-0045 등록`, `CLR-0045 CLR-0047 등록`, `CLR-0045 등록 안 함`, `다 등록`."
+            ut = ([label] if n == 0 else []) + [f"  {ref} {e['title']} — {e['when']} · {state}{sel}", f"```{ref}```"]
+            unit_text.append(ut)
+            fallback += ut[1:] if n == 0 else ut
+    note = ("번호로도 됩니다: `CLR-0045 등록`, `CLR-0045 CLR-0047 등록`, `CLR-0045 달력에 표시 안 함`, `다 등록`. "
+            "표시 안 함은 달력·Tasks 표시만 빼고 업무는 계속 추적합니다(업무를 뺄 때는 `처리 불필요`).")
     if past_note:
         note = past_note + "\n" + note
     tail = [{"type": "actions", "buttons": [{"label": "선택한 것 등록", "style": "success"},
@@ -414,24 +473,106 @@ def cmd_approvals(args, cfg):
     def cost(bs):
         return sum(1 if b["type"] == "text" else 1 + len(b["buttons"]) for b in bs)
 
-    limit = int(args.max_components)
-    chunks, cur = [], []
-    for u in units + [tail]:
+    limit = int(max_components)
+    unit_text.append(["", note])
+    chunks, texts, cur, cur_t = [], [], [], []
+    for u, t in zip(units + [tail], unit_text):
         if cur and 2 + cost(cur) + cost(u) > limit:
-            chunks.append(cur); cur = []
+            chunks.append(cur); texts.append(cur_t); cur, cur_t = [], []
         cur = cur + u
+        cur_t = cur_t + t
     if cur:
-        chunks.append(cur)
+        chunks.append(cur); texts.append(cur_t)
     messages = []
-    for i, ch in enumerate(chunks, 1):
+    for i, (ch, tx_lines) in enumerate(zip(chunks, texts), 1):
         suffix = f" (계속 {i}/{len(chunks)})" if i > 1 else ""
-        messages.append({"index": i, "of": len(chunks),
-                         "message": "\n".join(fallback) if i == 1 else header + suffix,
-                         "components": {"reusable": True, "text": header + suffix, "blocks": ch},
-                         "component_count": 2 + cost(ch)})
+        refs = [b["text"].split(" ", 1)[0] for b in ch if b["type"] == "text" and b["text"].startswith("CLR-")]
+        m = {"index": i, "of": len(chunks), "message": "\n".join([header + suffix] + tx_lines).rstrip(),
+             "components": {"reusable": True, "text": header + suffix, "blocks": ch},
+             "component_count": 2 + cost(ch), "numbers": refs}
+        m["problems"] = [p for p in track.validate_message(m) if not p.startswith("missing_button")]
+        messages.append(m)
     return {"count": total, "counts": q["counts"], "past_hidden": past, "selected": q["selected"],
-            "messages": messages, "text": "\n".join(fallback),
-            "send_with": "message 도구로 messages[] 를 순서대로 보낸다(components 그대로). 버튼을 못 쓰면 text 를 그대로 보낸다."}
+            "messages": messages, "text": "\n".join(fallback)}
+
+
+def cmd_approvals(args, cfg):
+    conn = connect(create=False)
+    out = approval_messages(conn, cfg, include_past=args.include_past, max_components=args.max_components)
+    out.update(_send_to(cfg))
+    if args.record and out["messages"]:
+        rec = _record(cfg, "approvals", out["messages"])
+        out.update(report_key=rec["report_key"], duplicate=rec["duplicate"], messages=rec["messages"])
+    out["send_with"] = SEND_WITH
+    return out
+
+
+# --------------------------------------------------------------------------
+# 업무 현황 (0.6.0, R2·R8)
+# --------------------------------------------------------------------------
+
+def agenda_messages(conn, cfg, now) -> dict:
+    """업무 현황(1–4) 페이지 + 승인 대기(5) + 반영·전달 점검(6). 모든 활성 미완료 업무가 번호 버튼과 함께 실린다."""
+    today = now.astimezone(tz_of(cfg)).strftime("%Y-%m-%d")
+    data = track.agenda_data(conn, cfg, now, overlays=track.overlay_on(conn, cfg, today))
+    text = track.agenda_text(cfg, data)
+    built = build_messages(text)
+    messages = built["messages"] or [{"index": 1, "of": 1, "message": text, "components": None, "numbers": [], "problems": []}]
+    ap = approval_messages(conn, cfg)
+    messages += ap["messages"]
+    h = track.health(conn, cfg, now, exclude_kind_today="agenda")
+    htext = track.health_text(h)
+    if htext:
+        messages.append({"message": htext, "components": {"reusable": True, "text": htext, "blocks": []}, "numbers": [],
+                         "problems": []})
+    for i, m in enumerate(messages, 1):
+        m["index"], m["of"] = i, len(messages)
+    return {"data": data, "text": text, "messages": messages, "approvals": ap["counts"] if ap.get("counts") else {},
+            "health": h}
+
+
+def cmd_agenda(args, cfg):
+    conn = connect(create=False)
+    now = now_dt(cfg)
+    out = agenda_messages(conn, cfg, now)
+    data = out["data"]
+    result = {"counts": data["counts"], "check_refs": data["check_refs"], "approvals": out["approvals"],
+              "health": {k: (v if k != "delivery" else {"count": v["count"]}) for k, v in out["health"].items()},
+              "text": out["text"], "messages": out["messages"]}
+    result.update(_send_to(cfg))
+    problems = [(m["index"], p) for m in out["messages"] for p in (m.get("problems") or [])]
+    if problems:
+        result["problems"] = [{"page": i, "problem": p} for i, p in problems]
+    if not args.no_record:
+        with tx(conn):
+            rec = track.register_delivery(conn, cfg, "agenda", out["messages"], now_iso(cfg), check_refs=data["check_refs"])
+        result.update(report_key=rec["report_key"], duplicate=rec["duplicate"], messages=rec["messages"])
+        if rec.get("resend"):
+            result["resend"] = True
+        if rec.get("message"):
+            result["message"] = rec["message"]
+    result["send_with"] = SEND_WITH
+    return result
+
+
+def cmd_resend(args, cfg):
+    """전송 실패·확인 없는 페이지만 다시 보낼 페이로드."""
+    conn = connect(create=False)
+    now = now_dt(cfg)
+    issues = track.delivery_issues(conn, cfg, now)
+    ids = args.id or [d["delivery_id"] for d in issues["failed"] + issues["unconfirmed"]]
+    msgs = []
+    for did in ids:
+        r = conn.execute("SELECT * FROM delivery WHERE id=?", (did,)).fetchone()
+        if r is None or r["status"] in ("sent", "superseded"):
+            continue
+        msgs.append({**json.loads(r["payload"]), "delivery_id": r["id"], "report_key": r["report_key"],
+                     "index": r["page"], "of": r["pages"], "previous_error": r["error"]})
+    out = {"count": len(msgs), "messages": msgs,
+           "message": f"다시 보낼 쪽 {len(msgs)}개" if msgs else "다시 보낼 쪽이 없습니다."}
+    out.update(_send_to(cfg))
+    out["send_with"] = SEND_WITH
+    return out
 
 
 # --------------------------------------------------------------------------
@@ -443,6 +584,8 @@ def build_parser():
     b.add_argument("--file", help="본문 파일 (없으면 stdin)")
     b.add_argument("--max-components", type=int, default=DEFAULT_MAX_COMPONENTS)
     b.add_argument("--max-chars", type=int, default=DEFAULT_MAX_CHARS)
+    b.add_argument("--record", choices=["brief", "answer", "list"], help="보낼 메시지를 전달 기록에 남긴다 (0.6.0)")
+    b.add_argument("--briefing", type=int, help="--record brief 일 때 claire_run brief 가 준 briefing_id")
     a = sub.add_parser("actions", help="항목·질문 카드와 다음 행동 버튼")
     a.add_argument("--item")
     a.add_argument("--question")
@@ -450,11 +593,17 @@ def build_parser():
     ap = sub.add_parser("approvals", help="승인 대기 목록 메시지 (달력/Tasks 구분)")
     ap.add_argument("--include-past", action="store_true")
     ap.add_argument("--max-components", type=int, default=DEFAULT_MAX_COMPONENTS)
+    ap.add_argument("--record", action="store_true", help="전달 기록에 남긴다 (0.6.0)")
+    ag = sub.add_parser("agenda", help="업무 현황 — 활성 미완료 업무 전체 (0.6.0)")
+    ag.add_argument("--no-record", action="store_true", help="전달 기록 없이 미리 보기")
+    rs = sub.add_parser("resend", help="전송 실패·확인 없는 페이지 다시 보내기")
+    rs.add_argument("--id", type=int, action="append", help="delivery_id (없으면 실패·확인 없는 쪽 전부)")
     return p
 
 
 def dispatch(args, cfg):
-    return {"build": cmd_build, "actions": cmd_actions, "approvals": cmd_approvals}[args.cmd](args, cfg)
+    return {"build": cmd_build, "actions": cmd_actions, "approvals": cmd_approvals, "agenda": cmd_agenda,
+            "resend": cmd_resend}[args.cmd](args, cfg)
 
 
 if __name__ == "__main__":
