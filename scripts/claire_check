@@ -114,10 +114,15 @@ def cmd_init(args, cfg):
     conn = connect(create=True)
     version = conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
     synced = is_synced_location(d)
+    # 0.6.1: 설치·업그레이드 때 바로 기존 업무 중요도 소급 분류(한 번)와 자동 마감 표시 보정 (다음 06:00 을 기다리지 않는다)
+    from claire_core import load_config, tx
+    import claire_track
+    with tx(conn):
+        upkeep = claire_track.upkeep(conn, load_config(), now_iso(cfg))
     return {
         "data_dir": str(d), "db": str(db_path()), "created": not existed,
         "schema_version": int(version["value"]), "claire_version": CLAIRE_VERSION,
-        "config_added_keys": added, "counts": table_counts(conn),
+        "config_added_keys": added, "counts": table_counts(conn), "upkeep": upkeep,
         "warning": (f"데이터 디렉터리가 {synced} 동기화 폴더 안에 있습니다. §4.2 위반입니다."
                     if synced else None),
         "message": "데이터베이스를 만들었습니다." if not existed else "이미 초기화되어 있습니다. 변경 없음.",

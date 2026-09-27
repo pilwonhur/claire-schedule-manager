@@ -58,9 +58,9 @@ def _item(r) -> dict:
         out["sync"] = ops.sync_state_of(conn, r)
         out["state_line"] = ops.describe_state(conn, cfg, r)
         out["status_label"] = ops.status_label(r)
-        out["time_kind"] = track.time_kind(r)
+        out["time_kind"] = track.time_kind(r, cfg)
         if "close_reason" in d:
-            plan = track.check_plan(cfg, r, now_dt(cfg))
+            plan = track.check_plan(cfg, r, now_dt(cfg), track.tracking_since(conn, cfg))
             out["tracking"] = {"priority": track.PRIORITY_KO.get(d["priority"]), "reason": d.get("priority_reason"),
                                "source": d.get("priority_source"), "check_due": plan["due"], "check_reason": plan["reason"],
                                "check_label": plan["label"],
@@ -242,6 +242,9 @@ def cmd_agenda(args, cfg):
     for key in ("today", "check", "upcoming"):
         for e in data[key]:
             e.pop("id", None)
+    for sl in data["series"]:
+        for e in sl["members"]:
+            e.pop("id", None)
     for g in list(data["open"].values()) + list(data["parked"].values()):
         for e in g:
             e.pop("id", None)
@@ -256,8 +259,10 @@ def cmd_importance_review(args, cfg):
     --set priority=high|normal --set priority_reason="..."` 로 확정한다. 교수님이 정한 중요도는 바꾸지 않는다."""
     conn = _ctx(connect(create=False), cfg)
     out = []
-    for r in conn.execute(f"SELECT * FROM item WHERE deleted_at IS NULL AND priority_source='unreviewed' AND {OPEN_SQL} "
-                          "ORDER BY id LIMIT ?", (args.limit,)):
+    # 직접 요청일 가능성이 큰 것부터: 회신 요청 → 잠정 높음 → 최근 (0.6.1). 소급 분류 전(NULL)도 포함.
+    unrev = "(priority_source='unreviewed' OR priority_source IS NULL)"
+    for r in conn.execute(f"SELECT * FROM item WHERE deleted_at IS NULL AND {unrev} AND {OPEN_SQL} "
+                          "ORDER BY (kind='reply') DESC, (priority='high') DESC, id DESC LIMIT ?", (args.limit,)):
         d = _item(r)
         d["sources"] = []
         for e in conn.execute("SELECT e.platform, e.headers, e.excerpt FROM item_source s JOIN source_event e "
@@ -266,7 +271,7 @@ def cmd_importance_review(args, cfg):
             d["sources"].append({"platform": e["platform"], "from": h.get("from"), "to": h.get("to"), "cc": h.get("cc"),
                                  "subject": h.get("subject"), "excerpt": (e["excerpt"] or "")[:300]})
         out.append(d)
-    total = conn.execute(f"SELECT COUNT(*) c FROM item WHERE deleted_at IS NULL AND priority_source='unreviewed' AND {OPEN_SQL}").fetchone()["c"]
+    total = conn.execute(f"SELECT COUNT(*) c FROM item WHERE deleted_at IS NULL AND {unrev} AND {OPEN_SQL}").fetchone()["c"]
     return {"count": total, "items": out,
             "rule": "직접 요청(교수님을 특정한 회신·행동 요청) → high, 단체 공통 요청 → normal, 단체라도 개인 의무(결재·필수 제출) → high. "
                     "수신자 수만으로 정하지 않는다. 근거를 priority_reason 에."}

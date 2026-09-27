@@ -54,12 +54,15 @@ done ─("다시 열어")─▶ todo  (reopen 이력)
 닫힌 업무 제외. 오늘 보고받았으면 묻지 않음. 대기·보류는 `next_check_at`(재확인일)이 되면 `recheck`. `captured`는 목록만.
 `review_after`(교수님 지정) 전에는 묻지 않음. 지난 회의 → `meeting_passed`, 기한 경과 → `overdue`, 당일 → `d_day`, 전날 → `d_minus_1`.
 그 밖에는 마지막 확인·보고·생성일에서 `check_every_days` 또는 중요도별 주기(high 1 · normal 2 · low 7일, normal·low 는 주말 제외).
-오늘 이미 물은 업무는 그날 내내 오늘의 확인 목록에 남는다(재실행해도 같은 보고).
+오늘 이미 물은 업무는 그날 내내 오늘의 확인 목록에 남는다(재실행해도 같은 보고). 추적 시작(`meta.tracking_since`) 전부터 있던 업무의
+첫 확인은 주기 안에서 번호 순으로 나눈다(0.6.1 — 업그레이드 첫날 밀린 업무가 한꺼번에 몰리지 않게).
 
 ## 시간 종류 (v3, `time_kind`)
 
 `appointment`(회의·수업·면담) · `work`(마감 아닌 항목에 교수님이 잡은 시간, `window_auto=0`) · `deadline_marker`(마감 전 자동 표시 구간,
-`window_auto=1`). 충돌(`overlaps`)은 appointment·work·overlay 끼리만. deadline_marker 끼리는 `deadline_clusters`(작업량 안내).
+`window_auto=1`, 또는 구간이 정확히 마감 N분 전~마감). 충돌(`overlaps`)은 appointment·work·overlay 끼리만. deadline_marker 끼리는
+`deadline_clusters`(작업량 안내). 표시가 꺼진 옛 마감 표시 구간은 `claire_track.upkeep`(설치·maintain·업무 현황)이 `window_auto=1`로 보정한다.
+Calendar 동기화는 시각을 순간(instant)으로 비교한다(표기만 다른 값을 "교수님이 옮김"으로 보지 않는다).
 
 ## 시각
 
@@ -69,7 +72,8 @@ done ─("다시 열어")─▶ todo  (reopen 이력)
 
 `SCHEMA_VERSION` 3(0.6.0). 기존 DB는 `connect()`가 열 때 `claire_core.migrate()`로 열만 추가한다(앞으로만, 멱등).
 v2→v3 은 값을 바꾸지 않는다(원본 ID·상태·완료 이력·"등록 안 함" 기록 보존). 기존 활성 업무의 중요도 소급 분류는 설정(본인 주소)이
-필요해서 첫 `claire_store maintain`이 한 번 한다(Discord 등록 → 높음, 메일 → 잠정값 + 검토 필요, 캘린더·Obsidian → 보통, 이미 높음은 유지).
+필요해서 `claire_track.upkeep`이 한다 — 설치(`claire_check init`)·`maintain`·업무 현황 앞에서, 분류 없는 활성 업무만 골라 멱등하게
+(Discord 등록 → 높음, 메일 → 잠정값 + 검토 필요, 캘린더·Obsidian → 보통, 이미 높음은 유지).
 `install.sh`는 버전이 바뀌면 변환 전에 `backups/pre-upgrade-<이전>-to-<새>-<시각>/claire.db`를 남긴다.
 v1 코드는 v2 DB를 읽을 수 있다(추가 열만 있음). 완전히 되돌리려면 그 사본을 복원한다(`recovery-policy.md`).
 테스트·재현용으로 `CLAIRE_NOW` 환경변수가 현재 시각을 고정한다.

@@ -341,7 +341,7 @@ def cmd_actions_item(conn, cfg, ref: str, detail: bool = False) -> dict:
     if it.get("next_action"):
         lines.append(f"다음 행동: {it['next_action']}")
     if status not in ("done", "cancelled"):
-        plan = track.check_plan(cfg, row, now_dt(cfg))
+        plan = track.check_plan(cfg, row, now_dt(cfg), track.tracking_since(conn, cfg))
         why = f" ({it['priority_reason']})" if it.get("priority_reason") else ""
         nxt = f" · 다음 확인 {track.md(plan['next_on'])}" if plan.get("next_on") and not plan["due"] else ""
         lines.append(f"중요도 {track.PRIORITY_KO.get(it['priority'], it['priority'])}{why}{nxt}")
@@ -511,13 +511,84 @@ def cmd_approvals(args, cfg):
 # 업무 현황 (0.6.0, R2·R8)
 # --------------------------------------------------------------------------
 
-def agenda_messages(conn, cfg, now) -> dict:
-    """업무 현황(1–4) 페이지 + 승인 대기(5) + 반영·전달 점검(6). 모든 활성 미완료 업무가 번호 버튼과 함께 실린다."""
+COMPACT_GROUP = 5          # 2~4구역: 다섯 줄마다 번호 버튼 한 줄 (메시지당 약 25건, 줄마다 버튼이면 약 11건)
+
+
+def _agenda_units(rows: list[dict]) -> list[dict]:
+    """업무 현황 줄 → 메시지 안에서 떨어지면 안 되는 블록 묶음(unit).
+    1구역(오늘)은 줄마다 오른쪽 번호 버튼(section). 2~4구역은 다섯 줄 text + 그 번호 버튼 한 줄(actions).
+    구역 제목·소제목·버튼 없는 줄은 다음 묶음 앞에 붙여 메시지 끝에 홀로 남지 않게 한다."""
+    units: list[dict] = []
+    pending: list[str] = []
+    group: list[tuple[str, str]] = []
+
+    def flush_group():
+        nonlocal pending, group
+        if not group:
+            return
+        lines = pending + [line for line, _ in group]
+        raw = pending + [x for line, ref in group for x in (line, f"```{ref}```")]
+        units.append({"blocks": [{"type": "text", "text": "\n".join(lines)},
+                                 {"type": "actions", "buttons": [_button(ref) for _, ref in group]}],
+                      "raw": raw, "numbers": [ref for _, ref in group]})
+        pending, group = [], []
+
+    for r in rows:
+        if not r.get("ref"):
+            flush_group()
+            pending.append(r.get("heading") or r["text"])
+            continue
+        if r["section"] == "1":
+            flush_group()
+            blocks = [{"type": "text", "text": "\n".join(pending)}] if pending else []
+            blocks.append({"type": "section", "text": r["text"].rstrip(),
+                           "accessory": {"type": "button", "button": _button(r["ref"])}})
+            units.append({"blocks": blocks, "raw": pending + [r["text"], f"```{r['ref']}```"], "numbers": [r["ref"]]})
+            pending = []
+            continue
+        group.append((r["text"], r["ref"]))
+        if len(group) == COMPACT_GROUP:
+            flush_group()
+    flush_group()
+    if pending:
+        units.append({"blocks": [{"type": "text", "text": "\n".join(pending)}], "raw": list(pending), "numbers": []})
+    return units
+
+
+def _chunk_units(units: list[dict], max_components: int, max_chars: int) -> list[list[dict]]:
+    chunks, cur, used, chars = [], [], 2, 0          # 2 = 컨테이너 + 머리글
+    for u in units:
+        c = sum(_cost(b) for b in u["blocks"])
+        n = sum(_chars(b) for b in u["blocks"])
+        if cur and (used + c > max_components or chars + n > max_chars):
+            chunks.append(cur)
+            cur, used, chars = [], 2, 0
+        cur.append(u)
+        used += c
+        chars += n
+    if cur:
+        chunks.append(cur)
+    return chunks
+
+
+def agenda_messages(conn, cfg, now, max_components: int = DEFAULT_MAX_COMPONENTS, max_chars: int = DEFAULT_MAX_CHARS) -> dict:
+    """업무 현황(1–4) 쪽들 + 승인 대기(5) + 반영·전달 점검(6). 모든 활성 미완료 업무가 번호 버튼과 함께 실린다
+    (앞으로의 정기 일정은 시리즈마다 한 줄 — 버튼은 다음 회차)."""
     today = now.astimezone(tz_of(cfg)).strftime("%Y-%m-%d")
     data = track.agenda_data(conn, cfg, now, overlays=track.overlay_on(conn, cfg, today))
     text = track.agenda_text(cfg, data)
-    built = build_messages(text)
-    messages = built["messages"] or [{"index": 1, "of": 1, "message": text, "components": None, "numbers": [], "problems": []}]
+    header = track.agenda_header(data)
+    chunks = _chunk_units(_agenda_units(track.agenda_rows(cfg, data)), max_components, max_chars)
+    messages = []
+    for i, chunk in enumerate(chunks, 1):
+        head = header if i == 1 else f"{header} (계속 {i}/{len(chunks)})"
+        blocks = [b for u in chunk for b in u["blocks"]]
+        m = {"message": "\n".join([head] + [line for u in chunk for line in u["raw"]]),
+             "components": {"reusable": True, "text": head, "blocks": blocks},
+             "numbers": [n for u in chunk for n in u["numbers"]],
+             "component_count": 2 + sum(_cost(b) for b in blocks)}
+        m["problems"] = track.validate_message(m)
+        messages.append(m)
     ap = approval_messages(conn, cfg)
     messages += ap["messages"]
     h = track.health(conn, cfg, now, exclude_kind_today="agenda")
@@ -534,9 +605,12 @@ def agenda_messages(conn, cfg, now) -> dict:
 def cmd_agenda(args, cfg):
     conn = connect(create=False)
     now = now_dt(cfg)
+    with tx(conn):
+        upkeep = track.upkeep(conn, cfg, now_iso(cfg))      # 중요도 소급 분류(한 번)·자동 마감 표시 보정 (멱등)
     out = agenda_messages(conn, cfg, now)
     data = out["data"]
-    result = {"counts": data["counts"], "check_refs": data["check_refs"], "approvals": out["approvals"],
+    result = {"counts": data["counts"], "coverage": data["coverage"], "upkeep": upkeep,
+              "check_refs": data["check_refs"], "approvals": out["approvals"],
               "health": {k: (v if k != "delivery" else {"count": v["count"]}) for k, v in out["health"].items()},
               "text": out["text"], "messages": out["messages"]}
     result.update(_send_to(cfg))

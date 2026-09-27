@@ -1,6 +1,6 @@
 ---
 name: claire-schedule-manager
-version: 0.6.0
+version: 0.6.1
 description: >-
   교수님의 일정·업무를 Gmail(기관 메일 포워드 포함)·Google Calendar·Obsidian Tasks·Discord 이미지에서
   하나의 장부(SQLite)로 모아 아침 브리핑·확인 질문·진행 추적·검색을 제공한다. Claire 전용 Discord 채널에서
@@ -12,7 +12,7 @@ description: >-
   Calendar·Obsidian 반영(승인 대기열), 보고 전달 기록까지 동작한다.
 ---
 
-# Claire 통합 일정·업무 관리 (v0.6.0 — 완료까지 추적: 업무 현황·중요도별 진행 확인·전달 기록)
+# Claire 통합 일정·업무 관리 (v0.6.1 — 완료까지 추적: 업무 현황·중요도별 진행 확인·전달 기록)
 
 정본 설계: 프로젝트의 `PRD.md` v1.9. 이 문서는 판단 계층(Claire)이 지켜야 할 규칙과 절차만 적는다.
 **스킬 파일은 고치지 않는다.** 규칙을 바꿔야 하면 교수님께 제안만 하고, 변경은 저장소 → 릴리스 → `claire-update`로 들어온다(§8).
@@ -55,6 +55,8 @@ $S/claire_store progress|wait|hold|cancel|reopen|update ...       # §4 표 참�
 $S/claire_store hold --item CLR [--until YYYY-MM-DD] [--reason]   # 보류 = 재확인일에 다시 묻는다 (기본 7일 뒤)
 $S/claire_store dismiss --item CLR[,CLR…] --why not_needed|not_mine [--reason]   # 처리 불필요 / 내 할 일 아님 (이력 보관, reopen 으로 되돌림)
 $S/claire_store link-task --item <일정 CLR> --role prep|followup --title "…" [--due-at] # 일정의 준비·후속 업무 (따로 완료)
+$S/claire_store prep-template --add "로봇공학" [--days-before 1] [--due-time 18:00] [--title "{title} 준비"] | --remove "…" | (목록)
+$S/claire_store complete --past-meetings --evidence user_report --note "교수님 보고" [--before YYYY-MM-DD] --apply   # "지난 일정 다 끝났어"만
 $S/claire_store undo [--action-id N] --apply
 $S/claire_apply --run <id>                        # outbox 실행 (승인된 것만) + Daily 완료 기록 누락 대조. to_deliver 는 채널에 전달
 $S/claire_apply --approvals                       # 승인 대기 목록: 달력 / Tasks 구분, 지난 일정 제외(건수만)
@@ -110,8 +112,9 @@ OpenClaw cron이 "일일 점검을 실행하고 브리핑을 보내세요"를 �
      "미처리 N묶음, 다음 점검에서 계속"을 쓴다). 첫 실행은 백로그가 크므로 여러 회 반복이 정상이다.
 6. claire_store maintain --run <id>      (질문 정리, 0.6.0: 기존 업무 중요도 소급 분류 1회·승인된 준비 템플릿)
    claire_search review --run <id>
-   review.tracking.importance_unreviewed 가 있으면 claire_search importance-review 로 최대 10건 원문을 보고 §3.2 대로
-   request_scope·priority·priority_reason 을 확정한다(update --actor claire). 애매하면 그대로 둔다(보통 중요도로 추적은 된다).
+   review.tracking.importance_unreviewed 가 있으면 claire_search importance-review 로 최대 20건 원문을 보고 §3.2 대로
+   request_scope·priority·priority_reason 을 확정한다(update --actor claire). 목록은 회신 요청·잠정 높음·최근 순이다.
+   애매하면 그대로 둔다(보통 중요도로 추적은 된다). 소급 분류 자체는 설치·maintain·업무 현황이 자동으로 한다(0.6.1).
 7. [Claire] 브리핑 작성 (references/briefing-format.md) → 파일로 저장
      0.6.0: 브리핑은 머리글·신규·변경·확인 필요(질문)·반영 상태·참고만 쓴다. 오늘 일정·진행 확인·전체 목록·승인 대기·
      점검은 9단계 업무 현황이 맡으므로 브리핑에 다시 나열하지 않는다(같은 번호를 두 번 묻지 않게).
@@ -209,6 +212,7 @@ OpenClaw cron(`claire-checkin`, `0 12,18 * * *`)이 "미등록 일정 확인을 
   확보했다는 뜻이 아니다. 자동 마감 표시끼리 겹친 것을 "일정 충돌"이라고 말하지 않는다 — 도구의 `deadline_clusters`는
   "18:00 마감 2건 — 작업량 안내"로만 쓴다. 충돌 경고는 도구의 `overlaps`(실제 약속·교수님이 잡은 작업 시간·가족 일정끼리)만 쓴다.
   교수님이 "10시부터 12시까지 작업 시간 잡아줘"라고 하면 `update --set start_at=… --set end_at=…`(작업 예약, `time_kind: work`).
+  구간이 정확히 "마감 1시간 전~마감"이면 도구가 자동 마감 표시로 본다(0.6.1) — 제안에 그 구간을 직접 적을 필요가 없다(`due_at`만).
 
 ### 3.2 중요도와 진행 확인 (0.6.0, R3)
 
@@ -260,7 +264,8 @@ OpenClaw cron(`claire-checkin`, `0 12,18 * * *`)이 "미등록 일정 확인을 
 | "보고 다시", "안 온 쪽 다시" | `claire_buttons resend` → 그 쪽만 보내고 deliver |
 | "이건 10월에 다시 물어봐", "3일마다만 물어봐", "이건 중요해/덜 중요해" | `claire_store update --item CLR --set review_after=2026-10-01` / `--set check_every_days=3` / `--set priority=high\|normal\|low` (교수님 지정은 Claire 가 바꾸지 않는다) |
 | "수업 준비 추가", "회의 끝나고 자료 공유할 일도" | `claire_store link-task --item <일정 CLR> --role prep\|followup --title "…" [--due-at …]`. 일정 완료가 이 업무를 완료시키지 않는다고 결과 `message`대로 전한다 |
-| "지난 일정 다 끝났어", "어제 수업·회의 다 했어" | 업무 현황 "지난 일정 — 완료 체크"에 있던 번호들로 `claire_store complete --item CLR-a,CLR-b --evidence user_report --note "교수님 보고" --apply` |
+| "지난 일정 다 끝났어", "어제 수업·회의 다 했어" | 전부면 `claire_store complete --past-meetings --evidence user_report --note "교수님 보고" --apply` (끝난 일정 중 열린 것 전부, 어제까지만이면 `--before <오늘 날짜>`). 일부면 번호로 `--item CLR-a,CLR-b`. 교수님이 말했을 때만 — 시각이 지났다고 스스로 완료하지 않는다 |
+| "로봇공학 수업마다 전날 18시까지 준비 업무 만들어줘", "준비 템플릿 뭐 있어?", "그 템플릿 지워" | `claire_store prep-template --add "로봇공학" --days-before 1 --due-time 18:00` (제목 일부로 맞춘다. 어느 수업인지 불명확하면 묻는다) / 인자 없이 목록 / `--remove "로봇공학"`. 다음 매일 점검부터 14일 안의 회차에 준비 업무가 생긴다. 교수님이 정하지 않은 수업에 템플릿을 만들지 않는다 |
 | `Clicked "선택한 것 등록".` / `"전부 등록"` / `"선택 해제"` | `claire_apply --confirm selected` / `--confirm all` / `--unselect all`. 승인했으면 바로 `claire_apply` 실행 후 결과(등록된 제목·일시) 보고. `all`은 목록에 보인 것(지난 일정 제외)만이다 |
 | `Clicked "18:00 미등록 일정 없음".` | §2.1 |
 | 만료된 버튼 대신 번호를 적음: `31 완료`, `clr31 보류`, `0031 상세`, `45 47 등록` | 짧은 번호를 `CLR-0031`로 읽고 위 버튼 행과 똑같이 처리한다. 여러 번호 승인은 `--confirm CLR-0045,CLR-0047` |
@@ -341,6 +346,12 @@ OpenClaw cron(`claire-checkin`, `0 12,18 * * *`)이 "미등록 일정 확인을 
 → **5 승인 대기 목록** → **6 반영·전달 점검**(반영 실패, 전송 실패·확인 없음, 누락 감지, 중요도 검토 건수).
 
 - 한 업무는 주된 구역 한 곳에만 나온다. 활성 미완료 업무는 모두 번호 버튼과 함께 실린다(숫자로 접지 않는다). 쪽이 여러 개면 모두 보낸다.
+- **앞으로의 정기 일정은 시리즈마다 한 줄이다 (교수님 결정 2026-09-27, 0.6.1).** `MC2103 수업 · 매주 화·목 09:00 · 다음 9/29(화) 09:00
+  (CLR-0801) · 앞으로 24회` — 버튼은 다음 회차. 단발 일정은 기간과 관계없이 모두 하나씩 나온다. 이것은 R2 "전체 항목 노출"을 교수님과 합의한
+  방식이며 위반이 아니다. 오늘·내일·지난 회차는 각자 1·2구역에 하나씩 나온다.
+- **빠짐 검사:** `claire_buttons agenda` 결과 `coverage`(active·listed·in_series_lines·missing·duplicated). `missing`이 비어 있으면
+  모든 활성 업무가 어느 구역이나 시리즈 줄에 실린 것이다. 비어 있지 않으면 교수님께 그대로 알린다(도구 오류).
+- 2~4구역은 다섯 줄마다 번호 버튼 한 줄(메시지당 약 25건), 1구역(오늘)은 줄마다 오른쪽 버튼이다.
 - 모든 목록 항목에 매일 답을 요구하지 않는다. 진행 확인 질문은 2구역(과 1구역의 "진행 확인" 표시)만이다. 교수님이 번호를 누르면 카드
   (`완료`·`진행 중`·`보류`·`답변 대기`·`처리 불필요`·`내 할 일 아님`·`취소`)로 답한다.
 - 같은 날 다시 만들면 내용이 같을 때 `duplicate`(보내지 않음) 또는 `resend`(안 간 쪽만)다. 같은 질문을 같은 날 다시 세지 않는다.

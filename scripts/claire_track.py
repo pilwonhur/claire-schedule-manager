@@ -110,13 +110,13 @@ def origins_of(conn, item_id: int) -> list[dict]:
 
 
 def backfill_importance(conn, cfg, ts: str) -> dict:
-    """기존 활성 업무의 중요도 소급 분류 (한 번, maintain 이 부른다). 원본 상태·이력은 바꾸지 않는다.
+    """중요도가 분류되지 않은(priority_source 없음) 활성 업무의 소급 분류. 원본 상태·이력은 바꾸지 않는다.
+    0.6.1: 한 번만 도는 표시를 두지 않는다 — 분류 없는 업무만 고르므로 여러 번 불러도 같고(멱등), 업그레이드 뒤 설치·점검·업무 현황
+    어느 쪽이 먼저 불러도 된다. 결과 done 은 이번에 분류한 업무가 있었는지.
     - Discord 직접 등록 → 높음(규칙)
     - 메일: 교수님 주소가 유일한 받는 사람(To)이면 잠정 높음, 아니면 보통. 둘 다 '검토 필요'로 남겨 Claire 가 확정한다
       (수신자 수만으로 정하지 않는다 — 잠정값일 뿐이고 근거를 적는다).
     - 캘린더·Obsidian → 보통(규칙)"""
-    if meta_get(conn, "importance_backfilled"):
-        return {"done": False, "note": "이미 소급 분류함"}
     me = {a.lower() for a in cfg["gmail"].get("user_addresses", [])}
     changed, review = [], []
     rows = conn.execute("SELECT * FROM item WHERE deleted_at IS NULL AND priority_source IS NULL AND status IN (%s)"
@@ -152,21 +152,46 @@ def backfill_importance(conn, cfg, ts: str) -> dict:
             changed.append(it["ref"])
         conn.execute("UPDATE item SET priority=?, priority_source=?, priority_reason=?, "
                      "request_scope=COALESCE(request_scope, ?) WHERE id=?", (pri, src, why, scope, it["id"]))
-    conn.execute("INSERT INTO meta(key,value) VALUES('importance_backfilled',?) ON CONFLICT(key) DO NOTHING", (ts,))
-    return {"done": True, "items": len(rows), "changed": changed, "needs_review": review}
+    if rows:
+        conn.execute("INSERT INTO meta(key,value) VALUES('importance_backfilled',?) ON CONFLICT(key) DO NOTHING", (ts,))
+    return {"done": bool(rows), "items": len(rows), "changed": changed, "needs_review": review}
+
+
+def repair_deadline_markers(conn, cfg, ts: str) -> list[str]:
+    """0.6.1: 구간이 정확히 '마감 1시간 전~마감'인데 자동 표시(window_auto)가 꺼진 열린 업무를 자동 마감 표시로 되돌린다.
+    0.5.0 전에 직접 넣은 구간·제안에 구간을 함께 준 경우·Calendar 동기화의 표기 차이로 꺼진 경우. 멱등."""
+    fixed = []
+    for it in conn.execute("SELECT * FROM item WHERE deleted_at IS NULL AND kind<>'meeting' AND window_auto=0 "
+                           "AND due_precision='time' AND start_at IS NOT NULL AND end_at IS NOT NULL AND status IN (%s)"
+                           % ",".join("?" * len(OPEN_STATUSES)), OPEN_STATUSES).fetchall():
+        if ops.is_default_window(cfg, it):
+            conn.execute("UPDATE item SET window_auto=1 WHERE id=?", (it["id"],))
+            log_activity(conn, item_id=it["id"], action="update", actor="claire", ts=ts, field="window_auto", old_value=0,
+                         new_value=1, reason="마감 1시간 전~마감 구간 → 자동 마감 표시로 보정 (작업 예약 아님)",
+                         payload={"before": {"window_auto": 0}})
+            fixed.append(it["ref"])
+    return fixed
+
+
+def upkeep(conn, cfg, ts: str) -> dict:
+    """설치(claire_check init)·매일 점검(maintain)·업무 현황(agenda) 앞에서 도는 멱등 정리.
+    기존 업무 중요도 소급 분류(한 번)와 자동 마감 표시 보정."""
+    return {"importance_backfill": backfill_importance(conn, cfg, ts),
+            "markers_repaired": repair_deadline_markers(conn, cfg, ts)}
 
 
 # --------------------------------------------------------------------------
 # 시간 종류 (R7)
 # --------------------------------------------------------------------------
 
-def time_kind(item) -> str | None:
-    """appointment(실제 약속: 회의·수업·면담) · work(교수님이 잡은 작업 시간) · deadline_marker(마감 전 자동 표시 구간)."""
+def time_kind(item, cfg=None) -> str | None:
+    """appointment(실제 약속: 회의·수업·면담) · work(교수님이 잡은 작업 시간) · deadline_marker(마감 전 자동 표시 구간).
+    0.6.1: 구간이 정확히 '마감 1시간 전~마감'이면 window_auto 표시가 없어도 자동 마감 표시로 본다 (0.5.0 전에 직접 넣은 구간 등)."""
     start = _get(item, "start_at")
     if item["kind"] == "meeting":
         return "appointment" if start else None
     if start and len(start) > 10:
-        return "deadline_marker" if _get(item, "window_auto") else "work"
+        return "deadline_marker" if (_get(item, "window_auto") or ops.is_default_window(cfg, item)) else "work"
     return None
 
 
@@ -216,7 +241,7 @@ def deadline_clusters(cfg, items: list) -> list[dict]:
     """1시간 안에 몰린 마감(자동 표시 구간끼리 겹침). 충돌이 아니라 작업량 안내다."""
     need = int(cfg.get("tracking", {}).get("deadline_cluster_min", 2))
     marks = sorted(((parse_iso(i["due_at"]), i) for i in items
-                    if time_kind(i) == "deadline_marker" and i["due_at"]), key=lambda x: x[0])
+                    if time_kind(i, cfg) == "deadline_marker" and i["due_at"]), key=lambda x: x[0])
     out, group = [], []
     for due, it in marks:
         if group and (due - group[0][0]) > timedelta(hours=1):
@@ -237,8 +262,8 @@ def day_conflicts(conn, cfg, day: date, overlays: list[dict] | None = None) -> d
     rows = [r for r in conn.execute(
         "SELECT * FROM item WHERE deleted_at IS NULL AND start_at IS NOT NULL AND status IN (%s)"
         % ",".join("?" * len(OPEN_STATUSES)), OPEN_STATUSES) if local_date(cfg, r["start_at"]) == day]
-    blocks = [{"ref": r["ref"], "title": r["title"], "kind": time_kind(r), "span": _span(r["start_at"], r["end_at"])}
-              for r in rows if time_kind(r) in ("appointment", "work")]
+    blocks = [{"ref": r["ref"], "title": r["title"], "kind": time_kind(r, cfg), "span": _span(r["start_at"], r["end_at"])}
+              for r in rows if time_kind(r, cfg) in ("appointment", "work")]
     for o in overlays or []:
         blocks.append({"ref": f"overlay:{o['calendar']}", "title": o["summary"], "kind": "overlay",
                        "span": _span(o.get("start"), o.get("end"))})
@@ -255,9 +280,16 @@ def interval_days(cfg, item) -> int:
     return int(cfg.get("tracking", {}).get("interval_days", {}).get(item["priority"], 2))
 
 
-def check_plan(cfg, item, now: datetime) -> dict:
+def tracking_since(conn, cfg) -> date | None:
+    """노출·진행 확인 추적을 시작한 날 (스키마 v3 변환 시각)."""
+    return local_date(cfg, meta_get(conn, "tracking_since"))
+
+
+def check_plan(cfg, item, now: datetime, since: date | None = None) -> dict:
     """오늘 이 업무의 진행을 물어야 하는가. {due, reason, label, next_on}.
-    답이 없다고 완료·취소·중요도 하향하지 않는다. 같은 날 보고받았으면 그날 다시 묻지 않는다."""
+    답이 없다고 완료·취소·중요도 하향하지 않는다. 같은 날 보고받았으면 그날 다시 묻지 않는다.
+    since(추적 시작일)를 주면, 그 전부터 있던 업무의 첫 확인을 주기 안에서 번호 순으로 나눈다(0.6.1) —
+    업그레이드 첫날 밀린 업무 전체가 한꺼번에 '오늘 진행 확인'에 몰리고, 이후에도 같은 날끼리 묶여 반복되지 않게."""
     tr = cfg.get("tracking", {})
     today = now.astimezone(tz_of(cfg)).date()
     tomorrow = today + timedelta(days=1)
@@ -280,7 +312,7 @@ def check_plan(cfg, item, now: datetime) -> dict:
     if ra and ra > today:
         return {**out, "reason": "snoozed", "label": f"{md(ra)}부터 다시 확인", "next_on": ra}
     kind = item["kind"]
-    start_d = local_date(cfg, item["start_at"]) if kind == "meeting" or time_kind(item) == "work" else None
+    start_d = local_date(cfg, item["start_at"]) if kind == "meeting" or time_kind(item, cfg) == "work" else None
     due_d = local_date(cfg, item["due_at"])
     if kind == "meeting" and item["start_at"] and start_d and start_d < today:
         sp = _span(item["start_at"], item["end_at"])
@@ -303,8 +335,13 @@ def check_plan(cfg, item, now: datetime) -> dict:
         reason = "daily" if n == 1 else "cadence"
         return {"due": True, "reason": reason, "label": REASON_KO[reason].format(n=n), "next_on": today,
                 "asked_today": True}
-    base = max(d for d in (asked, local_date(cfg, _get(item, "last_reported_at")), local_date(cfg, item["created_at"])) if d)
-    nxt = add_days(base, n, skip)
+    reported = local_date(cfg, _get(item, "last_reported_at"))
+    created = local_date(cfg, item["created_at"])
+    if since and asked is None and reported is None and created and created < since:
+        nxt = add_days(since, (int(_get(item, "id") or 0) % n), skip) if n > 1 else since
+    else:
+        base = max(d for d in (asked, reported, created) if d)
+        nxt = add_days(base, n, skip)
     if nxt <= today:
         reason = "daily" if n == 1 else "cadence"
         return {"due": True, "reason": reason, "label": REASON_KO[reason].format(n=n), "next_on": today}
@@ -347,7 +384,7 @@ def _entry(conn, cfg, it, plan) -> dict:
             "priority_label": PRIORITY_KO.get(it["priority"]), "priority_source": it["priority_source"],
             "request_scope": it["request_scope"], "scope_label": SCOPE_KO.get(it["request_scope"] or ""),
             "due_at": it["due_at"], "due_text": _due_text(cfg, it), "start_at": it["start_at"], "end_at": it["end_at"],
-            "time_kind": time_kind(it), "next_action": it["next_action"], "waiting_on": it["waiting_on"],
+            "time_kind": time_kind(it, cfg), "next_action": it["next_action"], "waiting_on": it["waiting_on"],
             "next_check_at": it["next_check_at"], "blocked_reason": it["blocked_reason"],
             "check": {**plan, "next_on": plan["next_on"].isoformat() if plan.get("next_on") else None},
             "external": _ext_note(conn, it)}
@@ -360,11 +397,11 @@ def agenda_data(conn, cfg, now: datetime, overlays: list[dict] | None = None) ->
     3 open    그 외 진행 중·할 일·확인 필요·참고 (마감 없는 업무 포함) + 앞으로의 일정
     4 parked  답변 대기·보류 (다음 확인일 표시, 그 전에는 묻지 않는다)"""
     tz = tz_of(cfg)
-    tr = cfg.get("tracking", {})
     today = now.astimezone(tz).date()
+    since = tracking_since(conn, cfg)
     rows = conn.execute("SELECT * FROM item WHERE deleted_at IS NULL AND status IN (%s) ORDER BY id"
                         % ",".join("?" * len(OPEN_STATUSES)), OPEN_STATUSES).fetchall()
-    entries = {r["id"]: _entry(conn, cfg, r, check_plan(cfg, r, now)) for r in rows}
+    entries = {r["id"]: _entry(conn, cfg, r, check_plan(cfg, r, now, since)) for r in rows}
     by_id = {r["id"]: r for r in rows}
 
     def rel(item_id, rel_type, outgoing: bool):
@@ -378,6 +415,7 @@ def agenda_data(conn, cfg, now: datetime, overlays: list[dict] | None = None) ->
     for r in rows:
         e = entries[r["id"]]
         tk = e["time_kind"]
+        e["series_key"] = r["series_key"]
         if r["kind"] == "meeting" and local_date(cfg, r["start_at"]) == today:
             e["role"] = "meeting"
             e["when"] = "종일" if r["all_day"] else f"{_hm(cfg, r['start_at'])}" + (f"–{_hm(cfg, r['end_at'])}" if r["end_at"] and len(r["end_at"]) > 10 else "")
@@ -405,8 +443,8 @@ def agenda_data(conn, cfg, now: datetime, overlays: list[dict] | None = None) ->
                                    0 if e["priority"] == "high" else 1, e["id"]))
     used |= {e["id"] for e in check_list}
 
-    horizon = today + timedelta(days=int(tr.get("upcoming_meeting_days", 7)))
-    upcoming, later = [], 0
+    upcoming = []                                   # 앞으로의 단발 일정 — 모두 하나씩 (0.6.1: 기간 제한·건수 접기 없음)
+    series_members: dict[str, list[dict]] = {}      # 앞으로의 정기 일정 — 시리즈마다 한 줄 (교수님 결정 2026-09-27)
     parked = {"waiting": [], "on_hold": []}
     groups = {"in_progress": [], "todo": [], "needs_info": [], "captured": []}
     for i, e in entries.items():
@@ -416,29 +454,76 @@ def agenda_data(conn, cfg, now: datetime, overlays: list[dict] | None = None) ->
         if r["status"] in ("waiting", "on_hold"):
             parked[r["status"]].append(e)
             continue
-        if r["kind"] == "meeting" and r["start_at"] and local_date(cfg, r["start_at"]) > today:
-            if local_date(cfg, r["start_at"]) <= horizon:
-                e["when"] = ops.fmt_when(cfg, r["start_at"], r["end_at"], bool(r["all_day"]))
-                upcoming.append(e)
+        if r["kind"] == "meeting" and r["start_at"] and local_date(cfg, r["start_at"]) > today \
+                and r["status"] in ("todo", "in_progress"):
+            e["when"] = ops.fmt_when(cfg, r["start_at"], r["end_at"], bool(r["all_day"]))
+            if r["series_key"]:
+                series_members.setdefault(r["series_key"], []).append(e)
             else:
-                later += 1
+                upcoming.append(e)
             continue
         groups.get(r["status"], groups["todo"]).append(e)
+    series = []
+    for key, members in series_members.items():
+        members.sort(key=lambda e: e["start_at"] or "")
+        if len(members) == 1:
+            upcoming.append(members[0])             # 남은 회차가 하나면 단발 일정처럼
+            continue
+        series.append(_series_line(cfg, key, members))
+    series.sort(key=lambda s: s["next"]["start_at"] or "")
     for g in groups.values():
         g.sort(key=lambda e: (0 if e["priority"] == "high" else 1, e["due_at"] or "9999", e["id"]))
     upcoming.sort(key=lambda e: e["start_at"] or "")
     for g in parked.values():
         g.sort(key=lambda e: (e["next_check_at"] or "9999", e["id"]))
 
+    # 빠짐 검사 (R2): 모든 활성 업무가 어느 구역에 하나씩 있거나 시리즈 줄에 들어 있어야 한다
+    listed = [e["id"] for e in today_list + check_list + upcoming] + \
+             [e["id"] for g in list(groups.values()) + list(parked.values()) for e in g] + \
+             [m["id"] for sl in series for m in sl["members"]]
+    missing = sorted({r["id"] for r in rows} - set(listed))
+    dup = sorted({i for i in listed if listed.count(i) > 1})
+    coverage = {"active": len(rows), "listed": len(set(listed)), "in_series_lines": sum(sl["count"] for sl in series),
+                "missing": [by_id[i]["ref"] for i in missing], "duplicated": [by_id[i]["ref"] for i in dup]}
+
     day = day_conflicts(conn, cfg, today, overlays)
     check_refs = [e["ref"] for e in today_list if e["check"]["due"]] + [e["ref"] for e in check_list]
     counts = {"active": len(rows), "today": len(today_list), "check": len(check_refs),
-              "open": sum(len(g) for g in groups.values()), "upcoming": len(upcoming), "later_meetings": later,
+              "open": sum(len(g) for g in groups.values()), "upcoming": len(upcoming), "series": len(series),
+              "series_occurrences": coverage["in_series_lines"],
               "waiting": len(parked["waiting"]), "on_hold": len(parked["on_hold"])}
     return {"today_date": today.isoformat(), "weekday": "월화수목금토일"[today.weekday()], "counts": counts,
             "today": today_list, "overlay": overlays or [], "overlaps": day["overlaps"],
             "deadline_clusters": day["deadline_clusters"], "check": check_list, "open": groups,
-            "upcoming": upcoming, "later_meetings": later, "parked": parked, "check_refs": check_refs}
+            "series": series, "upcoming": upcoming, "parked": parked, "check_refs": check_refs, "coverage": coverage}
+
+
+WEEKDAY_KO = "월화수목금토일"
+
+
+def _series_line(cfg, key: str, members: list[dict]) -> dict:
+    """정기 일정 한 줄: 제목 · (매주) 요일 시각 · 다음 날짜 · 앞으로 N회. 버튼은 다음 회차."""
+    tz = tz_of(cfg)
+    starts = [parse_iso(m["start_at"]).astimezone(tz) for m in members if m["start_at"] and len(m["start_at"]) > 10]
+    days = sorted({d.weekday() for d in starts})
+    times = [d.strftime("%H:%M") for d in starts]
+    common = max(set(times), key=times.count) if times else None
+    weekly = False
+    by_wd: dict[int, list] = {}
+    for d in starts:
+        by_wd.setdefault(d.weekday(), []).append(d.date())
+    gaps = [(b - a).days for ds in by_wd.values() for a, b in zip(ds, ds[1:])]
+    if gaps and max(set(gaps), key=gaps.count) == 7:
+        weekly = True
+    pattern = ("매주 " if weekly else "") + "·".join(WEEKDAY_KO[d] for d in days)
+    if common:
+        pattern += f" {common}" + (" 외" if len(set(times)) > 1 else "")
+    nxt = members[0]
+    nd = parse_iso(nxt["start_at"]).astimezone(tz) if nxt["start_at"] and len(nxt["start_at"]) > 10 else None
+    next_text = (f"{nd.month}/{nd.day}({WEEKDAY_KO[nd.weekday()]}) {nd:%H:%M}" if nd
+                 else ops.fmt_when(cfg, nxt["start_at"], nxt["end_at"]))
+    return {"series_key": key, "title": nxt["title"], "pattern": pattern.strip(), "next": nxt, "next_text": next_text,
+            "count": len(members), "members": members, "refs": [m["ref"] for m in members]}
 
 
 def _block(ref: str) -> str:
@@ -460,15 +545,25 @@ def _line_bits(e, *, show_due=True) -> str:
     return " · ".join(b for b in bits if b)
 
 
-def agenda_text(cfg, data: dict) -> str:
-    """업무 현황 본문 (번호 복사 블록 = 번호 버튼 자리). claire_buttons 가 페이지로 나눈다."""
+def agenda_rows(cfg, data: dict) -> list[dict]:
+    """업무 현황의 줄 목록. {"heading": 구역 제목} | {"text": 버튼 없는 줄} | {"text": 줄, "ref": 번호, "section": "1".."4"}.
+    claire_buttons 가 이것으로 메시지를 만든다(1구역은 줄마다 오른쪽 버튼, 2~4구역은 5줄마다 번호 버튼 한 줄)."""
     c = data["counts"]
-    d = date.fromisoformat(data["today_date"])
-    lines = [f"[업무 현황 {md(d)}({data['weekday']})] 활성 업무 {c['active']}건 · 오늘 확인 {c['check']}건"]
+    rows: list[dict] = []
+
+    def head(t):
+        rows.append({"heading": t})
+
+    def plain(t):
+        rows.append({"text": t})
+
+    def item(t, ref, sec):
+        rows.append({"text": t, "ref": ref, "section": sec})
+
     # 1. 오늘
-    lines.append(f"**1. 오늘 일정·마감 ({c['today']})**")
+    head(f"**1. 오늘 일정·마감 ({c['today']})**")
     if not data["today"] and not data["overlay"]:
-        lines.append("  없음")
+        plain("  없음")
     for e in data["today"]:
         extra = []
         if e["role"] == "meeting":
@@ -482,38 +577,39 @@ def agenda_text(cfg, data: dict) -> str:
                 extra.append(bits)
         if e["check"]["due"]:
             extra.append("진행 확인")
-        lines.append(f"  {e['when']}  {e['title']} ({e['ref']})" + (f" · {' · '.join(extra)}" if extra else ""))
-        lines.append(_block(e["ref"]))
+        item(f"  {e['when']}  {e['title']} ({e['ref']})" + (f" · {' · '.join(extra)}" if extra else ""), e["ref"], "1")
     for o in data["overlay"]:
         when = "종일" if o.get("all_day") else (_hm(cfg, o["start"]) + (f"–{_hm(cfg, o['end'])}" if o.get("end") and len(o["end"]) > 10 else ""))
-        lines.append(f"  {when}  ({o['calendar']}) {o['summary']}")
+        plain(f"  {when}  ({o['calendar']}) {o['summary']}")
     for ov in data["overlaps"]:
         a = ov["a"] if not ov["a"].startswith("overlay:") else ov["a"].split(":", 1)[1]
         b = ov["b"] if not ov["b"].startswith("overlay:") else ov["b"].split(":", 1)[1]
-        lines.append(f"  ⚠ 겹침: {ov['a_title']}({a})와 {ov['b_title']}({b})")
+        plain(f"  ⚠ 겹침: {ov['a_title']}({a})와 {ov['b_title']}({b})")
     for cl in data["deadline_clusters"]:
         span = cl["from"] if cl["from"] == cl["to"] else f"{cl['from']}–{cl['to']}"
-        lines.append(f"  ⏱ {span} 마감 {cl['count']}건({'·'.join(cl['refs'])}) — 약속 충돌이 아니라 작업량 안내입니다")
+        plain(f"  ⏱ {span} 마감 {cl['count']}건({'·'.join(cl['refs'])}) — 약속 충돌이 아니라 작업량 안내입니다")
     # 2. 진행 확인
-    lines.append(f"**2. 오늘 진행 확인 ({len(data['check'])})** — 번호를 누르면 완료·진행 중·보류·대기·처리 불필요")
+    head(f"**2. 오늘 진행 확인 ({len(data['check'])})** — 번호를 누르면 완료·진행 중·보류·대기·처리 불필요")
     if not data["check"]:
-        lines.append("  없음")
+        plain("  없음")
     for e in data["check"]:
         label = e["check"]["label"]
         if e["check"]["reason"] == "recheck":
             label += f" · {e['status_label']}" + (f"({e['waiting_on']})" if e["waiting_on"] else "")
-        lines.append(f"  {label}  {e['title']} ({e['ref']})" + (f" · {_line_bits(e)}" if _line_bits(e) else ""))
-        lines.append(_block(e["ref"]))
+        bits = _line_bits(e)
+        item(f"  {label}  {e['title']} ({e['ref']})" + (f" · {bits}" if bits else ""), e["ref"], "2")
     # 3. 그 외
-    lines.append(f"**3. 그 외 활성 업무 ({c['open']})**")
-    if not c["open"]:
-        lines.append("  없음")
+    n3 = c["open"] + c["upcoming"] + c["series"]
+    head(f"**3. 그 외 활성 업무 ({c['open']}) · 앞으로의 일정 (단발 {c['upcoming']} · 정기 {c['series']}개 시리즈 "
+         f"{c['series_occurrences']}회)**")
+    if not n3:
+        plain("  없음")
     for key, label in (("in_progress", "진행 중"), ("todo", "할 일"), ("needs_info", "확인 필요(질문 대기)"),
                        ("captured", "참고(신뢰도 낮음 — 업무인지 확인)")):
         g = data["open"][key]
         if not g:
             continue
-        lines.append(f"  {label} {len(g)}")
+        plain(f"  {label} {len(g)}")
         for e in g:
             nxt = e["check"].get("next_on")
             tail = _line_bits(e)
@@ -523,27 +619,46 @@ def agenda_text(cfg, data: dict) -> str:
                 tail += " · 오늘 보고받음"
             elif e["check"]["reason"] == "snoozed":
                 tail += f" · {e['check']['label']}"
-            lines.append(f"  {e['title']} ({e['ref']})" + (f" · {tail.lstrip(' ·')}" if tail.strip(' ·') else ""))
-            lines.append(_block(e["ref"]))
-    if data["upcoming"] or data["later_meetings"]:
-        lines.append(f"  앞으로의 일정 {len(data['upcoming'])}"
-                     + (f" (그 뒤 {data['later_meetings']}건은 \"다음 주 일정\"으로 조회)" if data["later_meetings"] else ""))
+            item(f"  {e['title']} ({e['ref']})" + (f" · {tail.lstrip(' ·')}" if tail.strip(' ·') else ""), e["ref"], "3")
+    if data["series"]:
+        plain(f"  정기 일정 {len(data['series'])} (시리즈마다 한 줄 — 버튼은 다음 회차)")
+        for sl in data["series"]:
+            item(f"  {sl['title']} · {sl['pattern']} · 다음 {sl['next_text']} ({sl['next']['ref']}) · 앞으로 {sl['count']}회",
+                 sl["next"]["ref"], "3")
+    if data["upcoming"]:
+        plain(f"  앞으로의 단발 일정 {len(data['upcoming'])}")
         for e in data["upcoming"]:
-            lines.append(f"  {e['when']}  {e['title']} ({e['ref']})")
-            lines.append(_block(e["ref"]))
+            item(f"  {e['when']}  {e['title']} ({e['ref']})", e["ref"], "3")
     # 4. 대기·보류
     parked = data["parked"]
     n4 = len(parked["waiting"]) + len(parked["on_hold"])
-    lines.append(f"**4. 답변 대기·보류 ({n4})** — 다음 확인일 전에는 묻지 않습니다")
+    head(f"**4. 답변 대기·보류 ({n4})** — 다음 확인일 전에는 묻지 않습니다")
     if not n4:
-        lines.append("  없음")
+        plain("  없음")
     for key in ("waiting", "on_hold"):
         for e in parked[key]:
             nc = local_date(cfg, e["next_check_at"])
             who = f"{e['waiting_on']} 답변 대기" if key == "waiting" else "보류" + (f"({e['blocked_reason']})" if e["blocked_reason"] else "")
-            lines.append(f"  {e['title']} ({e['ref']}) · {who} · 다음 확인 {md(nc) if nc else '미정'}"
-                         + (f" · {e['due_text']}" if e["due_at"] else ""))
-            lines.append(_block(e["ref"]))
+            item(f"  {e['title']} ({e['ref']}) · {who} · 다음 확인 {md(nc) if nc else '미정'}"
+                 + (f" · {e['due_text']}" if e["due_at"] else ""), e["ref"], "4")
+    if data["coverage"]["missing"] or data["coverage"]["duplicated"]:
+        plain(f"  ⚠ 목록 검사: 빠짐 {data['coverage']['missing']} · 중복 {data['coverage']['duplicated']} (도구 오류 — 알려 주세요)")
+    return rows
+
+
+def agenda_header(data: dict) -> str:
+    c = data["counts"]
+    d = date.fromisoformat(data["today_date"])
+    return f"[업무 현황 {md(d)}({data['weekday']})] 활성 업무 {c['active']}건 · 오늘 확인 {c['check']}건"
+
+
+def agenda_text(cfg, data: dict) -> str:
+    """업무 현황 전체 본문 (번호 복사 블록 포함). 미리 보기·버튼을 못 쓸 때의 본문."""
+    lines = [agenda_header(data)]
+    for r in agenda_rows(cfg, data):
+        lines.append(r.get("heading") or r["text"])
+        if r.get("ref"):
+            lines.append(_block(r["ref"]))
     return "\n".join(lines)
 
 
@@ -583,7 +698,7 @@ def exposure_gaps(conn, cfg, now: datetime) -> list[dict]:
     gaps = []
     for it in conn.execute("SELECT * FROM item WHERE deleted_at IS NULL AND status IN ('todo','in_progress','needs_info',"
                            "'waiting','on_hold') ORDER BY id"):
-        plan = check_plan(cfg, it, now)
+        plan = check_plan(cfg, it, now, since_d)
         if it["priority"] == "high" and plan["reason"] not in ("waiting", "on_hold", "snoozed"):
             last = max(x for x in (it["last_exposed_at"], since, it["created_at"]) if x)
             hrs = (now - parse_iso(last)).total_seconds() / 3600
@@ -597,7 +712,9 @@ def exposure_gaps(conn, cfg, now: datetime) -> list[dict]:
             base = max(d for d in (last_ask, local_date(cfg, it["last_reported_at"]), local_date(cfg, it["created_at"]),
                                    since_d) if d)
             n = interval_days(cfg, it)
-            late = (today - add_days(base, n, it["priority"] in tr.get("skip_weekends_for", ["normal", "low"]))).days
+            # 첫 확인을 나눈 기존 업무는 한 주기를 더 준다 (나눈 날까지 기다린 것을 누락으로 보지 않는다)
+            late = (today - add_days(base, n + (n - 1 if since_d and base == since_d else 0),
+                                     it["priority"] in tr.get("skip_weekends_for", ["normal", "low"]))).days
             if late >= 1:
                 gaps.append({"ref": it["ref"], "title": it["title"], "why": "check_missed",
                              "message": f"진행 확인이 {late}일 늦음 (마지막 확인 {md(last_ask) if last_ask else '없음'})",
@@ -613,8 +730,8 @@ def health(conn, cfg, now: datetime, exclude_kind_today: str | None = None) -> d
                 for r in conn.execute("SELECT o.op, o.attempts, i.ref, i.title FROM outbox o LEFT JOIN item i "
                                       "ON i.id=o.item_id WHERE o.status='pending' AND o.attempts > 0 ORDER BY o.id")]
     unreviewed = [r["ref"] for r in conn.execute(
-        "SELECT ref FROM item WHERE deleted_at IS NULL AND priority_source='unreviewed' AND status IN (%s) ORDER BY id"
-        % ",".join("?" * len(OPEN_STATUSES)), OPEN_STATUSES)]
+        "SELECT ref FROM item WHERE deleted_at IS NULL AND (priority_source='unreviewed' OR priority_source IS NULL) "
+        "AND status IN (%s) ORDER BY id" % ",".join("?" * len(OPEN_STATUSES)), OPEN_STATUSES)]
     return {"failed_ops": failed_ops, "retrying_ops": retrying,
             "delivery": delivery_issues(conn, cfg, now, exclude_kind_today=exclude_kind_today),
             "exposure_gaps": exposure_gaps(conn, cfg, now), "importance_unreviewed": unreviewed}

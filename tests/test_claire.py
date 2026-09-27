@@ -2024,6 +2024,7 @@ class V060Test(FixtureBase):
         d = d or self.ag_data()
         return {"today": [e["ref"] for e in d["today"]], "check": [e["ref"] for e in d["check"]],
                 "open": [e["ref"] for g in d["open"].values() for e in g], "upcoming": [e["ref"] for e in d["upcoming"]],
+                "series": [r for sl in d["series"] for r in sl["refs"]],
                 "parked": [e["ref"] for g in d["parked"].values() for e in g]}
 
     def deliver_all(self, ag):
@@ -2224,8 +2225,15 @@ class V060Test(FixtureBase):
         self.propose([{"op": "create", "source_event_ids": [a["source_event_id"]], "kind": "meeting", "title": "면담",
                        "start_at": "2026-09-11T17:30:00+09:00", "end_at": "2026-09-11T18:30:00+09:00",
                        "confidence": 0.95, "evidence": ["x"]}])
+        # 교수님이 '마감 1시간 전~마감'과 같은 구간을 말하면 그대로 자동 마감 표시다 (0.6.1)
         self.store("update", "--item", "CLR-0001", "--set", "start_at=2026-09-11T17:00:00+09:00",
-                   "--set", "end_at=2026-09-11T18:00:00+09:00", "--reason", "작업 시간 확보")
+                   "--set", "end_at=2026-09-11T18:00:00+09:00", "--reason", "그 시간에 할게")
+        self.assertEqual(self.item("CLR-0001")["window_auto"], 1)
+        self.assertEqual(self.sh("claire_search", "review")["overlaps"], [])
+        # 다른 구간을 잡으면 교수님의 작업 예약 → 실제 약속과 겹치면 알린다
+        self.store("update", "--item", "CLR-0001", "--set", "start_at=2026-09-11T16:30:00+09:00",
+                   "--set", "end_at=2026-09-11T17:45:00+09:00", "--reason", "작업 시간 확보")
+        self.assertEqual(self.item("CLR-0001")["window_auto"], 0)
         rv = self.sh("claire_search", "review")
         self.assertEqual([(o["a"], o["b"]) for o in rv["overlaps"]], [("CLR-0001", "CLR-0003")])
         self.assertEqual(self.sh("claire_search", "show", "--item", "CLR-0001")["time_kind"] if False else
@@ -2235,7 +2243,7 @@ class V060Test(FixtureBase):
     def test_failed_page_is_not_counted_and_only_that_page_is_resent(self):
         a = self.ingest("d1", "등록: 여러 일")
         self.propose([{"op": "create", "source_event_ids": [a["source_event_id"]], "kind": "task", "title": f"일 {i:02d}",
-                       "confidence": 0.9, "evidence": ["x"]} for i in range(20)])
+                       "confidence": 0.9, "evidence": ["x"]} for i in range(60)])
         self.at("2026-09-12T06:00:00+09:00")
         ag = self.agenda()
         self.assertGreaterEqual(len(ag["messages"]), 2)
@@ -2295,11 +2303,13 @@ class V060Test(FixtureBase):
         # 0.6.0 전 항목처럼 만든다 (분류 없음)
         self.db().execute("UPDATE item SET priority='normal', priority_source=NULL, priority_reason=NULL, request_scope=NULL")
         self.db().commit()
+        # 소급 분류 전에도 검토 목록에 보인다 (0.6.1: Claire 가 "검토 목록에도 없음"이라고 한 경우)
+        self.assertEqual(self.sh("claire_search", "importance-review")["count"], 2)
         m = self.store("maintain")["importance_backfill"]
         self.assertEqual((m["changed"], m["needs_review"]), (["CLR-0001", "CLR-0002"], ["CLR-0002"]))
         self.assertEqual((self.item("CLR-0001")["priority"], self.item("CLR-0001")["priority_source"]), ("high", "rule"))
         self.assertEqual((self.item("CLR-0002")["priority"], self.item("CLR-0002")["priority_source"]), ("high", "unreviewed"))
-        self.assertFalse(self.store("maintain")["importance_backfill"]["done"])          # 한 번만
+        self.assertEqual(self.store("maintain")["importance_backfill"]["items"], 0)      # 멱등 — 분류된 업무는 다시 안 건드림
         rv = self.sh("claire_search", "importance-review")
         self.assertEqual(rv["items"][0]["ref"], "CLR-0002"); self.assertEqual(rv["items"][0]["sources"][0]["to"], ["prof@univ.example"])
         self.store("update", "--actor", "claire", "--item", "CLR-0002", "--set", "request_scope=direct",
@@ -2359,6 +2369,124 @@ class V060Test(FixtureBase):
         d = self.ag_data()
         self.assertIn("CLR-0005", [e["ref"] for e in d["check"]])                   # 기존 마감 없는 활성 업무도 추적
         self.assertEqual(self.db().execute("SELECT COUNT(*) FROM item").fetchone()[0], 5)
+
+    # -- 0.6.1 (Claire 점검 결과 반영) --------------------------------------------------------------------
+    def _cal(self, eid, summary, start, end, **extra):
+        return {"id": eid, "etag": f"e-{eid}", "status": "confirmed", "summary": summary,
+                "updated": "2026-09-10T01:00:00.000Z", "start": {"dateTime": start}, "end": {"dateTime": end},
+                "organizer": {"email": "prof@example.com", "self": True}, **extra}
+
+    def test_future_series_one_line_each_and_every_item_covered(self):
+        """교수님 결정(2026-09-27): 앞으로의 정기 일정은 시리즈마다 한 줄, 단발 일정은 기간과 관계없이 모두 하나씩."""
+        occ = [self._cal(f"rec1_{i}", "MC2103 수업", f"{d}T09:00:00+09:00", f"{d}T10:15:00+09:00", recurringEventId="rec1")
+               for i, d in enumerate(("2026-09-15", "2026-09-17", "2026-09-22", "2026-09-24", "2026-10-20"))]
+        far = self._cal("far", "IROS 조직위 회의", "2026-10-30T14:00:00+09:00", "2026-10-30T15:00:00+09:00")
+        self.fixture(f"cal_events_{PROF}", {"items": occ + [far], "nextSyncToken": "tokA"})
+        self.sh("claire_sync", "calendar", "--calendar", "Prof. Hur")
+        groups = self.sh("claire_sync", "pending", "--platform", "calendar")["groups"]
+        ser = next(g for g in groups if g.get("series")); one = next(g for g in groups if not g.get("series"))
+        self.propose([{"op": "create", "series": True, "source_event_ids": ser["series"]["source_event_ids"], "kind": "meeting",
+                       "title": "MC2103 수업", "confidence": 1.0, "evidence": ["cal"]},
+                      {"op": "create", "source_event_ids": [one["events"][0]["source_event_id"]], "kind": "meeting",
+                       "title": "IROS 조직위 회의", "confidence": 1.0, "evidence": ["cal"]}])
+        d = self.ag_data()
+        self.assertEqual([(sl["count"], sl["next"]["ref"], sl["pattern"]) for sl in d["series"]], [(5, "CLR-0001", "매주 화·목 09:00")])
+        self.assertEqual([e["ref"] for e in d["upcoming"]], ["CLR-0006"])            # 50일 뒤 단발 일정도 하나씩
+        self.assertEqual((d["coverage"]["missing"], d["coverage"]["duplicated"], d["coverage"]["listed"]), ([], [], 6))
+        ag = self.agenda("--no-record")
+        self.assertIn("MC2103 수업 · 매주 화·목 09:00 · 다음 9/15(화) 09:00 (CLR-0001) · 앞으로 5회", ag["text"])
+        self.assertIn("IROS 조직위 회의 (CLR-0006)", ag["text"])
+        self.assertIsNone(re.search(r"그 뒤 \d+건|외 \d+건", ag["text"]))
+        nums = [n for m in ag["messages"] for n in m.get("numbers", [])]
+        self.assertIn("CLR-0001", nums); self.assertIn("CLR-0006", nums); self.assertNotIn("CLR-0003", nums)
+        self.assertEqual(ag["coverage"]["missing"], [])
+
+    def test_compact_rows_fit_twenty_four_checks_in_one_message(self):
+        a = self.ingest("d1", "등록: 여러 일")
+        self.propose([{"op": "create", "source_event_ids": [a["source_event_id"]], "kind": "task", "title": f"일 {i:02d}",
+                       "confidence": 0.9, "evidence": ["x"]} for i in range(24)])
+        self.at("2026-09-12T06:00:00+09:00")                                         # 높음 → 모두 오늘 진행 확인
+        ag = self.agenda("--no-record")
+        pages = [m for m in ag["messages"] if m.get("numbers")]
+        self.assertEqual(len(pages), 1)
+        rows = [b for b in pages[0]["components"]["blocks"] if b["type"] == "actions"]
+        self.assertTrue(all(len(r["buttons"]) <= 5 for r in rows))
+        self.assertEqual(sum(len(r["buttons"]) for r in rows), 24)
+        self.assertLessEqual(pages[0]["component_count"], 38)
+        self.assertEqual(pages[0]["problems"], [])
+
+    def test_explicit_default_window_legacy_markers_and_calendar_format(self):
+        # 제안에 '마감 1시간 전~마감'을 직접 적어도 자동 마감 표시 (Claire 의 옛 습관)
+        V050Test.register_deadline(self, due="2026-09-11T18:00:00+09:00", title="출장 결과 보고서", mid="d1",
+                                   start_at="2026-09-11T17:00:00+09:00", end_at="2026-09-11T18:00:00+09:00")
+        self.assertEqual(self.item("CLR-0001")["window_auto"], 1)
+        # 표시가 꺼진 옛 데이터: 모양으로도 마감 표시로 보고, 업무 현황 앞의 정리(upkeep)가 보정한다
+        V050Test.register_deadline(self, due="2026-09-11T18:00:00+09:00", title="강의 일정 변경 확정", mid="d2")
+        self.db().execute("UPDATE item SET window_auto=0 WHERE ref='CLR-0002'"); self.db().commit()
+        self.assertEqual(self.sh("claire_search", "find", "--q", "강의 일정")["results"][0]["time_kind"], "deadline_marker")
+        ag = self.agenda("--no-record")
+        self.assertEqual(ag["upkeep"]["markers_repaired"], ["CLR-0002"])
+        self.assertEqual(self.item("CLR-0002")["window_auto"], 1)
+        self.assertNotIn("⚠ 겹침", ag["text"]); self.assertIn("⏱ 18:00 마감 2건", ag["text"])
+        # Calendar 가 같은 시각을 다른 표기(UTC Z)로 돌려줘도 '교수님이 블록을 옮김'으로 보지 않는다
+        self.apply()
+        key = self.db().execute("SELECT l.external_key FROM link l JOIN item i ON i.id=l.item_id "
+                                "WHERE i.ref='CLR-0001' AND l.system='calendar'").fetchone()[0]
+        ev = self._cal(key.split(":", 1)[1], "[마감] 출장 결과 보고서", "2026-09-11T08:00:00Z", "2026-09-11T09:00:00Z",
+                       extendedProperties={"private": {"claire_ref": "CLR-0001"}})
+        self.fixture(f"cal_events_{PROF}", {"items": [ev], "nextSyncToken": "tokZ"})
+        self.sh("claire_sync", "calendar", "--calendar", "Prof. Hur")
+        it = self.item("CLR-0001")
+        self.assertEqual((it["window_auto"], it["start_at"], it["title"]), (1, "2026-09-11T17:00:00+09:00", "출장 결과 보고서"))
+        self.assertEqual(self.db().execute("SELECT COUNT(*) FROM activity_log a JOIN item i ON i.id=a.item_id WHERE i.ref='CLR-0001' "
+                                           "AND a.actor='sync' AND a.field IN ('start_at','end_at','window_auto')").fetchone()[0], 0)
+
+    def test_legacy_backlog_first_checks_are_spread_over_the_interval(self):
+        self.mail_items(*({"title": f"옛 단체 요청 {i}", "request_scope": "group"} for i in range(4)))
+        # 추적 시작(업그레이드)이 9/14(월)인 DB 처럼: 그 전부터 있던 보통 업무 4건
+        self.db().execute("UPDATE meta SET value='2026-09-14T05:00:00+09:00' WHERE key='tracking_since'"); self.db().commit()
+        self.at("2026-09-14T06:00:00+09:00")
+        ag = self.agenda()
+        self.assertEqual(ag["check_refs"], ["CLR-0002", "CLR-0004"])                  # 첫날 절반만
+        self.deliver_all(ag)
+        self.at("2026-09-15T06:00:00+09:00")
+        self.assertEqual(self.agenda()["check_refs"], ["CLR-0001", "CLR-0003"])      # 나머지 절반, 이후 2영업일마다
+        self.assertEqual(self.ag_data()["health"]["exposure_gaps"], [])
+
+    def test_complete_past_meetings_only_when_told(self):
+        a = self.ingest("d1", "등록: 면담들")
+        self.propose([{"op": "create", "source_event_ids": [a["source_event_id"]], "kind": "meeting", "title": t, "start_at": s,
+                       "end_at": e, "confidence": 0.95, "evidence": ["x"]} for t, s, e in (
+            ("어제 면담", "2026-09-10T10:00:00+09:00", "2026-09-10T11:00:00+09:00"),
+            ("새벽 회의", "2026-09-11T05:00:00+09:00", "2026-09-11T05:30:00+09:00"),
+            ("내일 회의", "2026-09-12T10:00:00+09:00", "2026-09-12T11:00:00+09:00"))])
+        self.assertEqual([self.item(r)["status"] for r in ("CLR-0001", "CLR-0002")], ["todo", "todo"])   # 시각이 지나도 그대로
+        r = self.store("complete", "--past-meetings", "--evidence", "user_report", "--note", "교수님: 지난 일정 다 끝났어")
+        self.assertEqual(r["completed"], ["CLR-0001", "CLR-0002"])
+        self.assertEqual(self.item("CLR-0003")["status"], "todo")
+        self.assertEqual(self.store("complete", "--past-meetings", "--evidence", "user_report")["completed"], [])
+
+    def test_prep_template_command_sets_rules_used_by_maintain(self):
+        r = self.store("prep-template", "--add", "로봇공학", "--days-before", "1", "--due-time", "18:00")
+        self.assertIn("1일 전 18:00", r["message"])
+        self.assertEqual([t["match"] for t in self.store("prep-template")["templates"]], ["로봇공학"])
+        a = self.ingest("d1", "등록: 수업")
+        self.propose([{"op": "create", "source_event_ids": [a["source_event_id"]], "kind": "meeting", "title": "로봇공학 수업",
+                       "start_at": "2026-09-15T09:00:00+09:00", "confidence": 0.95, "evidence": ["x"]}])
+        made = self.store("maintain")["prep_created"]
+        self.assertEqual([(m["ref"], m["for"]) for m in made], [("CLR-0002", "CLR-0001")])
+        self.assertEqual(self.item("CLR-0002")["due_at"], "2026-09-14T18:00:00+09:00")
+        self.assertEqual(self.store("prep-template", "--remove", "로봇공학")["templates"], [])
+        self.store("prep-template", "--add", "x", "--due-time", "6pm", expect_ok=False)
+
+    def test_install_init_backfills_and_review_lists_likely_direct_first(self):
+        self.mail_items({"title": "공지 설문"}, {"title": "Aaron 회신", "kind": "reply", "next_check_at": "2026-09-14"})
+        self.db().execute("UPDATE item SET priority_source=NULL, priority_reason=NULL"); self.db().commit()
+        rv = self.sh("claire_search", "importance-review")
+        self.assertEqual([x["ref"] for x in rv["items"]], ["CLR-0002", "CLR-0001"])   # 회신 요청 먼저
+        i = self.sh("claire_check", "init")
+        self.assertEqual(i["upkeep"]["importance_backfill"]["items"], 2)
+        self.assertEqual(self.item("CLR-0002")["priority_source"], "unreviewed")
 
     def test_recurring_occurrence_completion_does_not_touch_other_occurrences(self):
         occ = [{"id": f"rec1_{i}", "etag": f"r{i}", "status": "confirmed", "summary": "MC2103 수업",

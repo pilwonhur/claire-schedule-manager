@@ -402,6 +402,12 @@ def _mirror_calendar_to_item(conn, cfg, link_row, ev: dict, hdrs: dict, sid: int
         return changes
     start, all_day = _ev_time(ev.get("start"))
     end, _ = _ev_time(ev.get("end"))
+    # 같은 순간이면 저장된 표기를 유지한다 (0.6.1). 표기만 다른데('Z'·오프셋) 문자열 비교로 '교수님이 블록을 옮김'으로
+    # 보고 자동 마감 표시를 작업 예약으로 바꾸거나 변경 이력을 남기지 않게.
+    if ops.same_instant(item["start_at"], start):
+        start = item["start_at"]
+    if ops.same_instant(item["end_at"], end):
+        end = item["end_at"]
     title = ev.get("summary") or item["title"]
     if item["kind"] != "meeting":
         # 마감 표시 블록: 달력 제목의 "[마감] " 은 표시용이다. 항목 제목·마감 시각(due_at)은 건드리지 않는다.

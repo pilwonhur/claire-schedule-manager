@@ -28,7 +28,7 @@ scripts/              결정론적 도구 (Python 3.11+, 표준 라이브러리�
   claire_buttons      Discord 버튼 페이로드: build (본문 → components) | actions (항목·질문 카드) | approvals (승인 대기 목록)
                       | agenda (업무 현황: 활성 미완료 전체·진행 확인·점검) | resend (전송 실패 쪽만)
   claire_track.py     완료까지 추적: 중요도 기본값·진행 확인 계획·시간 종류(약속/작업/마감 표시)·업무 현황·전달 기록·누락 감시
-  claire_store        저장: propose | update | complete | answer | wait | hold | dismiss | link-task | undo | merge | ...
+  claire_store        저장: propose | update | complete | answer | wait | hold | dismiss | link-task | prep-template | undo | merge | ...
   claire_search       조회: review | today | week | overdue | find | history | trace | waiting | dupcheck | agenda | importance-review
   claire_apply        외부 반영: outbox 실행·승인·선택 (Obsidian 🆔·체크·Daily 줄·완료 기록, Calendar 등록·변경)
   claire_run          실행 관리: begin | step | brief | deliver (전송 결과) | end | status | missed | checkin (12·18시 미등록 일정 확인)
@@ -36,7 +36,7 @@ scripts/              결정론적 도구 (Python 3.11+, 표준 라이브러리�
   claire_export       json | md
 connectors/           Google OAuth·REST(읽기/쓰기 토큰 분리), Obsidian Tasks 파서·원자적 쓰기, Discord 첨부
 references/           브리핑 형식, 제안 JSON 규격, 스키마, 진단, 복구 정책, 활용 시나리오(usage-guide.md)
-tests/                98개 테스트 (Google API 는 기록된 fixture 로 대체, 설치·업그레이드 경로 포함)
+tests/                105개 테스트 (Google API 는 기록된 fixture 로 대체, 설치·업그레이드 경로 포함)
 docs/manual.md        사용 안내
 VERSION               배포 버전 (claire_core.CLAIRE_VERSION·SKILL.md·CHANGELOG 와 같아야 한다 — 테스트·CI 가 검사)
 get.sh                설치·업그레이드 (GitHub 릴리스 태그) · install.sh 실제 설치 · release.sh 릴리스(관리자)

@@ -132,6 +132,8 @@ def _validate_create(p: dict, idx: int, cfg, evs=None) -> dict:
             start = datetime.fromisoformat(fields["start_at"])
             due = datetime.fromisoformat(fields["due_at"])
             fields["end_at"] = (due if due > start else start + timedelta(hours=1)).isoformat()
+        if ops.is_default_window(cfg, fields):
+            fields["window_auto"] = 1          # 제안이 '마감 1시간 전~마감'을 직접 적어도 자동 마감 표시다 (0.6.1)
     if fields["priority"] not in PRIORITIES:
         _bad(f"제안 {idx}: priority 가 잘못되었습니다", priority=fields["priority"])
     # 0.6.0 R3 — 중요도: Claire 가 정했으면 그 판단(근거 필수 권장), 아니면 출처·요청 범위 규칙. 마감 유무와 무관.
@@ -545,7 +547,33 @@ def _refs(value: str | None) -> list[str]:
     return [x for x in re.split(r"[,\s]+", value or "") if x]
 
 
+def _past_meeting_refs(conn, cfg, before: str | None) -> list[str]:
+    """끝난 일정(회의·수업) 중 아직 열린 것. before(YYYY-MM-DD)를 주면 그날 전에 시작한 것만."""
+    now = now_dt(cfg)
+    out = []
+    for r in conn.execute("SELECT * FROM item WHERE deleted_at IS NULL AND kind='meeting' AND start_at IS NOT NULL "
+                          "AND status IN ('todo','in_progress','waiting','on_hold') ORDER BY start_at"):
+        start = datetime.fromisoformat(r["start_at"]) if len(r["start_at"]) > 10 else \
+            datetime.fromisoformat(r["start_at"] + "T00:00:00").replace(tzinfo=tz_of(cfg))
+        end = datetime.fromisoformat(r["end_at"]) if r["end_at"] and len(r["end_at"]) > 10 else start + timedelta(hours=1)
+        if end >= now:
+            continue
+        if before and start.astimezone(tz_of(cfg)).strftime("%Y-%m-%d") >= before:
+            continue
+        out.append(r["ref"])
+    return out
+
+
 def cmd_complete(args, cfg):
+    if args.past_meetings:
+        # "지난 일정 다 끝났어" — 교수님이 말했을 때만. 시각이 지났다는 이유만으로 도구가 스스로 완료하지 않는다.
+        if args.item or args.find:
+            _bad("--past-meetings 는 --item·--find 와 함께 쓰지 않습니다")
+        refs = _past_meeting_refs(connect(create=False), cfg, args.before)
+        if not refs:
+            return {"results": [], "completed": [], "message": "끝났는데 열려 있는 일정이 없습니다."}
+        one = argparse.Namespace(**{**vars(args), "item": ",".join(refs), "past_meetings": False})
+        return cmd_complete(one, cfg)
     refs = _refs(args.item)
     if len(refs) > 1:
         # 여러 건 (예: "지난 일정 모두 완료" 버튼). 한 건씩 같은 규칙으로, 결과를 모아서.
@@ -633,6 +661,36 @@ def cmd_dismiss(args, cfg):
     return {"results": out, "close_reason": args.why,
             "message": (f"{', '.join(refs_done)} 를 '{label}'(으)로 정리했습니다. 활성 목록과 진행 확인에서 빠지고 기록은 남습니다 "
                         "(되돌리려면 '다시 열어')." if refs_done else "바뀐 항목이 없습니다.")}
+
+
+def cmd_prep_template(args, cfg):
+    """정기 일정 준비 템플릿 관리 (config.json prep_templates, 0.6.1). 교수님이 정한 규칙만 넣는다.
+    다음 maintain(매일 점검)부터 14일 안의 회차에 준비 업무가 생긴다. 이미 준비 업무가 있는 회차는 건너뛴다."""
+    from claire_core import data_dir, atomic_write_text
+    path = data_dir() / "config.json"
+    user = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    tpls = list(user.get("prep_templates", cfg.get("prep_templates") or []))
+    if args.add:
+        match = args.add.strip()
+        if not match:
+            _bad("--add 에 일정 제목의 일부(예: 로봇공학)를 주세요")
+        if args.due_time and not re.fullmatch(r"\d{1,2}:\d{2}", args.due_time):
+            _bad("--due-time 은 HH:MM", value=args.due_time)
+        tpl = {"match": match, "title": args.title or "{title} 준비", "days_before": args.days_before}
+        if args.due_time:
+            tpl["due_time"] = args.due_time
+        tpls = [t for t in tpls if t.get("match") != match] + [tpl]
+        msg = (f"'{match}' 일정마다 {args.days_before}일 전{(' ' + args.due_time) if args.due_time else ''}까지 "
+               f"'{tpl['title']}' 준비 업무를 만듭니다 (다음 매일 점검부터, 14일 안의 회차).")
+    elif args.remove:
+        before = len(tpls)
+        tpls = [t for t in tpls if t.get("match") != args.remove.strip()]
+        msg = f"'{args.remove}' 준비 템플릿을 지웠습니다." if len(tpls) < before else f"'{args.remove}' 템플릿이 없습니다."
+    else:
+        return {"templates": tpls, "message": f"준비 템플릿 {len(tpls)}개" if tpls else "준비 템플릿이 없습니다."}
+    user["prep_templates"] = tpls
+    atomic_write_text(path, json.dumps(user, ensure_ascii=False, indent=2) + "\n")
+    return {"templates": tpls, "message": msg}
 
 
 def cmd_link_task(args, cfg):
@@ -812,10 +870,12 @@ def cmd_split(args, cfg):
             _bad(f"kind 가 잘못되었습니다: {args.kind}")
         ref = next_item_ref(conn, cfg)
         iid = conn.execute(
-            "INSERT INTO item(ref,title,kind,status,project,owner,due_at,tentative,created_at,updated_at) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO item(ref,title,kind,status,project,owner,due_at,due_precision,tentative,priority,priority_source,"
+            "priority_reason,request_scope,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (ref, args.title, args.kind, "todo", src["project"], src["owner"],
-             ops.norm_value("due_at", args.due_at, cfg) if args.due_at else None, 0, now_s, now_s)).lastrowid
+             ops.norm_value("due_at", args.due_at, cfg) if args.due_at else None, ops.precision_of(args.due_at), 0,
+             src["priority"], src["priority_source"], src["priority_reason"], src["request_scope"],   # 떼어낸 업무는 원래 업무의 중요도
+             now_s, now_s)).lastrowid
         for r in conn.execute("SELECT source_event_id FROM item_source WHERE item_id=?", (src["id"],)).fetchall():
             conn.execute("INSERT OR IGNORE INTO item_source(item_id,source_event_id,role) VALUES(?,?,'origin')",
                          (iid, r["source_event_id"]))
@@ -880,7 +940,7 @@ def cmd_maintain(args, cfg):
     with tx(conn):
         r = ops.expire_and_withdraw(conn, cfg, now_s)
         # 0.6.0: 기존 업무 중요도 소급 분류(한 번) · 승인된 준비 템플릿으로 다가오는 회차의 준비 업무
-        r["importance_backfill"] = track.backfill_importance(conn, cfg, now_s)
+        r.update(track.upkeep(conn, cfg, now_s))
         r["prep_created"] = track.apply_prep_templates(conn, cfg, now_dt(cfg), now_s)
     return {**r, "run_id": args.run}
 
@@ -905,6 +965,9 @@ def build_parser():
     c.add_argument("--evidence", required=True); c.add_argument("--note")
     c.add_argument("--completed-at", help="실제 완료일(YYYY-MM-DD 또는 ISO). 이미 완료된 항목이면 완료일 정정")
     c.add_argument("--apply", action="store_true", help="저장 뒤 이 항목의 외부 반영(Tasks 체크·Daily 기록)을 바로 실행")
+    c.add_argument("--past-meetings", action="store_true",
+                   help="끝난 일정 중 열린 것 전부 (교수님: '지난 일정 다 끝났어'). --before YYYY-MM-DD 로 범위 제한")
+    c.add_argument("--before", help="--past-meetings 와 함께: 이 날짜 전에 시작한 일정만")
     c.set_defaults(fn=cmd_complete)
     for name, fn in (("reopen", cmd_reopen), ("cancel", cmd_cancel), ("hold", cmd_hold)):
         x = _common(sub.add_parser(name)); x.add_argument("--item", required=True); x.add_argument("--reason")
@@ -921,6 +984,10 @@ def build_parser():
     lt.add_argument("--title", required=True); lt.add_argument("--due-at"); lt.add_argument("--kind", default="prep",
                                                                                             choices=["prep", "task", "deadline", "reply"])
     lt.add_argument("--next-action"); lt.set_defaults(fn=cmd_link_task)
+    pt = sub.add_parser("prep-template", help="정기 일정 준비 템플릿 (--add 제목일부 | --remove 제목일부 | 목록)")
+    pt.add_argument("--add"); pt.add_argument("--remove"); pt.add_argument("--title", help="예: '{title} 준비'")
+    pt.add_argument("--days-before", type=int, default=1); pt.add_argument("--due-time", help="HH:MM (없으면 일정 시각)")
+    pt.set_defaults(fn=cmd_prep_template)
     w = _common(sub.add_parser("wait")); w.add_argument("--item", required=True); w.add_argument("--waiting-on", required=True)
     w.add_argument("--next-check"); w.add_argument("--reason"); w.set_defaults(fn=cmd_wait)
     rs = _common(sub.add_parser("resume")); rs.add_argument("--item", required=True); rs.add_argument("--reason"); rs.set_defaults(fn=cmd_resume)

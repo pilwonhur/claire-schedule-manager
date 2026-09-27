@@ -146,6 +146,30 @@ def deadline_window(cfg, due_at: str) -> tuple[str, str]:
     return (end - timedelta(minutes=minutes)).isoformat(), end.isoformat()
 
 
+def same_instant(a: str | None, b: str | None) -> bool:
+    """두 시각 표기가 같은 순간인가 (`…T17:00:00+09:00` 과 `…T08:00:00Z` 는 같다). 날짜만인 값은 문자열로만 비교."""
+    if a == b:
+        return True
+    if not a or not b or len(a) == 10 or len(b) == 10:
+        return False
+    try:
+        return parse_iso(a.replace("Z", "+00:00")) == parse_iso(b.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+
+
+def is_default_window(cfg, item_like) -> bool:
+    """달력 구간이 정확히 '마감 N분 전 ~ 마감'인가 (0.6.1). 이 모양이면 교수님이 잡은 작업 시간이 아니라 자동 마감 표시다.
+    0.5.0 전에 Claire 가 직접 넣은 17–18시 같은 구간, 제안에 start_at·end_at 을 함께 준 경우도 여기에 든다."""
+    if item_like["kind"] == "meeting" or not item_like["due_at"] or item_like["due_precision"] != "time":
+        return False
+    s, e = item_like["start_at"], item_like["end_at"]
+    if not s or not e or len(s) == 10 or len(e) == 10:
+        return False
+    ws, we = deadline_window(cfg or {}, item_like["due_at"])
+    return same_instant(s, ws) and same_instant(e, we)
+
+
 def wants_window(item_like) -> bool:
     """달력 표시 구간을 마감에서 만드는 항목인가: 회의가 아니고 마감 시각이 확정됨."""
     return (item_like["kind"] != "meeting" and item_like["due_at"] and item_like["due_precision"] == "time")
@@ -188,7 +212,14 @@ def apply_update(conn, cfg, item, changes: dict, *, actor: str, ts: str, reason:
         changes.setdefault("due_precision", prec)
     explicit_window = any(k in changes for k in ("start_at", "end_at"))
     if explicit_window and item["kind"] != "meeting" and "window_auto" not in changes:
-        changes["window_auto"] = 0
+        # 준 구간이 '마감 1시간 전~마감'과 같으면 자동 마감 표시(작업 예약이 아니다), 아니면 교수님이 잡은 작업 시간
+        after = dict(item)
+        for k in ("start_at", "end_at", "due_at"):
+            if k in changes:
+                after[k] = norm_value(k, changes[k], cfg)
+        if "due_precision" in changes:
+            after["due_precision"] = changes["due_precision"]
+        changes["window_auto"] = 1 if is_default_window(cfg, after) else 0
     # 마감이 바뀌었거나 시각이 새로 확정되면 달력 구간을 다시 만든다
     if not explicit_window and item["kind"] != "meeting" and ("due_at" in changes or "due_precision" in changes):
         new_due = norm_value("due_at", changes["due_at"], cfg) if "due_at" in changes else item["due_at"]

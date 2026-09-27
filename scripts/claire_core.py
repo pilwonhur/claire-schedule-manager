@@ -27,7 +27,7 @@ from zoneinfo import ZoneInfo
 #
 # 스킬 전체의 배포 버전 (SemVer). 동작이나 문서가 바뀌면 반드시 올리고
 # CHANGELOG.md에 항목을 남긴다. tests/test_claire.py가 둘의 일치를 검사한다.
-CLAIRE_VERSION = "0.6.0"
+CLAIRE_VERSION = "0.6.1"
 
 # 데이터 파일 형식의 버전. 스키마가 바뀌면 올리고 MIGRATIONS 에 기존 DB 변환을 적는다.
 # v2 (0.5.0): item.due_precision·window_auto·attendance·daily_logged_on, outbox.selected_at, checkin 표.
@@ -164,7 +164,6 @@ DEFAULT_CONFIG = {
         "hold_default_days": 7,              # 보류 재확인일을 말하지 않으면 N일 뒤
         "exposure_grace_hours": 30,          # 높은 중요도 업무가 이 시간 넘게 전달되지 않으면 누락으로 표시
         "delivery_confirm_minutes": 60,      # 생성 뒤 이 시간 안에 전송 확인이 없으면 "전달 확인 안 됨"
-        "upcoming_meeting_days": 7,          # 전체 목록에 개별로 보일 앞으로의 일정 범위 (그 뒤는 건수 + "이번 주" 조회)
         "deadline_cluster_min": 2,           # 1시간 안에 몰린 마감이 N건 이상이면 작업량 안내 (충돌 경고 아님)
     },
     # 0.6.0 — 정기 일정 회차의 준비 업무 템플릿 (교수님이 승인한 것만). 비어 있으면 만들지 않는다.
