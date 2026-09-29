@@ -781,11 +781,37 @@ def short_num(ref: str) -> str:
     return str(int(m.group(1))) if m else ref
 
 
-def auto_label(title: str) -> str:
-    """키워드가 없을 때 제목에서 1~3단어를 자른다. 앞의 [마감]·(회신) 같은 꼬리표는 뺀다."""
-    t = re.sub(r"^\s*(?:[\[(（【][^\])）】]{0,12}[\])）】]\s*)+", "", title or "").strip() or (title or "").strip()
+# 키워드로 쓰면 뜻이 없는 낱말 (0.7.1 점검: '내 연구 및', '내가 맡은 업무에', 'pilwon'). 제목 앞부분 대체값에서만 뺀다.
+LABEL_STOP = {"내", "내가", "나의", "제", "제가", "저의", "우리", "저희", "및", "등", "관련", "관련한", "대한", "대해", "위한", "건",
+              "요청", "요청의", "안내", "안내의", "문의", "공지", "알림", "참고", "맡은", "해야", "할", "하는", "있는", "the", "a", "an",
+              "re:", "fw:", "fwd:", "re", "fw", "fwd", "for", "of", "to", "and", "on", "in", "교수님", "교수", "님"}
+
+
+LABEL_TAGS = {"마감", "회신", "요청", "안내", "공지", "긴급", "중요", "참고", "필독", "재공지", "re", "fw", "fwd", "ext", "외부"}
+
+
+def _label_words(title: str, stop_extra: set[str]) -> list[str]:
+    t = re.sub(r"^\s*(?:(?:re|fwd?|회신|전달)\s*[:：]\s*)+", "", title or "", flags=re.I)
+    # [IROS] 같은 꼬리표는 낱말로 살리고 [마감]·(회신)·[공지] 같은 일반 꼬리표는 뺀다
+    t = re.sub(r"[\[(（【]([^\])）】]{0,12})[\])）】]",
+               lambda m: " " if m.group(1).strip().lower() in LABEL_TAGS else f" {m.group(1)} ", t)
+    words = []
+    for w in re.split(r"[\s/,·|]+", t):
+        w = w.strip(" -_:;.'\"“”‘’")
+        base = re.sub(r"(에게|에서|으로|에|의|을|를|은|는|이|가|과|와|도|로)$", "", w) if len(w) > 2 else w
+        if not w or w.lower() in LABEL_STOP or base.lower() in LABEL_STOP or w.lower() in stop_extra or w.isdigit():
+            continue
+        words.append(w)
+    return words
+
+
+def auto_label(title: str, stop_extra: set[str] | None = None) -> str:
+    """키워드가 없을 때 제목에서 1~3단어를 고른다. 앞의 [마감]·Re:·(회신) 같은 꼬리표와 뜻 없는 낱말(내·및·관련·요청·교수님·
+    본인 이름)은 뺀다. 판단이 필요한 좋은 이름은 Claire 가 short_label 로 적는다(labels_needed)."""
+    words = _label_words(title, stop_extra or set())
+    t = " ".join(words) or (title or "").strip()
     out: list[str] = []
-    for w in t.split():
+    for w in (words or t.split()):
         if out and len(" ".join(out + [w])) > 14:
             break
         out.append(w)
@@ -795,8 +821,32 @@ def auto_label(title: str) -> str:
     return label if len(label) <= 16 else label[:15] + "…"
 
 
-def keyword_of(e) -> str:
-    return f"{e.get('short_label') or auto_label(e['title'])}({short_num(e['ref'])})"
+def label_stopwords(cfg) -> set[str]:
+    """교수님 이름·주소 앞부분 (pilwon·hur 등). 키워드 대체값에서 뺀다."""
+    out = set()
+    for a in (cfg.get("gmail", {}).get("user_addresses") or []):
+        local = a.split("@", 1)[0].lower()
+        out.add(local)
+        out.update(x for x in re.split(r"[._\-+]", local) if len(x) >= 2)
+    return out
+
+
+def check_label(label: str | None) -> str | None:
+    """Claire 가 적는 키워드 검사: 1~3단어, 20자 이내, 뜻 없는 낱말만으로 된 것이 아닐 것. 문제가 있으면 이유."""
+    v = re.sub(r"\s+", " ", str(label or "")).strip()
+    if not v:
+        return "비어 있음"
+    if len(v.split()) > 3:
+        return "3단어 초과"
+    if len(v) > 20:
+        return "20자 초과"
+    if not _label_words(v, set()):
+        return "뜻 없는 낱말뿐 (내·및·관련·요청 등)"
+    return None
+
+
+def keyword_of(e, stop_extra: set[str] | None = None) -> str:
+    return f"{e.get('short_label') or auto_label(e['title'], stop_extra)}({short_num(e['ref'])})"
 
 
 def detail_score(cfg, e, today: date) -> int:
@@ -820,7 +870,7 @@ def _rank(cfg, entries: list[dict], today: date) -> list[dict]:
     return sorted(entries, key=lambda e: (-e["score"], e["due_at"] or "9999", e["id"]))
 
 
-def keyword_block(entries: list[dict], budget: int) -> dict:
+def keyword_block(entries: list[dict], budget: int, stop_extra: set[str] | None = None) -> dict:
     """키워드 요약: 분야(project)별로 묶고 글자 수 상한을 넘으면 묶음마다 "외 N건". 언급한 업무 번호(mentions)와
     줄인 업무(omitted)를 돌려준다 — 줄인 업무도 추적은 그대로이고 "전체 보기"로 모두 볼 수 있다."""
     groups: dict[str, list[dict]] = {}
@@ -834,7 +884,7 @@ def keyword_block(entries: list[dict], budget: int) -> dict:
         head = f"  {g}: " if named else "  "
         words = []
         for e in members:
-            k = keyword_of(e)
+            k = keyword_of(e, stop_extra)
             if used + len(head) + len(k) + 3 > budget and words:
                 break
             if used + len(head) + len(k) + 3 > budget:
@@ -947,14 +997,15 @@ def report_data(conn, cfg, now: datetime, overlays: list[dict] | None = None) ->
     od = _rank(cfg, b["overdue"], today)
     n_high = sum(1 for e in od if e["priority"] == "high")
     n_od = len(od) if len(od) <= rp["overdue_detail_max"] else max(rp["overdue_detail"], min(n_high, rp["overdue_detail_max"]))
+    stop = label_stopwords(cfg)
     overdue = {"total": len(od), "detail": od[:n_od], "rest": od[n_od:],
-               "keywords": keyword_block(od[n_od:], rp["keyword_chars"]),
+               "keywords": keyword_block(od[n_od:], rp["keyword_chars"], stop),
                "parked_overdue": sum(1 for e in b["parked"] if e["due_at"] and parse_iso(e["due_at"]) < now)}
     # 진행 확인: 최대 두 쪽. 쪽마다 상세 15건, 넘치면 마지막 쪽에 키워드.
     pg = _rank(cfg, b["progress"], today)
     cap = rp["progress_messages"] * rp["progress_detail_per_message"]
     progress = {"total": len(pg), "detail": pg[:cap], "rest": pg[cap:],
-                "keywords": keyword_block(pg[cap:], rp["keyword_chars"]),
+                "keywords": keyword_block(pg[cap:], rp["keyword_chars"], stop),
                 "per_message": rp["progress_detail_per_message"]}
 
     # 질문: 기본 3건 (나머지는 계속 추적). 마감이 가까운 업무의 질문 먼저.
@@ -980,7 +1031,13 @@ def report_data(conn, cfg, now: datetime, overlays: list[dict] | None = None) ->
               "overdue": len(od), "progress": len(pg), "check": len(check_refs),
               "parked": len(b["parked"]), "past_meetings": len(b["past_meetings"]), "done": len(done_refs),
               "upcoming": len(b["upcoming"]), "scheduled": len(b["scheduled"]) + len(b["snoozed"]) + len(b["captured"])}
+    # 0.7.1: 이번 보고에서 키워드로 보일 업무 중 이름(short_label)이 없는 것 — Claire 가 보내기 전에 labels 로 적는다
+    shown = set(overdue["keywords"]["mentions"]) | set(progress["keywords"]["mentions"])
+    labels_needed = [{"ref": e["ref"], "title": e["title"], "project": e.get("project"),
+                      "auto": auto_label(e["title"], stop)}
+                     for e in od[n_od:] + pg[cap:] if e["ref"] in shown and not e.get("short_label")]
     return {"today_date": today.isoformat(), "weekday": WEEKDAY_KO[today.weekday()], "counts": counts,
+            "labels_needed": labels_needed,
             "today_cal": b["today_cal"], "today_due": b["today_due"], "overlay": overlays or [],
             "overlaps": day["overlaps"], "deadline_clusters": day["deadline_clusters"],
             "overdue": overdue, "progress": progress, "questions": questions, "done_refs": done_refs,

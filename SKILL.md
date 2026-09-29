@@ -1,6 +1,6 @@
 ---
 name: claire-schedule-manager
-version: 0.7.0
+version: 0.7.1
 description: >-
   교수님의 일정·업무를 Gmail(기관 메일 포워드 포함)·Google Calendar·Obsidian Tasks·Discord 이미지에서
   하나의 장부(SQLite)로 모아 아침 브리핑·확인 질문·진행 추적·검색을 제공한다. Claire 전용 Discord 채널에서
@@ -13,7 +13,7 @@ description: >-
   Daily 완료 기록)·진행·되돌리기·검색과 Calendar·Obsidian 반영(주제 문서 Tasks), 보고 전달 기록까지 동작한다.
 ---
 
-# Claire 통합 일정·업무 관리 (v0.7.0 — 아침 보고 간소화·대기 재확인·Tasks 주제 문서)
+# Claire 통합 일정·업무 관리 (v0.7.1 — 아침 보고 간소화·대기 재확인·Tasks 주제 문서)
 
 정본 설계: 프로젝트의 `PRD.md` v1.9. 이 문서는 판단 계층(Claire)이 지켜야 할 규칙과 절차만 적는다.
 **스킬 파일은 고치지 않는다.** 규칙을 바꿔야 하면 교수님께 제안만 하고, 변경은 저장소 → 릴리스 → `claire-update`로 들어온다(§8).
@@ -127,7 +127,8 @@ OpenClaw cron이 "일일 점검을 실행하고 브리핑을 보내세요"를 �
    request_scope·priority·priority_reason 을 확정한다(update --actor claire). 목록은 회신 요청·잠정 높음·최근 순이다.
    애매하면 그대로 둔다(보통 중요도로 추적은 된다). 소급 분류 자체는 설치·maintain·아침 보고·업무 현황이 자동으로 한다(0.6.1).
    0.7.0: claire_search labels-missing 이 비어 있지 않으면 최대 40건의 제목을 보고 1~3단어 키워드(예: "RiTA 회신", "IROS 명단")를
-   지어 claire_store labels --file 로 적는다. 보고의 키워드 요약에 쓰인다(없으면 도구가 제목 앞부분을 쓴다). 뜻을 바꾸지 않는다.
+   지어 claire_store labels --file 로 적는다. 보고의 키워드 요약에 쓰인다. 뜻을 바꾸지 않는다. 0.7.1: 업무를 알아볼 수 있어야 한다 —
+   '내 연구 및', '관련 요청', 사람 이름만, 영어 한 낱말('Asset')처럼 무엇인지 모를 이름은 쓰지 않는다(도구가 일부를 거부한다).
 7. [Claire] 브리핑 작성 (references/briefing-format.md) → 파일로 저장
      0.7.0: 브리핑은 **짧게** — 머리글(소스 상태) · 중요한 신규·변경 최대 5줄(나머지는 "신규 N건·변경 M건" 한 줄) · 참고 한 줄.
      오늘 일정·기한 지남·진행 확인·질문·완료 건수·승인 대기·운영 점검은 9단계 아침 보고가 맡는다(다시 나열하지 않는다).
@@ -136,7 +137,9 @@ OpenClaw cron이 "일일 점검을 실행하고 브리핑을 보내세요"를 �
      로 변환해 messages[] 를 message 도구로 보낸다(§5). 쪽마다 claire_run deliver --id <delivery_id> --status sent
      --message-id <결과 id> (실패면 --status failed --error "…"). message 도구는 초기 도구 목록에 안 보인다 — tool search 로
      `message` 를 찾아 로드한 뒤 호출한다(§5). 검색해도 없거나 전송이 실패할 때만 본문을 그대로 답한다(--via reply).
-9. claire_buttons report  → **아침 보고**(§5.1): messages[] 를 순서대로 같은 방식으로 보내고 쪽마다 deliver.
+9. claire_buttons report --no-record → 결과 labels_needed(이번 보고에서 키워드로만 보일 업무 중 이름 없는 것)가 있으면 제목·원문을
+     보고 1~3단어 이름을 지어 claire_store labels --file 로 적는다(rejected 가 있으면 고쳐 한 번 더). 그다음
+   claire_buttons report  → **아침 보고**(§5.1): messages[] 를 순서대로 같은 방식으로 보내고 쪽마다 deliver.
      duplicate=true 면 보내지 않는다. resend=true 면 안 간 쪽만 온 것이다(그것만 보낸다). problems 에 section_overflow 가
      있어도 그 쪽을 그대로 보낸다(도구 한도 문제 — 교수님께 한 줄로 알린다). 질문(최대 3)·Tasks 문서 위치 질문·완료 반영 건수·
      승인 대기·지난 일정·운영 점검은 마지막 쪽에 들어 있다(따로 approvals·agenda 를 보내지 않는다).

@@ -713,6 +713,7 @@ def cmd_report(args, cfg):
                            "keywords": d["progress"]["keywords"]["mentions"],
                            "omitted": d["progress"]["keywords"]["omitted"]},
               "questions": [q["ref"] for q in d["questions"]["shown"]], "note_asks": d["note_asks"],
+              "labels_needed": d["labels_needed"],
               "approvals": out["approvals"],
               "health": {k: (v if k != "delivery" else {"count": v["count"]}) for k, v in out["health"].items()},
               "text": out["text"], "messages": out["messages"]}

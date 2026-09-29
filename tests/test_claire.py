@@ -2894,6 +2894,61 @@ class V070Test(FixtureBase):
         self.assertTrue(self.report()["duplicate"])
         self.assertIn("전체 목록", json.dumps(rp["messages"][-1]["components"], ensure_ascii=False))
 
+    # -- 0.7.1 (점검 2026-09-29) ------------------------------------------------------------------------------
+    def test_changed_defaults_are_migrated_once_on_install(self):
+        """init 이 예전 기본값을 config.json 에 적어 두어 새 기본값이 기존 설치에 안 먹던 문제 (Tasks 승인 대기 4건·보류 7일)."""
+        p = self.data / "config.json"
+        c = json.loads(p.read_text(encoding="utf-8"))
+        c.pop("_migrated_defaults", None)
+        c.setdefault("apply", {})["obsidian_add_task"] = "confirm_unless_directed"     # 0.6.x init 이 적어 둔 값
+        c.setdefault("tracking", {})["hold_default_days"] = 7
+        c["tracking"]["interval_days"] = {"high": 1, "normal": 3, "low": 7}            # 교수님이 바꾼 다른 값은 그대로
+        p.write_text(json.dumps(c, ensure_ascii=False), encoding="utf-8")
+        self.sh("claire_sync", "gmail")
+        m1 = self.gmail_event("m1")["id"]
+        self.propose([{"op": "create", "source_event_ids": [m1], "kind": "task", "title": "명단 정리", "due_at": "2026-09-18",
+                       "confidence": 0.9, "evidence": ["x"], "request_scope": "group"}])
+        self.assertEqual(self.outbox("obsidian.add_task")[0]["status"], "awaiting_confirm")
+        r = self.sh("claire_check", "init")                                            # claire-update 가 부른다
+        self.assertIn("apply.obsidian_add_task: confirm_unless_directed → always (기본값 변경 0.7.0)", r["config_added_keys"])
+        self.assertEqual(r["upkeep"]["task_approvals_released"], ["CLR-0001"])
+        c = json.loads(p.read_text(encoding="utf-8"))
+        self.assertEqual((c["apply"]["obsidian_add_task"], c["tracking"]["hold_default_days"]), ("always", 3))
+        self.assertEqual(c["tracking"]["interval_days"]["normal"], 3)
+        # 교수님이 다시 승인 방식으로 되돌리면 존중한다
+        c["apply"]["obsidian_add_task"] = "confirm_unless_directed"
+        p.write_text(json.dumps(c, ensure_ascii=False), encoding="utf-8")
+        self.sh("claire_check", "init")
+        self.assertEqual(json.loads(p.read_text(encoding="utf-8"))["apply"]["obsidian_add_task"], "confirm_unless_directed")
+        # 교수님이 따로 정한 보류 일수(10)는 바꾸지 않는다
+        c = json.loads(p.read_text(encoding="utf-8"))
+        c["_migrated_defaults"] = []; c["tracking"]["hold_default_days"] = 10
+        p.write_text(json.dumps(c, ensure_ascii=False), encoding="utf-8")
+        self.sh("claire_check", "init")
+        self.assertEqual(json.loads(p.read_text(encoding="utf-8"))["tracking"]["hold_default_days"], 10)
+
+    def test_label_quality_fallback_validation_and_needed_list(self):
+        a = self.ingest("dm", "등록: 여러")
+        titles = ["내 연구 및 교육 실적 제출", "내가 맡은 업무에 대한 보고", "Re: [IROS] Speaker list request", "prof 님 NRF 과제 협약"]
+        self.propose([{"op": "create", "source_event_ids": [a["source_event_id"]], "kind": "task", "title": t,
+                       "due_at": "2026-09-05", "confidence": 0.9, "evidence": ["x"]} for t in titles * 5])
+        self.at("2026-09-12T06:00:00+09:00")
+        rp = self.report("--no-record")
+        text = self.page(rp, "overdue")[0]["message"]
+        for bad in ("내 연구 및", "내가 맡은", "prof 님"):
+            self.assertNotIn(bad + "(", text)
+        self.assertTrue(re.search(r"연구 교육 실적\(\d+\)|IROS Speaker\(\d+\)|NRF 과제 협약\(\d+\)", text))
+        need = {x["ref"] for x in rp["labels_needed"]}
+        self.assertEqual(need, set(rp["overdue"]["keywords"]))                         # 키워드로 보일 것만
+        lf = self.data / "labels.json"
+        first = sorted(need)[:3]
+        lf.write_text(json.dumps({first[0]: "연구실적 제출", first[1]: "내 연구 및 보고", first[2]: "관련 요청"},
+                                 ensure_ascii=False), encoding="utf-8")
+        r = self.store("labels", "--file", lf)
+        self.assertEqual(r["updated"], [first[0]])
+        self.assertEqual([x["why"] for x in r["rejected"]], ["3단어 초과", "뜻 없는 낱말뿐 (내·및·관련·요청 등)"])
+        self.assertNotIn(first[0], {x["ref"] for x in self.report("--no-record")["labels_needed"]})
+
 
 class InstallTest(unittest.TestCase):
     """0.5.0: install.sh(설치 기록·claire-update·업그레이드 전 DB 사본)와 get.sh(릴리스 태그 설치·고정·확인)."""

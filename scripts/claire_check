@@ -80,6 +80,33 @@ def _open(path) -> sqlite3.Connection:
 # init
 # --------------------------------------------------------------------------
 
+# 기본값을 바꾼 설정 (0.7.1). init 이 예전 기본값을 config.json 에 적어 두었기 때문에(새 키 채우기) 기본값만 바꾸면 기존 설치에는
+# 적용되지 않았다(0.7.0 점검: Tasks 승인 대기 4건, 보류 7일). 값이 **예전 기본값 그대로일 때만** 한 번 새 값으로 바꾼다.
+# 교수님이 바꾼 값은 두고, 한 번 바꾼 뒤 교수님이 되돌리면 다시 바꾸지 않는다(config.json 의 _migrated_defaults 에 기록).
+CHANGED_DEFAULTS = [
+    ("apply.obsidian_add_task", "confirm_unless_directed", "always", "0.7.0"),   # Tasks 승인 없이 자동 (2026-09-29 결정)
+    ("tracking.hold_default_days", 7, 3, "0.7.0"),                               # 보류 재확인 기본 3일
+]
+
+
+def _migrate_defaults(user: dict) -> list[dict]:
+    done = user.setdefault("_migrated_defaults", [])
+    changed = []
+    for dotted, old, new, ver in CHANGED_DEFAULTS:
+        tag = f"{dotted}@{ver}"
+        if tag in done:
+            continue
+        *parents, leaf = dotted.split(".")
+        node = user
+        for k in parents:
+            node = node.get(k) if isinstance(node, dict) else None
+        if isinstance(node, dict) and leaf in node and node[leaf] == old:
+            node[leaf] = new
+            changed.append({"key": dotted, "from": old, "to": new, "version": ver})
+        done.append(tag)
+    return changed
+
+
 def _merge_config_file(path: Path) -> list[str]:
     """config.json 이 없으면 기본값으로 만들고, 있으면 새 키만 채운다. 사용자 값은 보존."""
     if not path.exists():
@@ -96,8 +123,11 @@ def _merge_config_file(path: Path) -> list[str]:
             elif isinstance(v, dict) and isinstance(current[k], dict):
                 merge(v, current[k], prefix + k + ".")
 
+    before = json.dumps(user, sort_keys=True)
+    migrated = _migrate_defaults(user)          # 먼저: 새로 채우는 키는 이미 새 기본값이다
     merge(DEFAULT_CONFIG, user)
-    if added:
+    added += [f"{m['key']}: {m['from']} → {m['to']} (기본값 변경 {m['version']})" for m in migrated]
+    if json.dumps(user, sort_keys=True) != before:
         atomic_write_text(path, json.dumps(user, ensure_ascii=False, indent=2) + "\n")
     return added
 

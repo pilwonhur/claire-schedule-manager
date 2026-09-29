@@ -64,9 +64,10 @@ def _bad(msg, **extra):
 
 
 def _short_label(v):
-    """0.7.0: 보고의 키워드 요약에 쓰는 1~3단어 이름 (예: "RiTA 회신"). 비우면 도구가 제목에서 자른다."""
+    """0.7.0: 보고의 키워드 요약에 쓰는 1~3단어 이름 (예: "RiTA 회신"). 0.7.1: 3단어·20자를 넘거나 뜻 없는 낱말뿐이면
+    쓰지 않는다(도구가 제목에서 고른다)."""
     v = re.sub(r"\s+", " ", str(v or "")).strip()
-    return v[:24] or None
+    return None if track.check_label(v) else v
 
 
 def _norm_dt(value, field: str, cfg, end_of_day: bool):
@@ -863,16 +864,24 @@ def cmd_labels(args, cfg):
     if not isinstance(data, dict):
         _bad("labels 파일은 {\"CLR-0001\": \"키워드\"} 모양")
     conn = connect(create=False); now_s = now_iso(cfg)
-    done = []
+    done, rejected = [], []
     with tx(conn):
         for ref, label in data.items():
             item = get_item(conn, ref)
-            v = _short_label(label)
+            why = track.check_label(label)
+            if why:
+                rejected.append({"ref": item["ref"], "label": label, "why": why})
+                continue
+            v = re.sub(r"\s+", " ", str(label)).strip()
             if v != item["short_label"]:
                 conn.execute("UPDATE item SET short_label=?, updated_at=? WHERE id=?", (v, now_s, item["id"]))
                 reindex_item(conn, item["id"])
                 done.append(item["ref"])
-    return {"updated": done, "message": f"키워드 {len(done)}건을 적었습니다."}
+    msg = f"키워드 {len(done)}건을 적었습니다."
+    if rejected:
+        msg += f" {len(rejected)}건은 적지 않았습니다(1~3단어·20자 이내, 업무를 알아볼 수 있는 낱말로 다시): " + \
+            ", ".join(f"{r['ref']} '{r['label']}' — {r['why']}" for r in rejected[:5])
+    return {"updated": done, "rejected": rejected, "message": msg}
 
 
 def cmd_resume(args, cfg):

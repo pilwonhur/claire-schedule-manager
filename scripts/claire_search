@@ -271,7 +271,7 @@ def cmd_report(args, cfg):
         sec = d[key]
         out[key] = {"total": sec["total"], "detail": [slim(e) for e in sec["detail"]], "rest": [slim(e) for e in sec["rest"]],
                     "keyword_lines": sec["keywords"]["lines"], "omitted": sec["keywords"]["omitted"]}
-    out.update(questions=d["questions"], done_refs=d["done_refs"], note_asks=d["note_asks"],
+    out.update(questions=d["questions"], done_refs=d["done_refs"], note_asks=d["note_asks"], labels_needed=d["labels_needed"],
                past_meetings=[slim(e) for e in d["past_meetings"]], parked=[slim(e) for e in d["parked"]],
                health=track.health(conn, cfg, now), data_as_of=_data_as_of(conn))
     return out
@@ -287,11 +287,13 @@ def cmd_labels_missing(args, cfg):
     for e in order:
         if not e.get("short_label") and e["ref"] not in seen:
             seen.add(e["ref"])
-            out.append({"ref": e["ref"], "title": e["title"], "project": e.get("project"), "auto": track.auto_label(e["title"])})
+            out.append({"ref": e["ref"], "title": e["title"], "project": e.get("project"),
+                        "auto": track.auto_label(e["title"], track.label_stopwords(cfg))})
     total = conn.execute(f"SELECT COUNT(*) c FROM item WHERE deleted_at IS NULL AND {OPEN_SQL} AND "
                          "(short_label IS NULL OR short_label='')").fetchone()["c"]
     return {"items": out[:args.limit], "total_missing": total,
-            "note": "제목을 보고 1~3단어로(예: 'RiTA 회신', 'IROS 명단'). 없으면 도구가 제목 앞부분(auto)을 쓴다."}
+            "note": "제목·원문을 보고 업무를 알아볼 수 있는 1~3단어(20자 이내)로. 예: 'RiTA 회신', 'IROS 명단'. "
+                    "'내 연구', '관련 요청', 사람 이름만 같은 것은 도구가 거부한다. 없으면 도구가 제목에서 고른다(auto)."}
 
 
 def cmd_importance_review(args, cfg):

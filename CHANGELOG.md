@@ -3,6 +3,32 @@
 형식은 [Keep a Changelog](https://keepachangelog.com/ko/1.1.0/)를 따르고 버전은 SemVer다.
 데이터 형식 버전(`SCHEMA_VERSION`)은 따로 관리한다.
 
+## [0.7.1] — 2026-09-29
+
+0.7.0 설치 뒤 Claire 의 전체 점검(`claire-v070-audit-2026-09-29.md`, 9/29 22:00)이 짚은 보완. 스키마 변경 없음(v4).
+
+### 1. 새 기본값이 기존 설치에 적용되지 않음 (Tasks 승인 대기 4건 남음)
+- 원인: `claire_check init`이 설치 때마다 없는 설정 키를 기본값으로 `config.json`에 **적어 두어**, 예전 기본값
+  (`apply.obsidian_add_task: confirm_unless_directed`, `tracking.hold_default_days: 7`)이 교수님 설정처럼 남았다. 0.7.0 은 기본값만 바꿔
+  기존 설치에는 Tasks 승인 없는 자동 등록·보류 3일이 먹지 않았다.
+- 이제 init 이 **바뀐 기본값 목록**(`CHANGED_DEFAULTS`)을 한 번 적용한다: 값이 **예전 기본값 그대로일 때만** 새 값으로 바꾸고
+  `config.json`의 `_migrated_defaults`에 적는다. 교수님이 다르게 정한 값은 두고, 바꾼 뒤 교수님이 되돌리면 다시 바꾸지 않는다.
+  같은 init 의 upkeep 이 승인 대기 Tasks 를 풀어 위치 규칙대로 쓴다. 결과 `config_added_keys`에 바뀐 키가 보인다.
+
+### 2. 키워드 품질 ('내 연구 및', '내가 맡은 업무에', 'pilwon')
+- 이름(`short_label`)이 없을 때의 대체값: 앞의 Re:·Fwd:·[마감]·(회신) 같은 꼬리표와 뜻 없는 낱말(내·내가·및·관련·요청·안내·교수님 등)과
+  교수님 이름·주소 앞부분을 빼고 고른다. `[IROS]` 같은 꼬리표는 낱말로 살린다. (예: `내 연구 및 교육 실적 제출` → `연구 교육 실적`)
+- 아침 보고 결과에 `labels_needed`(이번 보고에서 키워드로만 보일 업무 중 이름 없는 것). SKILL 9단계: 보내기 전에 `report --no-record`로
+  보고 Claire 가 이름을 지어 `claire_store labels`로 적은 뒤 보낸다.
+- `labels`·제안 `short_label` 검사: 1~3단어, 20자 이내, 뜻 없는 낱말뿐이면 거부(`rejected`와 이유). 알아볼 수 있는지는 Claire 판단(SKILL).
+
+### 그대로 둔 것 (점검 지적 중)
+- "스레드" = 채널 메시지 1개: 교수님 결정(2026-09-29 이슈 §6-1)대로다. 실제 Discord 하위 스레드가 필요하면 따로 요청.
+- 프로젝트 → 문서 연결 0건·중요도 미검토 4건·기존 제목 정리·메일 해석 대기 54건: 운영(다음 06:00 절차·아침 보고의 문서 위치 질문)으로 처리된다.
+
+### 테스트
+- 122건(+2): 바뀐 기본값 한 번 적용·교수님 값 존중·되돌림 존중, 키워드 대체값·검사·labels_needed.
+
 ## [0.7.0] — 2026-09-29
 
 교수님 개선 요청 반영(`claire-briefing-simplification-issue-2026-09-29.md`, Epic: 아침 브리핑 간소화 및 대기·Obsidian Tasks 관리 개선).
