@@ -27,13 +27,14 @@ from zoneinfo import ZoneInfo
 #
 # 스킬 전체의 배포 버전 (SemVer). 동작이나 문서가 바뀌면 반드시 올리고
 # CHANGELOG.md에 항목을 남긴다. tests/test_claire.py가 둘의 일치를 검사한다.
-CLAIRE_VERSION = "0.6.1"
+CLAIRE_VERSION = "0.7.0"
 
 # 데이터 파일 형식의 버전. 스키마가 바뀌면 올리고 MIGRATIONS 에 기존 DB 변환을 적는다.
 # v2 (0.5.0): item.due_precision·window_auto·attendance·daily_logged_on, outbox.selected_at, checkin 표.
 # v3 (0.6.0): item.request_scope·priority_source·priority_reason·check_every_days·review_after·close_reason·
 #             last_exposed_at·last_asked_at·last_reported_at, delivery 표 (완료까지 추적·전달 기록).
-SCHEMA_VERSION = 3
+# v4 (0.7.0): item.short_label·last_detailed_at, delivery.mention_refs, note_map 표 (아침 보고 간소화·Tasks 주제 문서).
+SCHEMA_VERSION = 4
 
 # --------------------------------------------------------------------------
 # 설정 (PRD §12, §15)
@@ -88,6 +89,12 @@ DEFAULT_CONFIG = {
         "custom_status_symbols": {},
         "completed_days": 90,
         "navigation_guide": "Vault_Navigation_Guide.md",
+        # 0.7.0 — 새 Tasks 줄의 자리: topic(업무의 정본 노트 → 프로젝트 연결 문서 → 임시 수집 노트) | daily(0.6.x: 마감일 Daily)
+        "tasks_placement": "topic",
+        "inbox_note": "01 Inbox/Claire 업무 수집함.md",   # 관련 문서를 특정하지 못한 업무의 임시 수집 노트
+        "topic_task_section": "## Tasks",                  # 주제 문서 안에서 Tasks 줄을 넣을 섹션 (없으면 문서 끝에 만든다)
+        # 문서 후보를 찾을 폴더 (처음 보는 프로젝트의 기록 위치를 교수님께 여쭐 때)
+        "candidate_folders": ["10 Projects", "20 Areas", "30 Resources"],
     },
 
     # D11 — OpenClaw 브리지가 첨부를 로컬 파일로 내려받는 위치
@@ -126,7 +133,7 @@ DEFAULT_CONFIG = {
     "briefing": {"imminent_days": 3, "travel_minutes": 30, "section_limit": 7},
 
     # D6 — 후속·재질문
-    "followup": {"waiting_business_days": 3, "reask_daily_days": 2,
+    "followup": {"waiting_business_days": 3, "wait_default_days": 3, "reask_daily_days": 2,
                  "reask_weekday": "mon", "reask_urgent_hours": 48,
                  "question_expire_days_after_due": 7},
 
@@ -134,8 +141,9 @@ DEFAULT_CONFIG = {
     "apply": {
         "enabled": True,
         "calendar_create_requires_confirm_for_discovered": 1,
-        "obsidian_add_task": "confirm_unless_directed",   # always | confirm_unless_directed | never
-        "daily_for_due_date": True,                        # Daily 줄을 마감일 Daily 에 (False 면 오늘 Daily)
+        # 0.7.0: 승인 없이 자동 (교수님 결정 2026-09-29). 위치는 obsidian.tasks_placement. 달력 등록 승인은 그대로다.
+        "obsidian_add_task": "always",                     # always | confirm_unless_directed | never
+        "daily_for_due_date": True,                        # (tasks_placement=daily 일 때만) 마감일 Daily 에
         "max_attempts": 5,
         "backoff_minutes": [1, 5, 15, 60, 240],
         "calendar_reminder_minutes": 30,
@@ -161,10 +169,20 @@ DEFAULT_CONFIG = {
         "interval_days": {"high": 1, "normal": 2, "low": 7},
         # 이 중요도의 주기는 주말을 세지 않는다 (높음·전날·당일·기한 경과는 주말에도 확인)
         "skip_weekends_for": ["normal", "low"],
-        "hold_default_days": 7,              # 보류 재확인일을 말하지 않으면 N일 뒤
+        "hold_default_days": 3,              # 보류 재확인일을 말하지 않으면 N일 뒤 (0.7.0: 7 → 3, 대기와 같게)
         "exposure_grace_hours": 30,          # 높은 중요도 업무가 이 시간 넘게 전달되지 않으면 누락으로 표시
         "delivery_confirm_minutes": 60,      # 생성 뒤 이 시간 안에 전송 확인이 없으면 "전달 확인 안 됨"
         "deadline_cluster_min": 2,           # 1시간 안에 몰린 마감이 N건 이상이면 작업량 안내 (충돌 경고 아님)
+    },
+    # 0.7.0 — 아침 보고 분량 (ISSUE 2026-09-29). 전체 업무는 계속 추적하고 보고에는 필요한 만큼만 싣는다.
+    "report": {
+        "overdue_detail": 10,               # 기한 지남: 버튼과 함께 자세히 보일 건수 (기본)
+        "overdue_detail_max": 15,           # 중요(높음)가 더 많으면 이만큼까지
+        "progress_messages": 2,             # 진행 확인 구역의 메시지(쪽) 수 상한
+        "progress_detail_per_message": 15,  # 진행 확인 한 쪽에 버튼과 함께 보일 건수
+        "keyword_chars": 1100,              # 한 쪽의 키워드 요약 글자 수 상한 (넘으면 분야별 "외 N건")
+        "questions_max": 3,                 # 확인 필요 질문 (나머지는 계속 추적하고 다음에)
+        "done_hours": 24,                   # "완료 반영 N건"을 셀 기간
     },
     # 0.6.0 — 정기 일정 회차의 준비 업무 템플릿 (교수님이 승인한 것만). 비어 있으면 만들지 않는다.
     # 예: {"match": "로봇공학", "title": "{title} 준비", "days_before": 1, "kind": "prep"}
@@ -317,6 +335,8 @@ CREATE TABLE IF NOT EXISTS item (
   last_exposed_at TEXT,
   last_asked_at  TEXT,
   last_reported_at TEXT,
+  short_label    TEXT,
+  last_detailed_at TEXT,
   created_at     TEXT NOT NULL,
   updated_at     TEXT NOT NULL,
   completed_at   TEXT,
@@ -521,6 +541,7 @@ CREATE TABLE IF NOT EXISTS delivery (
   item_refs     TEXT,
   check_refs    TEXT,
   question_refs TEXT,
+  mention_refs  TEXT,
   payload       TEXT NOT NULL,
   content_hash  TEXT NOT NULL,
   problems      TEXT,
@@ -535,6 +556,18 @@ CREATE TABLE IF NOT EXISTS delivery (
 );
 CREATE INDEX IF NOT EXISTS ix_delivery_status ON delivery(status);
 
+-- 0.7.0: 프로젝트 → Obsidian 주제 문서 (Tasks 줄의 자리). 교수님이 확인한 연결만 confirmed.
+CREATE TABLE IF NOT EXISTS note_map (
+  project       TEXT PRIMARY KEY,
+  note          TEXT,
+  status        TEXT NOT NULL CHECK (status IN ('pending','confirmed','inbox')),
+  candidates    TEXT,
+  asked_count   INTEGER NOT NULL DEFAULT 0,
+  last_asked_at TEXT,
+  created_at    TEXT NOT NULL,
+  updated_at    TEXT NOT NULL
+);
+
 -- 한국어 검색 (Clio의 어간 근사 처리 재사용)
 CREATE VIRTUAL TABLE IF NOT EXISTS search_fts USING fts5(
   ref, title, project, next_action, waiting_on, excerpts,
@@ -545,7 +578,7 @@ CREATE VIRTUAL TABLE IF NOT EXISTS search_fts USING fts5(
 # 백업·복구 대조와 무결성 집계에 쓰는 표 목록 (TC20)
 COUNT_TABLES = ["item", "source_event", "item_source", "attachment", "question",
                 "activity_log", "relation", "link", "sync_state", "run", "outbox",
-                "briefing", "checkin", "delivery"]
+                "briefing", "checkin", "delivery", "note_map"]
 
 # 내용 해시에 참여하는 표. 복구 후 "건수·해시 일치"의 해시가 이것이다 (TC20).
 HASH_TABLES = ["item", "source_event", "item_source", "question", "activity_log",
@@ -621,8 +654,12 @@ MIGRATION_COLUMNS = {
         ("last_exposed_at", "TEXT"),
         ("last_asked_at", "TEXT"),
         ("last_reported_at", "TEXT"),
+        # v4 (0.7.0)
+        ("short_label", "TEXT"),
+        ("last_detailed_at", "TEXT"),
     ],
     "outbox": [("selected_at", "TEXT")],
+    "delivery": [("mention_refs", "TEXT")],
 }
 
 
@@ -855,7 +892,8 @@ def reindex_item(conn, item_id: int) -> None:
     conn.execute(
         "INSERT INTO search_fts(rowid, ref, title, project, next_action, waiting_on, excerpts) "
         "VALUES(?,?,?,?,?,?,?)",
-        (item_id, item["ref"], item["title"], item["project"] or "", item["next_action"] or "",
+        (item_id, item["ref"], item["title"] + (f" {item['short_label']}" if item["short_label"] else ""),
+         item["project"] or "", item["next_action"] or "",
          item["waiting_on"] or "", excerpts),
     )
 

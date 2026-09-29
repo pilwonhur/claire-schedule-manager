@@ -9,6 +9,9 @@
     자동 마감 표시끼리 겹친 것은 충돌이 아니라 작업량 안내다(R7).
   - 업무 현황(agenda): 활성 미완료 업무 전체를 구역별로. "외 N건"으로 숨기지 않는다(R2).
   - 전달 기록(delivery): 보고 생성과 전송 성공을 나눈다. 전송 성공한 페이지의 업무만 "보여 줌"·"확인함"(R8).
+  - 아침 보고(report, 0.7.0 ISSUE 2026-09-29): 전체 업무는 계속 추적하되 보고에는 필요한 만큼만 — 오늘 · 기한 지남(한 쪽) ·
+    진행 확인(최대 두 쪽) · 확인·상태. 버튼과 함께 보일 업무는 점수로 고르고 나머지는 1~3단어 키워드(번호 포함)로 줄인다.
+    표시를 줄여도 업무 상태·마감·추적 정보는 그대로다. 전체는 요청하면 본다(업무 현황 agenda / --view).
 
 판단하지 않는 규칙만 둔다. 요청 범위(직접/단체)의 판단은 Claire 가 제안에 적는다(request_scope).
 """
@@ -29,8 +32,9 @@ SCOPE_KO = {"direct": "직접 요청", "group": "단체 요청", "self": "본인
 
 # 진행 확인 사유 (정렬 순서 = 목록 순서)
 REASON_KO = {"overdue": "기한 지남", "meeting_passed": "지난 일정 — 완료 체크", "d_day": "오늘",
-             "d_minus_1": "내일", "recheck": "재확인일", "daily": "매일 확인", "cadence": "{n}일마다 확인"}
-REASON_ORDER = ["overdue", "meeting_passed", "d_day", "d_minus_1", "recheck", "daily", "cadence"]
+             "d_minus_1": "내일", "recheck": "재확인일", "wait_due": "마감 임박(대기 중)", "daily": "매일 확인",
+             "cadence": "{n}일마다 확인"}
+REASON_ORDER = ["overdue", "meeting_passed", "d_day", "d_minus_1", "recheck", "wait_due", "daily", "cadence"]
 
 
 # --------------------------------------------------------------------------
@@ -173,11 +177,103 @@ def repair_deadline_markers(conn, cfg, ts: str) -> list[str]:
     return fixed
 
 
+def backfill_recheck_dates(conn, cfg, ts: str) -> list[str]:
+    """0.7.0: 모든 대기·보류 업무에 재확인 날짜를 둔다. 날짜가 없는 것(0.6.x 전 기록)은 마지막 변경 + 기본 일수, 이미 지났으면 오늘.
+    답이 없어도 무기한 기다리지 않게 한다. 멱등(날짜가 있는 업무는 건드리지 않는다)."""
+    fixed = []
+    today = parse_iso(ts).astimezone(tz_of(cfg)).date()
+    for it in conn.execute("SELECT * FROM item WHERE deleted_at IS NULL AND status IN ('waiting','on_hold') "
+                           "AND (next_check_at IS NULL OR next_check_at='')").fetchall():
+        base = local_date(cfg, it["updated_at"]) or today
+        d = max(today, base + timedelta(days=default_wait_days(cfg, it["status"])))
+        nxt = at_daily_hour(cfg, d)
+        conn.execute("UPDATE item SET next_check_at=? WHERE id=?", (nxt, it["id"]))
+        log_activity(conn, item_id=it["id"], action="update", actor="claire", ts=ts, field="next_check_at", old_value=None,
+                     new_value=nxt, reason="재확인일이 없는 대기·보류 → 기본 재확인일 (0.7.0)",
+                     payload={"before": {"next_check_at": it["next_check_at"]}})
+        fixed.append(it["ref"])
+    return fixed
+
+
+def release_task_approvals(conn, cfg, ts: str) -> list[str]:
+    """0.7.0: Tasks 등록은 승인 없이 자동(교수님 결정 2026-09-29). 승인을 기다리던 Tasks 등록을 바로 반영 대기로 돌린다.
+    줄의 자리는 반영할 때 정한다(업무의 정본 노트 → 프로젝트 연결 문서 → 임시 수집 노트). "표시 안 함"으로 뺀 것은 그대로 둔다."""
+    if cfg.get("apply", {}).get("obsidian_add_task", "always") != "always":
+        return []
+    rows = conn.execute("SELECT o.id, i.ref FROM outbox o JOIN item i ON i.id=o.item_id WHERE o.op='obsidian.add_task' "
+                        "AND o.status='awaiting_confirm' AND i.deleted_at IS NULL AND i.status IN (%s)"
+                        % ",".join("?" * len(OPEN_STATUSES)), OPEN_STATUSES).fetchall()
+    for r in rows:
+        conn.execute("UPDATE outbox SET status='pending', requires_confirm=0, confirmed_at=?, selected_at=NULL WHERE id=?",
+                     (ts, r["id"]))
+    return [r["ref"] for r in rows]
+
+
 def upkeep(conn, cfg, ts: str) -> dict:
-    """설치(claire_check init)·매일 점검(maintain)·업무 현황(agenda) 앞에서 도는 멱등 정리.
-    기존 업무 중요도 소급 분류(한 번)와 자동 마감 표시 보정."""
+    """설치(claire_check init)·매일 점검(maintain)·업무 현황(agenda)·아침 보고(report) 앞에서 도는 멱등 정리.
+    기존 업무 중요도 소급 분류, 자동 마감 표시 보정, 대기·보류 재확인일 채우기, 승인 대기 Tasks 자동 전환(0.7.0)."""
     return {"importance_backfill": backfill_importance(conn, cfg, ts),
-            "markers_repaired": repair_deadline_markers(conn, cfg, ts)}
+            "markers_repaired": repair_deadline_markers(conn, cfg, ts),
+            "recheck_dates_set": backfill_recheck_dates(conn, cfg, ts),
+            "task_approvals_released": release_task_approvals(conn, cfg, ts)}
+
+
+# --------------------------------------------------------------------------
+# 대기·보류 재확인일 (0.7.0, ISSUE 2026-09-29 §4)
+# --------------------------------------------------------------------------
+
+def default_wait_days(cfg, status: str) -> int:
+    if status == "on_hold":
+        return int(cfg.get("tracking", {}).get("hold_default_days", 3))
+    return int(cfg.get("followup", {}).get("wait_default_days", 3))
+
+
+def at_daily_hour(cfg, d: date) -> str:
+    return datetime(d.year, d.month, d.day, int(cfg["run"]["daily_hour"]), 0, 0, tzinfo=tz_of(cfg)).isoformat()
+
+
+def recheck_plan(cfg, now: datetime, status: str, until: date | None, due_at: str | None) -> dict:
+    """대기·보류의 재확인일. {"date", "defaulted", "note"}.
+    - 교수님이 날짜를 말하면 그 날짜(마감보다 늦어도 존중하되, 마감은 그대로이고 마감 전날·당일에는 알린다는 안내).
+    - 날짜가 없으면 기본 N일 뒤(달력 기준). 마감이 더 빠르면 마감 전날로 당기고, 이미 마감이 지났으면 다음 날.
+    대기 설정으로 업무 마감을 연장하지 않는다."""
+    today = now.astimezone(tz_of(cfg)).date()
+    due_d = local_date(cfg, due_at) if due_at else None
+    if until:
+        note = None
+        if due_d and until > due_d:
+            note = (f"마감 {md(due_d)}이 재확인일 {md(until)}보다 먼저입니다. 마감은 그대로이고 마감 전날·당일에는 알려 드립니다.")
+        return {"date": until, "defaulted": False, "note": note}
+    n = default_wait_days(cfg, status)
+    d = today + timedelta(days=n)
+    note = None
+    if due_d and due_d - timedelta(days=1) < d:
+        if due_d <= today:
+            d = today + timedelta(days=1)
+            note = f"마감({md(due_d)})이 이미 지나 내일({md(d)}) 다시 확인합니다."
+        else:
+            d = max(today + timedelta(days=1), due_d - timedelta(days=1))
+            note = f"마감 {md(due_d)} 전에 확인하도록 {md(d)}로 당겼습니다."
+    return {"date": d, "defaulted": True, "note": note, "default_days": n}
+
+
+def recheck_ask(cfg, ref: str, status: str, plan: dict, now: datetime) -> dict:
+    """날짜 없이 대기·보류를 고르면 반드시 언제까지 기다릴지 묻는다(기본값은 이미 적용). 날짜 버튼을 붙인다.
+    버튼 라벨 `CLR-0031 10/2까지 대기`는 그대로 교수님 지시로 읽힌다(claire_store wait|hold --until)."""
+    today = now.astimezone(tz_of(cfg)).date()
+    verb = "대기" if status == "waiting" else "보류"
+    d = plan["date"]
+    choices = []
+    for c in (today + timedelta(days=1), d, today + timedelta(days=7)):
+        if c not in choices and c > today:
+            choices.append(c)
+    choices.sort()
+    labels = [f"{ref} {md(c)}까지 {verb}" + (" (기본)" if c == d else "") for c in choices]
+    text = (f"언제 다시 확인할까요? 지정하지 않으시면 {md(d)}({WEEKDAY_KO[d.weekday()]})에 확인하겠습니다."
+            + (f" {plan['note']}" if plan.get("note") else ""))
+    return {"text": text, "labels": labels,
+            "components": {"reusable": True, "text": text,
+                           "blocks": [{"type": "actions", "buttons": [{"label": l, "style": "secondary"} for l in labels]}]}}
 
 
 # --------------------------------------------------------------------------
@@ -301,10 +397,15 @@ def check_plan(cfg, item, now: datetime, since: date | None = None) -> dict:
         return {**out, "reason": "reported_today", "label": "오늘 보고받음"}
     if st in ("waiting", "on_hold"):
         nc = local_date(cfg, item["next_check_at"])
-        if nc is None and st == "on_hold":       # 0.6.0 전 보류(재확인일 없음): 기본 N일 뒤
-            nc = (local_date(cfg, item["updated_at"]) or today) + timedelta(days=int(tr.get("hold_default_days", 7)))
+        if nc is None:                           # 재확인일 없는 옛 기록(upkeep 이 채운다): 기본 N일 뒤
+            nc = (local_date(cfg, item["updated_at"]) or today) + timedelta(days=default_wait_days(cfg, st))
         if nc and nc <= today:
+            # 재확인일부터 답을 받을 때까지 매일 (무응답이어도 완료·숨김 없음)
             return {"due": True, "reason": "recheck", "label": REASON_KO["recheck"], "next_on": nc}
+        due_d = local_date(cfg, item["due_at"])
+        if due_d and today in (due_d - timedelta(days=1), due_d):
+            # 재확인일이 마감보다 늦어도 마감 전날·당일에는 알린다 (대기가 마감을 늦추지 않는다)
+            return {"due": True, "reason": "wait_due", "label": REASON_KO["wait_due"], "next_on": today}
         return {**out, "reason": "waiting" if st == "waiting" else "on_hold", "next_on": nc}
     if st == "captured":
         return {**out, "reason": "captured"}          # 신뢰도 낮은 참고 항목: 목록에는 있고 진행 질문은 하지 않는다
@@ -387,7 +488,9 @@ def _entry(conn, cfg, it, plan) -> dict:
             "time_kind": time_kind(it, cfg), "next_action": it["next_action"], "waiting_on": it["waiting_on"],
             "next_check_at": it["next_check_at"], "blocked_reason": it["blocked_reason"],
             "check": {**plan, "next_on": plan["next_on"].isoformat() if plan.get("next_on") else None},
-            "external": _ext_note(conn, it)}
+            "external": _ext_note(conn, it), "project": it["project"], "short_label": _get(it, "short_label"),
+            "last_detailed_at": _get(it, "last_detailed_at"), "created_at": it["created_at"],
+            "all_day": it["all_day"], "due_precision": it["due_precision"]}
 
 
 def agenda_data(conn, cfg, now: datetime, overlays: list[dict] | None = None) -> dict:
@@ -663,6 +766,395 @@ def agenda_text(cfg, data: dict) -> str:
 
 
 # --------------------------------------------------------------------------
+# 아침 보고 (0.7.0, ISSUE 2026-09-29) — 전체는 추적하고 보고에는 필요한 만큼만
+# --------------------------------------------------------------------------
+
+PRI_SCORE = {"high": 300, "normal": 200, "low": 100}
+REPORT_NAV = {"overdue": "기한 지남 전체 보기", "progress": "진행 확인 전체 보기", "past": "지난 일정 보기",
+              "waiting": "대기·보류 보기", "done": "완료 내역 보기", "questions": "질문 전체 보기",
+              "approvals": "승인 대기 보기", "full": "전체 목록"}
+
+
+def short_num(ref: str) -> str:
+    """CLR-0764 → 764 (교수님이 짧게 적으면 도구가 CLR-0764 로 읽는다)."""
+    m = re.search(r"(\d+)$", ref or "")
+    return str(int(m.group(1))) if m else ref
+
+
+def auto_label(title: str) -> str:
+    """키워드가 없을 때 제목에서 1~3단어를 자른다. 앞의 [마감]·(회신) 같은 꼬리표는 뺀다."""
+    t = re.sub(r"^\s*(?:[\[(（【][^\])）】]{0,12}[\])）】]\s*)+", "", title or "").strip() or (title or "").strip()
+    out: list[str] = []
+    for w in t.split():
+        if out and len(" ".join(out + [w])) > 14:
+            break
+        out.append(w)
+        if len(out) == 3:
+            break
+    label = " ".join(out) or t
+    return label if len(label) <= 16 else label[:15] + "…"
+
+
+def keyword_of(e) -> str:
+    return f"{e.get('short_label') or auto_label(e['title'])}({short_num(e['ref'])})"
+
+
+def detail_score(cfg, e, today: date) -> int:
+    """상세(버튼)로 보일 업무 고르기: 중요도 → 직접 요청 → 내일·재확인·마감 임박 → 최근에 기한이 지난 것 →
+    오래 상세로 보이지 않은 것(같은 업무만 반복되지 않게, 최대 10일분). 결정론적."""
+    s = PRI_SCORE.get(e["priority"], 200)
+    if e.get("request_scope") == "direct":
+        s += 60
+    s += {"d_minus_1": 120, "wait_due": 120, "recheck": 90, "d_day": 150}.get(e["check"].get("reason"), 0)
+    due_d = local_date(cfg, e["due_at"])
+    if due_d and due_d < today:
+        s += max(0, 30 - (today - due_d).days) * 2
+    last = local_date(cfg, e.get("last_detailed_at")) or local_date(cfg, e.get("created_at"))
+    s += min((today - last).days if last else 10, 10) * 8
+    return s
+
+
+def _rank(cfg, entries: list[dict], today: date) -> list[dict]:
+    for e in entries:
+        e["score"] = detail_score(cfg, e, today)
+    return sorted(entries, key=lambda e: (-e["score"], e["due_at"] or "9999", e["id"]))
+
+
+def keyword_block(entries: list[dict], budget: int) -> dict:
+    """키워드 요약: 분야(project)별로 묶고 글자 수 상한을 넘으면 묶음마다 "외 N건". 언급한 업무 번호(mentions)와
+    줄인 업무(omitted)를 돌려준다 — 줄인 업무도 추적은 그대로이고 "전체 보기"로 모두 볼 수 있다."""
+    groups: dict[str, list[dict]] = {}
+    for e in entries:
+        groups.setdefault((e.get("project") or "").strip() or "기타", []).append(e)
+    named = len(groups) > 1 or "기타" not in groups
+    lines, mentions, omitted = [], [], []
+    used = 0
+    # 분야 묶음은 중요한 업무가 든 순서(입력이 점수 순), "기타"는 맨 뒤
+    for g, members in sorted(groups.items(), key=lambda kv: kv[0] == "기타"):
+        head = f"  {g}: " if named else "  "
+        words = []
+        for e in members:
+            k = keyword_of(e)
+            if used + len(head) + len(k) + 3 > budget and words:
+                break
+            if used + len(head) + len(k) + 3 > budget:
+                break
+            words.append(k)
+            used += len(k) + 3
+            mentions.append(e["ref"])
+        rest = members[len(words):]
+        omitted += [e["ref"] for e in rest]
+        if words:
+            lines.append(head + " · ".join(words) + (f" 외 {len(rest)}건" if rest else ""))
+            used += len(head)
+        elif rest:
+            lines.append(f"{head}{len(rest)}건")
+            used += len(head) + 4
+    return {"lines": lines, "mentions": mentions, "omitted": omitted}
+
+
+def _today_when(cfg, r, tk) -> tuple[str, str]:
+    """1구역 한 줄의 시간 표기와 정렬 키. 작업 예약과 실제 마감을 한 항목에서 구분한다."""
+    if r["kind"] == "meeting":
+        when = "종일" if r["all_day"] else _hm(cfg, r["start_at"]) + (
+            f"–{_hm(cfg, r['end_at'])}" if r["end_at"] and len(r["end_at"]) > 10 else "")
+        return when, r["start_at"] or ""
+    due_today = r["due_at"] and local_date(cfg, r["due_at"]) == local_date(cfg, r["start_at"])
+    if tk == "deadline_marker":
+        return (f"{_hm(cfg, r['due_at'])} 마감" if r["due_at"] else _hm(cfg, r["start_at"])), r["start_at"]
+    work = _hm(cfg, r["start_at"]) + (f"–{_hm(cfg, r['end_at'])}" if r["end_at"] and len(r["end_at"]) > 10 else "") + " 작업"
+    if r["due_at"]:
+        if due_today and r["due_precision"] == "time":
+            work += f" · {_hm(cfg, r['due_at'])} 마감"
+        elif due_today:
+            work += " · 오늘 마감"
+        else:
+            work += f" · 마감 {_due_text(cfg, r).replace(' 마감', '')}"
+    return work, r["start_at"]
+
+
+def pending_note_asks(conn, cfg, now: datetime, limit: int = 1) -> list[dict]:
+    """처음 보는 프로젝트의 Tasks 문서 위치 질문 (한 번 묻고, 답이 없으면 7일 뒤 한 번 더. 그 뒤로는 수집함에 두고 묻지 않는다)."""
+    out = []
+    week_ago = (now - timedelta(days=7)).isoformat()
+    for r in conn.execute("SELECT * FROM note_map WHERE status='pending' AND asked_count < 2 AND "
+                          "(last_asked_at IS NULL OR last_asked_at <= ?) ORDER BY created_at LIMIT ?", (week_ago, limit)):
+        out.append({"project": r["project"], "candidates": json.loads(r["candidates"] or "[]"),
+                    "asked_count": r["asked_count"]})
+    return out
+
+
+def report_data(conn, cfg, now: datetime, overlays: list[dict] | None = None) -> dict:
+    """아침 보고 재료. 활성 업무를 한 곳에만 넣고(accounting 합 = 활성 수) 표시할 만큼만 고른다.
+    today_cal(오늘 달력) · today_due(달력 밖 오늘 마감) · overdue(기한 지남: 상세 10~15 + 키워드) ·
+    progress(기한 전·마감 없는 업무 중 오늘 확인 차례: 두 쪽) · 숨김(지난 일정·앞으로의 일정·대기·보류·확인 차례 아님)."""
+    tz = tz_of(cfg)
+    rp = {**{"overdue_detail": 10, "overdue_detail_max": 15, "progress_messages": 2, "progress_detail_per_message": 15,
+             "keyword_chars": 1100, "questions_max": 3, "done_hours": 24}, **(cfg.get("report") or {})}
+    today = now.astimezone(tz).date()
+    since = tracking_since(conn, cfg)
+    rows = conn.execute("SELECT * FROM item WHERE deleted_at IS NULL AND status IN (%s) ORDER BY id"
+                        % ",".join("?" * len(OPEN_STATUSES)), OPEN_STATUSES).fetchall()
+    b = {k: [] for k in ("today_cal", "today_due", "overdue", "progress", "past_meetings", "parked", "upcoming",
+                         "scheduled", "snoozed", "captured")}
+    by_id = {}
+    for r in rows:
+        plan = check_plan(cfg, r, now, since)
+        e = _entry(conn, cfg, r, plan)
+        by_id[r["id"]] = e
+        tk = e["time_kind"]
+        start_d = local_date(cfg, r["start_at"])
+        due_d = local_date(cfg, r["due_at"])
+        if (r["kind"] == "meeting" and start_d == today) or (tk in ("work", "deadline_marker") and start_d == today):
+            e["when"], e["sort"] = _today_when(cfg, r, tk)
+            if r["kind"] == "meeting":
+                e["preps"] = [{"ref": x["ref"], "title": x["title"], "status_label": ops.status_label(x)} for x in conn.execute(
+                    "SELECT i.* FROM relation rl JOIN item i ON i.id=rl.from_item_id WHERE rl.rel_type='prep_for' "
+                    "AND rl.to_item_id=? AND i.deleted_at IS NULL ORDER BY i.id", (r["id"],))]
+            b["today_cal"].append(e)
+            continue
+        if r["kind"] != "meeting" and due_d == today and parse_iso(r["due_at"]) >= now:
+            e["when"] = f"{_hm(cfg, r['due_at'])} 마감" if r["due_precision"] == "time" else "오늘 마감"
+            e["sort"] = r["due_at"]
+            b["today_due"].append(e)
+            continue
+        if r["kind"] == "meeting" and plan["reason"] == "meeting_passed":
+            b["past_meetings"].append(e)           # 기본 보고에서 뺀다. 시간이 지났다고 완료로 보지 않는다
+            continue
+        if r["status"] == "captured":
+            b["captured"].append(e)
+            continue
+        if r["status"] in ("waiting", "on_hold") and not plan["due"]:
+            b["parked"].append(e)                  # 재확인일 전(오늘 보고받은 것 포함): 독촉하지 않는다
+            continue
+        if plan["reason"] == "snoozed":
+            b["snoozed"].append(e)
+            continue
+        if r["kind"] != "meeting" and r["due_at"] and parse_iso(r["due_at"]) < now:
+            b["overdue"].append(e)
+            continue
+        if plan["due"]:
+            b["progress"].append(e)
+            continue
+        if r["kind"] == "meeting":
+            b["upcoming"].append(e)
+            continue
+        b["scheduled"].append(e)
+    b["today_cal"].sort(key=lambda e: e["sort"] or "")
+    b["today_due"].sort(key=lambda e: e["sort"] or "")
+
+    # 기한 지남: 한 쪽. 상세 기본 10건, 높음이 더 많으면 15건까지. 15건 이하면 모두 상세.
+    od = _rank(cfg, b["overdue"], today)
+    n_high = sum(1 for e in od if e["priority"] == "high")
+    n_od = len(od) if len(od) <= rp["overdue_detail_max"] else max(rp["overdue_detail"], min(n_high, rp["overdue_detail_max"]))
+    overdue = {"total": len(od), "detail": od[:n_od], "rest": od[n_od:],
+               "keywords": keyword_block(od[n_od:], rp["keyword_chars"]),
+               "parked_overdue": sum(1 for e in b["parked"] if e["due_at"] and parse_iso(e["due_at"]) < now)}
+    # 진행 확인: 최대 두 쪽. 쪽마다 상세 15건, 넘치면 마지막 쪽에 키워드.
+    pg = _rank(cfg, b["progress"], today)
+    cap = rp["progress_messages"] * rp["progress_detail_per_message"]
+    progress = {"total": len(pg), "detail": pg[:cap], "rest": pg[cap:],
+                "keywords": keyword_block(pg[cap:], rp["keyword_chars"]),
+                "per_message": rp["progress_detail_per_message"]}
+
+    # 질문: 기본 3건 (나머지는 계속 추적). 마감이 가까운 업무의 질문 먼저.
+    qs = []
+    for q in conn.execute("SELECT q.*, i.ref AS item_ref, i.title AS item_title, i.due_at AS item_due FROM question q "
+                          "LEFT JOIN item i ON i.id=q.item_id WHERE q.status='open' AND (q.next_ask_at IS NULL OR q.next_ask_at <= ?) "
+                          "ORDER BY (i.due_at IS NULL), i.due_at, q.id", (now.isoformat(),)):
+        qs.append({"ref": q["ref"], "item_ref": q["item_ref"], "item_title": q["item_title"], "question": q["question"],
+                   "options": json.loads(q["options"]) if q["options"] else None})
+    questions = {"total": len(qs), "shown": qs[:rp["questions_max"]]}
+
+    done_since = (now - timedelta(hours=float(rp["done_hours"]))).isoformat()
+    done_refs = [r["ref"] for r in conn.execute(
+        "SELECT DISTINCT i.ref FROM activity_log a JOIN item i ON i.id=a.item_id WHERE a.action='complete' "
+        "AND a.undone_at IS NULL AND a.created_at >= ? AND i.status='done' AND i.deleted_at IS NULL ORDER BY i.id", (done_since,))]
+    day = day_conflicts(conn, cfg, today, overlays)
+    check_refs = ([e["ref"] for e in b["today_cal"] + b["today_due"] if e["check"]["due"]]
+                  + [e["ref"] for e in overdue["detail"] + progress["detail"]])
+    accounting = {k: len(v) for k, v in b.items()}
+    accounting["active"] = len(rows)
+    accounting["ok"] = sum(len(v) for v in b.values()) == len(rows)
+    counts = {"active": len(rows), "today": len(b["today_cal"]), "today_due": len(b["today_due"]),
+              "overdue": len(od), "progress": len(pg), "check": len(check_refs),
+              "parked": len(b["parked"]), "past_meetings": len(b["past_meetings"]), "done": len(done_refs),
+              "upcoming": len(b["upcoming"]), "scheduled": len(b["scheduled"]) + len(b["snoozed"]) + len(b["captured"])}
+    return {"today_date": today.isoformat(), "weekday": WEEKDAY_KO[today.weekday()], "counts": counts,
+            "today_cal": b["today_cal"], "today_due": b["today_due"], "overlay": overlays or [],
+            "overlaps": day["overlaps"], "deadline_clusters": day["deadline_clusters"],
+            "overdue": overdue, "progress": progress, "questions": questions, "done_refs": done_refs,
+            "past_meetings": b["past_meetings"], "parked": b["parked"], "upcoming": b["upcoming"],
+            "note_asks": pending_note_asks(conn, cfg, now), "check_refs": check_refs, "accounting": accounting}
+
+
+def _title(e, n: int = 48) -> str:
+    t = e["title"]
+    return t if len(t) <= n else t[:n - 1] + "…"
+
+
+def _detail_line(cfg, e, today: date, overdue: bool = False) -> str:
+    r = e["check"].get("reason")
+    if overdue:
+        due_d = local_date(cfg, e["due_at"])
+        head = f"{md(due_d)} 마감({(today - due_d).days}일 지남)" if due_d < today else "오늘 마감 지남"
+        if r == "recheck":
+            head += " · 재확인일" + (f"·{e['waiting_on']}" if e.get("waiting_on") else "")
+    elif r in ("recheck", "wait_due"):
+        head = e["check"]["label"] + (f"·{e['waiting_on']}" if e.get("waiting_on") else "")
+    else:
+        head = e["check"].get("label") or ""
+    bits = []
+    if not overdue and e["due_at"]:
+        bits.append(e["due_text"])
+    elif not e["due_at"]:
+        bits.append("기한 없음")
+    if e["priority"] == "high":
+        bits.append("중요")
+    if e["request_scope"] == "direct":
+        bits.append("직접 요청")
+    if e["next_action"]:
+        bits.append(f"다음: {e['next_action'][:30]}")
+    if e["external"]:
+        bits.append(e["external"])
+    return f"  {head}  {_title(e)} ({e['ref']})" + (f" · {' · '.join(bits)}" if bits else "")
+
+
+def report_pages(cfg, data: dict, approvals: dict | None = None, health_lines: list[str] | None = None) -> list[dict]:
+    """아침 보고의 쪽 목록. 쪽 = {"key", "rows", "mentions", "question_refs"}. rows 는 agenda_rows 와 같은 모양에
+    {"nav": [버튼 라벨…]}(전체 보기 버튼 줄)이 더해진다. today 는 길면 여러 메시지, 나머지 쪽은 메시지 하나."""
+    c = data["counts"]
+    today = date.fromisoformat(data["today_date"])
+    pages = []
+    # 1. 오늘
+    rows: list[dict] = []
+    rows.append({"heading": f"**1. 오늘 일정 ({c['today']})**"})
+    if not data["today_cal"] and not data["overlay"]:
+        rows.append({"text": "  없음"})
+    for e in data["today_cal"]:
+        extra = [f"준비: {p['title']}({p['ref']} {p['status_label']})" for p in e.get("preps", [])]
+        if e["kind"] != "meeting" and e["priority"] == "high":
+            extra.append("중요")
+        rows.append({"text": f"  {e['when']}  {_title(e)} ({e['ref']})" + (f" · {' · '.join(extra)}" if extra else ""),
+                     "ref": e["ref"], "section": "1"})
+    for o in data["overlay"]:
+        when = "종일" if o.get("all_day") else (_hm(cfg, o["start"]) + (f"–{_hm(cfg, o['end'])}" if o.get("end") and len(o["end"]) > 10 else ""))
+        rows.append({"text": f"  {when}  ({o['calendar']}) {o['summary']}"})
+    for ov in data["overlaps"]:
+        a = ov["a"].split(":", 1)[1] if ov["a"].startswith("overlay:") else ov["a"]
+        bb = ov["b"].split(":", 1)[1] if ov["b"].startswith("overlay:") else ov["b"]
+        rows.append({"text": f"  ⚠ 겹침: {ov['a_title']}({a})와 {ov['b_title']}({bb})"})
+    for cl in data["deadline_clusters"]:
+        span = cl["from"] if cl["from"] == cl["to"] else f"{cl['from']}–{cl['to']}"
+        rows.append({"text": f"  ⏱ {span} 마감 {cl['count']}건 — 약속 충돌이 아니라 작업량 안내입니다"})
+    rows.append({"heading": f"**2. 오늘 마감 — 달력 밖 ({c['today_due']})**"})
+    if not data["today_due"]:
+        rows.append({"text": "  없음"})
+    for e in data["today_due"]:
+        bits = [x for x in ("중요" if e["priority"] == "high" else "", "직접 요청" if e["request_scope"] == "direct" else "",
+                            f"다음: {e['next_action'][:30]}" if e["next_action"] else "", e["external"]) if x]
+        rows.append({"text": f"  {e['when']}  {_title(e)} ({e['ref']})" + (f" · {' · '.join(bits)}" if bits else ""),
+                     "ref": e["ref"], "section": "1"})
+    pages.append({"key": "today", "rows": rows, "mentions": [], "question_refs": []})
+
+    empty = []
+    # 3. 기한 지남 (한 쪽) — 없으면 쪽을 만들지 않고 상태 쪽에 한 줄
+    od = data["overdue"]
+    if not od["total"]:
+        empty.append("기한 지남 없음" + (f"(답변 대기·보류 {od['parked_overdue']}건은 재확인일까지 따로)" if od["parked_overdue"] else ""))
+    rows = [{"heading": f"**3. 기한 지남 {od['total']}건**" + (f" (답변 대기·보류 {od['parked_overdue']}건은 재확인일까지 따로)"
+                                                            if od["parked_overdue"] else "")}]
+    if not od["total"]:
+        rows.append({"text": "  없음"})
+    for e in od["detail"]:
+        rows.append({"text": _detail_line(cfg, e, today, overdue=True), "ref": e["ref"], "section": "3"})
+    if od["rest"]:
+        rows.append({"text": f"  그 밖 {len(od['rest'])}건 — 번호(예: {short_num(od['rest'][0]['ref'])})를 적으면 처리 카드"})
+        rows += [{"text": ln} for ln in od["keywords"]["lines"]]
+        rows.append({"nav": [REPORT_NAV["overdue"]]})
+    if od["total"]:
+        pages.append({"key": "overdue", "rows": rows, "mentions": od["keywords"]["mentions"], "question_refs": []})
+
+    # 4. 진행 확인 (최대 두 쪽)
+    pg = data["progress"]
+    per = pg["per_message"]
+    chunks = [pg["detail"][i:i + per] for i in range(0, len(pg["detail"]), per)]
+    if not pg["total"]:
+        empty.append("오늘 진행 확인할 차례인 업무 없음")
+    for i, chunk in enumerate(chunks):
+        head = f"**4. 진행 확인 {pg['total']}건** — 기한 전·마감 없는 업무 중 오늘 확인할 차례" if i == 0 else \
+            f"**4. 진행 확인 (계속 {i + 1}/{len(chunks)})**"
+        rows = [{"heading": head}]
+        if not pg["total"]:
+            rows.append({"text": "  없음"})
+        for e in chunk:
+            rows.append({"text": _detail_line(cfg, e, today), "ref": e["ref"], "section": "4"})
+        mentions = []
+        if i == len(chunks) - 1 and pg["rest"]:
+            rows.append({"text": f"  그 밖 {len(pg['rest'])}건 — 다음 보고에 차례로 올립니다"})
+            rows += [{"text": ln} for ln in pg["keywords"]["lines"]]
+            rows.append({"nav": [REPORT_NAV["progress"]]})
+            mentions = pg["keywords"]["mentions"]
+        pages.append({"key": f"progress{i + 1}", "rows": rows, "mentions": mentions, "question_refs": []})
+
+    # 5. 확인·상태
+    rows = []
+    qd = data["questions"]
+    qrefs = []
+    if qd["shown"] or data["note_asks"]:
+        rows.append({"heading": f"**5. 확인 필요 ({qd['total'] + len(data['note_asks'])})**"})
+    for q in qd["shown"]:
+        opts = f" 후보 {' / '.join(str(o) for o in q['options'])}" if q.get("options") else ""
+        about = f"({q['item_ref']} {q['item_title'][:24]}) " if q.get("item_ref") else ""
+        rows.append({"text": f"  {q['ref']} {about}{q['question']}{opts}", "ref": q["ref"], "section": "5"})
+        qrefs.append(q["ref"])
+    if qd["total"] > len(qd["shown"]):
+        rows.append({"text": f"  질문 {qd['total'] - len(qd['shown'])}건은 다음 보고에 (계속 추적)"})
+        rows.append({"nav": [REPORT_NAV["questions"]]})
+    for na in data["note_asks"]:
+        names = [cand["name"] for cand in na["candidates"][:3]]
+        rows.append({"text": f"  📁 '{na['project']}' 업무의 Tasks 를 어느 문서에 둘까요? 지금은 임시 수집 노트에 있습니다."
+                             + (" 후보: " + " / ".join(names) if names else " (찾은 후보 없음 — 문서 이름을 적어 주세요)")})
+        rows.append({"nav": [f"{na['project']} → {n}" for n in names] + [f"{na['project']} → 수집함"]})
+        qrefs.append(f"NOTE:{na['project']}")
+    rows.append({"heading": "**6. 상태**"})
+    if empty:
+        rows.append({"text": "  " + " · ".join(empty)})
+    status = [f"완료 반영 {c['done']}건"]
+    nav = []
+    if c["done"]:
+        nav.append(REPORT_NAV["done"])
+    ap = approvals or {}
+    if ap.get("calendar") or ap.get("tasks"):
+        status.append("승인 대기 " + " · ".join(x for x in (f"달력 {ap['calendar']}건" if ap.get("calendar") else "",
+                                                          f"Tasks {ap['tasks']}건" if ap.get("tasks") else "") if x))
+        nav.append(REPORT_NAV["approvals"])
+    if c["past_meetings"]:
+        status.append(f"지난 일정 {c['past_meetings']}건(완료 체크 목록에서 뺌 · 기록 유지)")
+        nav.append(REPORT_NAV["past"])
+    if c["parked"]:
+        status.append(f"답변 대기·보류 {c['parked']}건(재확인일 전)")
+        nav.append(REPORT_NAV["waiting"])
+    hidden = c["upcoming"] + c["scheduled"]
+    if hidden:
+        status.append(f"그 밖 추적 중 {hidden}건(앞으로의 일정·확인 차례 아님)")
+    rows.append({"text": "  " + " · ".join(status)})
+    for ln in health_lines or ["  운영: 수집·반영·전달 정상"]:
+        rows.append({"text": ln})
+    nav.append(REPORT_NAV["full"])
+    rows.append({"nav": nav[:5]})
+    pages.append({"key": "status", "rows": rows, "mentions": [], "question_refs": qrefs})
+    return pages
+
+
+def report_header(data: dict) -> str:
+    c = data["counts"]
+    d = date.fromisoformat(data["today_date"])
+    return (f"[아침 보고 {md(d)}({data['weekday']})] 활성 {c['active']}건 · 오늘 일정 {c['today']} · 오늘 마감 {c['today_due']} · "
+            f"기한 지남 {c['overdue']} · 진행 확인 {c['progress']}")
+
+
+# --------------------------------------------------------------------------
 # 전달 기록 (R8)
 # --------------------------------------------------------------------------
 
@@ -699,7 +1191,9 @@ def exposure_gaps(conn, cfg, now: datetime) -> list[dict]:
     for it in conn.execute("SELECT * FROM item WHERE deleted_at IS NULL AND status IN ('todo','in_progress','needs_info',"
                            "'waiting','on_hold') ORDER BY id"):
         plan = check_plan(cfg, it, now, since_d)
-        if it["priority"] == "high" and plan["reason"] not in ("waiting", "on_hold", "snoozed"):
+        # 0.7.0: 기본 보고에서 일부러 빼는 것(재확인일 전 대기·보류, 다시 물을 날 전, 지난 일정, 앞으로의 일정)은 누락이 아니다
+        if it["priority"] == "high" and plan["reason"] not in ("waiting", "on_hold", "snoozed", "meeting_passed",
+                                                                "upcoming", "captured"):
             last = max(x for x in (it["last_exposed_at"], since, it["created_at"]) if x)
             hrs = (now - parse_iso(last)).total_seconds() / 3600
             if hrs > grace:
@@ -753,8 +1247,16 @@ def health_text(h: dict) -> str | None:
                      "전달된 것으로 보지 않았습니다 (\"보고 다시\" 하시면 그 쪽만 다시 보냅니다)")
     for x in d["unconfirmed"]:
         lines.append(f"  전송 확인 없음: {x['report_key']} {x['page']}/{x['pages']}쪽 (업무 {len(x['items'])}건)")
-    for g in h["exposure_gaps"]:
+    gaps = h["exposure_gaps"]
+    for g in [g for g in gaps if g["why"] == "not_delivered"][:5]:
         lines.append(f"  누락 감지: {g['title']} ({g['ref']}) — {g['message']}")
+    nd = sum(1 for g in gaps if g["why"] == "not_delivered")
+    if nd > 5:
+        lines.append(f"  누락 감지 외 {nd - 5}건")
+    late = [g for g in gaps if g["why"] == "check_missed"]
+    if late:
+        lines.append(f"  진행 확인 늦음 {len(late)}건 ({', '.join(g['ref'] for g in late[:5])}"
+                     + (f" 외 {len(late) - 5}건" if len(late) > 5 else "") + ") — 차례대로 보고에 올립니다")
     if h["importance_unreviewed"]:
         lines.append(f"  중요도 검토 필요 {len(h['importance_unreviewed'])}건 (직접 요청/단체 요청 분류 전 — Claire 가 확인 중)")
     if not lines:
@@ -801,13 +1303,18 @@ def register_delivery(conn, cfg, kind: str, messages: list[dict], ts: str, *, re
     for i, m in enumerate(messages, 1):
         nums = m.get("numbers") or []
         text = m.get("message", "")
-        page_qs = [q for q in re.findall(r"\bQ-\d+\b", text) if q in qs] if qs else re.findall(r"\bQ-\d+\b", text)
-        items = [n for n in nums if n.startswith("CLR-")] or re.findall(r"\bCLR-\d+\b", text)
+        if m.get("question_refs") is not None:
+            page_qs = list(m["question_refs"])        # 0.7.0: 보고가 직접 준 질문 번호(+ NOTE:프로젝트 문서 위치 질문)
+        else:
+            page_qs = [q for q in re.findall(r"\bQ-\d+\b", text) if q in qs] if qs else re.findall(r"\bQ-\d+\b", text)
+        items = [n for n in nums if n.startswith("CLR-")] or ([] if m.get("mentions") is not None
+                                                            else re.findall(r"\bCLR-\d+\b", text))
         payload = {"message": text, "components": m.get("components")}
         did = conn.execute(
-            "INSERT INTO delivery(report_key,kind,page,pages,item_refs,check_refs,question_refs,payload,content_hash,"
-            "problems,status,created_at) VALUES(?,?,?,?,?,?,?,?,?,?, 'generated', ?)",
+            "INSERT INTO delivery(report_key,kind,page,pages,item_refs,check_refs,question_refs,mention_refs,payload,"
+            "content_hash,problems,status,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?, 'generated', ?)",
             (report_key, kind, i, len(messages), _marks(items), _marks(r for r in items if r in checks), _marks(page_qs),
+             _marks(m.get("mentions") or []),
              json.dumps(payload, ensure_ascii=False), body_hash if i == 1 else sha256_text(text),
              json.dumps(m.get("problems") or [], ensure_ascii=False) if m.get("problems") else None, ts)).lastrowid
         out.append({**m, "delivery_id": did})
@@ -832,15 +1339,29 @@ def mark_delivery(conn, cfg, ids: list[int], status: str, ts: str, *, message_id
                          "error=NULL, attempts=attempts+1 WHERE id=?", (ts, mid, via or "message", did))
             items = json.loads(r["item_refs"] or "[]")
             checks = json.loads(r["check_refs"] or "[]")
+            mentions = json.loads(_get(r, "mention_refs") or "[]")
             if items:
-                conn.execute("UPDATE item SET last_exposed_at=? WHERE ref IN (%s)" % ",".join("?" * len(items)), (ts, *items))
+                # 상세(번호 버튼)로 보인 업무: 보여 줌 + 상세 노출 시각(다음 보고의 돌려 가며 고르기 기준)
+                conn.execute("UPDATE item SET last_exposed_at=?, last_detailed_at=? WHERE ref IN (%s)"
+                             % ",".join("?" * len(items)), (ts, ts, *items))
                 exposed.update(items)
+            if mentions:
+                # 키워드로만 언급된 업무: 보여 줌(누락 아님). 진행 확인을 물은 것으로는 치지 않는다
+                conn.execute("UPDATE item SET last_exposed_at=? WHERE ref IN (%s)" % ",".join("?" * len(mentions)),
+                             (ts, *mentions))
+                exposed.update(mentions)
             for ref in checks:
                 cur = conn.execute("UPDATE item SET last_asked_at=? WHERE ref=? AND (last_asked_at IS NULL OR "
                                    "substr(last_asked_at,1,10) <> ?)", (ts, ref, ts[:10])).rowcount
                 if cur:
                     asked.add(ref)
-            qs += mark_questions_asked(conn, cfg, json.loads(r["question_refs"] or "[]"), ts)
+            qrefs = json.loads(r["question_refs"] or "[]")
+            qs += mark_questions_asked(conn, cfg, [q for q in qrefs if not q.startswith("NOTE:")], ts)
+            for q in qrefs:
+                if q.startswith("NOTE:"):             # 0.7.0: 프로젝트 문서 위치 질문을 실제로 물었다
+                    conn.execute("UPDATE note_map SET asked_count=asked_count+1, last_asked_at=?, updated_at=? "
+                                 "WHERE project=? AND status='pending' AND (last_asked_at IS NULL OR substr(last_asked_at,1,10)<>?)",
+                                 (ts, ts, q[5:], ts[:10]))
             done.append({"delivery_id": did, "page": r["page"], "pages": r["pages"], "items": len(items)})
         else:
             conn.execute("UPDATE delivery SET status='failed', error=?, via=?, attempts=attempts+1 WHERE id=? AND status<>'sent'",

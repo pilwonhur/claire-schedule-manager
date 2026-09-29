@@ -12,8 +12,10 @@
 
 op
   obsidian.assign_id   연결된 Tasks 줄에 🆔 clrNNNN 부여 (D12)
-  obsidian.check_task  완료 시 [x] + ✅ 완료일
-  obsidian.add_task    Daily `## Tasks` 에 `- [ ] #tasks [[정본]]: 제목 📅 마감 🆔 clrNNNN`
+  obsidian.check_task  업무 상태에 맞춘다: 완료 → [x] + ✅ 완료일(정정이면 날짜만), 다시 열기 → [ ] (0.7.0)
+  obsidian.add_task    Tasks 줄 추가 `- [ ] #tasks 제목 📅 마감 🆔 clrNNNN` — 0.7.0: 업무의 정본 노트 → 프로젝트 연결 문서 →
+                       임시 수집 노트(01 Inbox/Claire 업무 수집함.md)의 `## Tasks`. 승인 없이 자동. (tasks_placement=daily 면 Daily)
+  obsidian.move_task   임시 수집 노트의 줄을 정해진 문서로 옮긴다(🆔 유지, 원래 줄은 지움) (0.7.0)
   calendar.create      Prof. Hur 에 이벤트 생성 (extendedProperties.private.claire_ref)
   calendar.update      교수님 지시로 시각 변경 → Calendar patch → 항목 미러링
   obsidian.daily_done  완료한 날 Daily `## 완료한 일` 에 한 줄 (0.5.0. 완료 취소·완료일 정정이면 옮기거나 지운다)
@@ -41,8 +43,8 @@ import claire_ops as ops  # noqa: E402
 import google_api  # noqa: E402
 import obsidian_tasks  # noqa: E402
 
-OPS = ("obsidian.assign_id", "obsidian.check_task", "obsidian.add_task", "obsidian.daily_done", "calendar.create",
-       "calendar.update", "discord.notice", "discord.brief")
+OPS = ("obsidian.assign_id", "obsidian.check_task", "obsidian.add_task", "obsidian.move_task", "obsidian.daily_done",
+       "calendar.create", "calendar.update", "discord.notice", "discord.brief")
 ONLY = {"calendar": ("calendar.create", "calendar.update"), "tasks": ("obsidian.add_task",)}
 
 
@@ -74,35 +76,141 @@ def op_assign_id(conn, cfg, row, payload, ts):
     return {"file": file_rel, "line": t["line"], "external_key": new_key}
 
 
-def op_check_task(conn, cfg, row, payload, ts):
-    path, file_rel = _rel(cfg, payload["external_key"])
+def _locate_task(conn, cfg, row, external_key: str):
+    """연결된 줄을 찾는다. 문서가 옮겨졌거나 이름이 바뀌었으면 🆔 로 볼트에서 다시 찾아 연결을 고친다(0.7.0).
+    같은 🆔 줄이 둘 이상이면 어느 쪽인지 정하지 않고 실패로 드러낸다(잘못된 줄을 고치지 않는다)."""
+    path, file_rel = _rel(cfg, external_key)
+    t = obsidian_tasks.find_task_by_key(path, cfg, external_key) if path.exists() else None
+    if t is not None:
+        return path, file_rel, t, external_key
+    ref = conn.execute("SELECT ref FROM item WHERE id=?", (row["item_id"],)).fetchone()["ref"]
+    found = obsidian_tasks.find_task_anywhere(cfg, ref)
+    if len(found) == 1:
+        new_key = f"{found[0]['file']}#{found[0]['id']}"
+        conn.execute("UPDATE link SET external_key=?, last_synced_at=? WHERE item_id=? AND system='obsidian_task' "
+                     "AND external_key=?", (new_key, ts_now(cfg), row["item_id"], external_key))
+        return obsidian_tasks.vault_path(cfg) / found[0]["file"], found[0]["file"], found[0], new_key
+    if len(found) > 1:
+        raise ClaireError("duplicate_task_lines", f"같은 🆔({obsidian_tasks.format_id(ref)}) 줄이 {len(found)}곳에 있습니다: "
+                          + ", ".join(f["file"] for f in found))
     if not path.exists():
         raise ClaireError("file_missing", f"노트가 없습니다: {file_rel}")
-    t = obsidian_tasks.find_task_by_key(path, cfg, payload["external_key"])
-    if t is None:
-        raise ClaireError("line_missing", f"연결된 Tasks 줄을 찾지 못했습니다: {payload['external_key']}")
-    if t["state"] == "done":
-        return {"file": file_rel, "line": t["line"], "already_checked": True}
-    new_line = obsidian_tasks.line_checked(t["raw"], payload.get("completed_on") or ts[:10])
+    raise ClaireError("line_missing", f"연결된 Tasks 줄을 찾지 못했습니다: {external_key}")
+
+
+def ts_now(cfg) -> str:
+    return now_iso(cfg)
+
+
+def op_check_task(conn, cfg, row, payload, ts):
+    path, file_rel, t, key = _locate_task(conn, cfg, row, payload["external_key"])
+    want = payload.get("state", "done")
     ref = conn.execute("SELECT ref FROM item WHERE id=?", (row["item_id"],)).fetchone()["ref"]
-    new_line = obsidian_tasks.line_with_id(new_line, ref)
+    if want == "open":
+        if t["state"] != "done":
+            return {"file": file_rel, "line": t["line"], "already_open": True}
+        new_line = obsidian_tasks.line_unchecked(t["raw"])
+        result = {"file": file_rel, "line": t["line"], "unchecked": True}
+    else:
+        day = payload.get("completed_on") or ts[:10]
+        if t["state"] == "done":
+            if not payload.get("completed_on") or t.get("done") == day:
+                return {"file": file_rel, "line": t["line"], "already_checked": True}
+            new_line = obsidian_tasks.line_done_on(t["raw"], day)         # 완료일 정정
+            result = {"file": file_rel, "line": t["line"], "done_date": day}
+        else:
+            new_line = obsidian_tasks.line_checked(t["raw"], day)
+            result = {"file": file_rel, "line": t["line"], "checked": True}
+        new_line = obsidian_tasks.line_with_id(new_line, ref)
     obsidian_tasks.replace_line_atomic(path, t["line"], t["raw"], new_line, t["file_mtime"])
-    conn.execute("UPDATE link SET last_synced_at=?, sync_status='ok' WHERE item_id=? AND system='obsidian_task'",
-                 (ts, row["item_id"]))
-    return {"file": file_rel, "line": t["line"], "checked": True}
+    conn.execute("UPDATE link SET last_synced_at=?, sync_status='ok' WHERE item_id=? AND system='obsidian_task' AND external_key=?",
+                 (ts, row["item_id"], key))
+    return result
+
+
+def task_home(conn, cfg, item) -> dict:
+    """새 Tasks 줄의 자리 (0.7.0): 업무의 정본 노트(canonical_note) → 프로젝트 연결 문서(note_map confirmed) → 임시 수집 노트.
+    처음 보는 프로젝트면 note_map 에 '확인 대기'로 남기고 문서 후보를 찾아 둔다(아침 보고가 한 번 묻는다)."""
+    ob = cfg["obsidian"]
+    if item["canonical_note"]:
+        hits = obsidian_tasks.find_notes(cfg, item["canonical_note"])
+        if len(hits) == 1:
+            return {"path": hits[0], "placement": "canonical_note", "self_note": True}
+    project = (item["project"] or "").strip()
+    if project:
+        m = conn.execute("SELECT * FROM note_map WHERE project=?", (project,)).fetchone()
+        if m is not None and m["status"] == "confirmed" and m["note"]:
+            if (obsidian_tasks.vault_path(cfg) / m["note"]).exists():
+                return {"path": m["note"], "placement": "project"}
+        if m is None:
+            cands = obsidian_tasks.note_candidates(cfg, project)
+            now_s = now_iso(cfg)
+            conn.execute("INSERT INTO note_map(project,note,status,candidates,created_at,updated_at) VALUES(?,?,?,?,?,?)",
+                         (project, None, "pending", json.dumps(cands, ensure_ascii=False), now_s, now_s))
+    inbox = obsidian_tasks.ensure_inbox(cfg)
+    return {"path": obsidian_tasks.note_rel(cfg, inbox), "placement": "inbox"}
 
 
 def op_add_task(conn, cfg, row, payload, ts):
-    day = payload.get("day") or ts[:10]
-    line = obsidian_tasks.format_task_line(payload["title"], payload.get("due"), payload["ref"], payload.get("note"),
-                                           cfg["obsidian"].get("tag", "#tasks"), payload.get("due_time"))
-    res = obsidian_tasks.add_task_to_daily(cfg, day, line)
-    file_rel = str(Path(res["path"]).relative_to(obsidian_tasks.vault_path(cfg)))
+    item = conn.execute("SELECT * FROM item WHERE id=?", (row["item_id"],)).fetchone()
+    if conn.execute("SELECT 1 FROM link WHERE item_id=? AND system='obsidian_task'", (row["item_id"],)).fetchone():
+        return {"added": False, "reason": "already_linked"}
+    tag = cfg["obsidian"].get("tag", "#tasks")
+    if cfg["obsidian"].get("tasks_placement", "topic") == "daily":     # 0.6.x 예약(payload.day)도 0.7.0 에서는 주제 문서로
+        day = payload.get("day") or ts[:10]
+        line = obsidian_tasks.format_task_line(payload["title"], payload.get("due"), payload["ref"], payload.get("note"),
+                                               tag, payload.get("due_time"))
+        res = obsidian_tasks.add_task_to_daily(cfg, day, line)
+        file_rel = str(Path(res["path"]).relative_to(obsidian_tasks.vault_path(cfg)))
+        placement = {"placement": "daily"}
+    else:
+        placement = task_home(conn, cfg, item)
+        note_link = None if placement.get("self_note") else (item["canonical_note"] if placement["placement"] != "inbox"
+                                                              else None)
+        line = obsidian_tasks.format_task_line(item["title"], payload.get("due"), payload["ref"], note_link, tag,
+                                               payload.get("due_time"))
+        res = obsidian_tasks.add_task_to_note(cfg, placement["path"], line)
+        res["created"] = False
+        file_rel = placement["path"]
     key = f"{file_rel}#{obsidian_tasks.format_id(payload['ref'])}"
     if conn.execute("SELECT 1 FROM link WHERE system='obsidian_task' AND external_key=?", (key,)).fetchone() is None:
         conn.execute("INSERT INTO link(item_id,system,external_key,version,last_seen_at,last_synced_at,sync_status) "
                      "VALUES(?,?,?,?,?,?,'ok')", (row["item_id"], "obsidian_task", key, None, ts, ts))
-    return {"file": file_rel, "added": res["added"], "created_daily": res["created"], "external_key": key}
+    return {"file": file_rel, "added": res["added"], "created_daily": res.get("created", False), "external_key": key,
+            "placement": placement["placement"]}
+
+
+def op_move_task(conn, cfg, row, payload, ts):
+    """임시 수집 노트의 줄을 정해진 문서로 옮긴다: 대상 문서에 같은 줄(상태·✅ 그대로)을 넣고 → 수집함 줄을 지우고 → 연결을 고친다.
+    중간에 실패해도 🆔 로 찾으므로 다음 시도에서 중복 줄을 만들지 않는다."""
+    ref = payload["ref"]
+    tid = obsidian_tasks.format_id(ref)
+    link = conn.execute("SELECT * FROM link WHERE item_id=? AND system='obsidian_task'", (row["item_id"],)).fetchone()
+    inbox_rel = cfg["obsidian"].get("inbox_note", "01 Inbox/Claire 업무 수집함.md")
+    target = payload["to"]
+    if link is None:
+        return {"moved": False, "reason": "no_task_line"}
+    src_rel = link["external_key"].split("#", 1)[0]
+    if src_rel == target:
+        return {"moved": False, "reason": "already_there"}
+    if src_rel != inbox_rel:
+        return {"moved": False, "reason": "not_in_inbox", "file": src_rel}   # 교수님 문서·Daily 의 줄은 옮기지 않는다
+    src = obsidian_tasks.vault_path(cfg) / src_rel
+    t = obsidian_tasks.find_task_by_key(src, cfg, link["external_key"]) if src.exists() else None
+    if t is None:
+        found = [f for f in obsidian_tasks.find_task_anywhere(cfg, ref) if f["file"] == target]
+        if not found:
+            raise ClaireError("line_missing", f"수집함에서 {ref} 줄을 찾지 못했습니다")
+        line = found[0]["raw"]
+    else:
+        line = t["raw"]
+    obsidian_tasks.add_task_to_note(cfg, target, line.rstrip())
+    obsidian_tasks.remove_task_line(cfg, src_rel, tid)
+    new_key = f"{target}#{tid}"
+    conn.execute("UPDATE link SET external_key=?, last_synced_at=?, sync_status='ok' WHERE id=?", (new_key, ts, link["id"]))
+    return {"moved": True, "from": src_rel, "to": target, "external_key": new_key}
+
+
 
 
 def _event_body(cfg, payload: dict) -> dict:
@@ -200,6 +308,7 @@ class _Skip(Exception):
 
 
 HANDLERS = {"obsidian.assign_id": op_assign_id, "obsidian.check_task": op_check_task, "obsidian.add_task": op_add_task,
+            "obsidian.move_task": op_move_task,
             "obsidian.daily_done": op_daily_done, "calendar.create": op_calendar_create,
             "calendar.update": op_calendar_update}
 
@@ -299,9 +408,12 @@ def _describe(op: str, p: dict) -> str:
     if op == "calendar.update":
         return f"Calendar 변경: {p.get('ref')} {p.get('fields')}"
     if op == "obsidian.add_task":
-        return f"Daily {p.get('day')} 에 Tasks 줄 추가: {p.get('title')} (📅 {p.get('due')})"
+        where = f"Daily {p.get('day')}" if p.get("day") else "주제 문서(없으면 수집함)"
+        return f"{where} 에 Tasks 줄 추가: {p.get('title')} (📅 {p.get('due')})"
     if op == "obsidian.check_task":
-        return f"Tasks 체크: {p.get('external_key')}"
+        return f"Tasks {'체크 해제' if p.get('state') == 'open' else '체크'}: {p.get('external_key')}"
+    if op == "obsidian.move_task":
+        return f"Tasks 줄 옮김: {p.get('ref')} → {p.get('to')}"
     if op == "obsidian.assign_id":
         return f"🆔 부여: {p.get('external_key')}"
     if op == "obsidian.daily_done":

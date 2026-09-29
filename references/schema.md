@@ -2,7 +2,7 @@
 
 | 표 | 역할 | 유니크·핵심 제약 |
 |---|---|---|
-| `item` | 관리 항목의 현재 상태 | `ref` 유니크(`CLR-0001`, 재사용 금지). `kind` 6종, `status` 8종, `priority`, `owner` CHECK. v2: `due_precision`(date/time), `window_auto`(달력 구간을 마감에서 계산), `attendance`(undecided/attending/declined), `daily_logged_on`(완료 기록이 있는 Daily 날짜). v3: `request_scope`(direct/group/self/none), `priority_source`(rule/claire/user/unreviewed)·`priority_reason`(분류 근거), `check_every_days`·`review_after`(교수님 지정 주기·다음 확인일), `close_reason`(cancelled/not_needed/not_mine), `last_exposed_at`·`last_asked_at`(전송 성공 기준)·`last_reported_at`(교수님 보고) |
+| `item` | 관리 항목의 현재 상태 | `ref` 유니크(`CLR-0001`, 재사용 금지). `kind` 6종, `status` 8종, `priority`, `owner` CHECK. v2: `due_precision`(date/time), `window_auto`(달력 구간을 마감에서 계산), `attendance`(undecided/attending/declined), `daily_logged_on`(완료 기록이 있는 Daily 날짜). v3: `request_scope`(direct/group/self/none), `priority_source`(rule/claire/user/unreviewed)·`priority_reason`(분류 근거), `check_every_days`·`review_after`(교수님 지정 주기·다음 확인일), `close_reason`(cancelled/not_needed/not_mine), `last_exposed_at`·`last_asked_at`(전송 성공 기준)·`last_reported_at`(교수님 보고). v4: `short_label`(보고 키워드 1~3단어)·`last_detailed_at`(아침 보고에 상세·버튼으로 전달된 시각 — 돌려 가며 고르기) |
 | `source_event` | 수집 원문 단위 = 미처리 큐 + 근거 | `(platform, account, external_id, version)` 유니크. `triage` new→proposed/ignored |
 | `item_source` | 항목↔원문 (origin/update/cancel/evidence/mention) | PK `(item_id, source_event_id, role)` |
 | `attachment` | Discord 이미지 원본 | `(source_event_id, sha256)` 유니크. 파일은 `attachments/<2자>/<sha256>.<ext>` |
@@ -15,7 +15,8 @@
 | `outbox` | 외부 반영·알림 대기열 | `dedupe_key` 유니크. `requires_confirm`. v2: `selected_at`(선택 일괄 승인), 교수님이 "등록 안 함"이면 `status=cancelled` + `result.declined` |
 | `briefing` | 발송 기록 | `content_hash`로 같은 날 중복 발송 방지 |
 | `checkin` | 12:00·18:00 미등록 일정 확인 (v2) | `(day, slot)` 유니크 — 하루·슬롯 1회. `message_id`, `result` |
-| `delivery` | 보고 전달 기록 (v3) | `(report_key, page)` 유니크. 페이지마다 `item_refs`·`check_refs`·`question_refs`·`payload`(재전송용). `status` generated→sent/failed(→superseded). sent 일 때만 항목 `last_exposed_at`·`last_asked_at`·질문 `asked_count` 갱신 |
+| `delivery` | 보고 전달 기록 (v3) | `(report_key, page)` 유니크. 페이지마다 `item_refs`(상세·버튼)·`check_refs`·`question_refs`(`NOTE:프로젝트` = 문서 위치 질문)·`mention_refs`(v4, 키워드로만 언급)·`payload`(재전송용). `status` generated→sent/failed(→superseded). sent 일 때만 항목 `last_exposed_at`(상세·키워드)·`last_detailed_at`·`last_asked_at`(상세의 진행 확인만)·질문 `asked_count`·`note_map.asked_count` 갱신 |
+| `note_map` | 프로젝트 → Obsidian 주제 문서 (v4) | `project` 기본 키, `note`(볼트 기준 경로), `status` pending(처음 봄, 후보 `candidates` JSON)/confirmed(교수님 확인)/inbox(수집함에 두고 묻지 않음), `asked_count`·`last_asked_at`(한 번 묻고 7일 뒤 한 번 더) |
 | `meta` | `schema_version`, `created_by_version`, `daily_done_since`(Daily 완료 기록 시작 시각), `migrated_v2`·`migrated_v3`, `tracking_since`(노출 추적 시작), `importance_backfilled`(소급 분류 1회) | |
 | `search_fts` | FTS5 (ref, title, project, next_action, waiting_on, excerpts) | rowid = item.id |
 
@@ -51,11 +52,21 @@ done ─("다시 열어")─▶ todo  (reopen 이력)
 
 ## 진행 확인 계획 (v3, `claire_track.check_plan`)
 
-닫힌 업무 제외. 오늘 보고받았으면 묻지 않음. 대기·보류는 `next_check_at`(재확인일)이 되면 `recheck`. `captured`는 목록만.
+닫힌 업무 제외. 오늘 보고받았으면 묻지 않음. 대기·보류는 `next_check_at`(재확인일)이 되면 `recheck`(답이 없어도 매일), 재확인일이 마감보다
+늦으면 마감 전날·당일에 `wait_due`(0.7.0). 재확인일이 없는 옛 대기·보류는 upkeep 이 기본 3일 뒤로 채운다. `captured`는 목록만.
 `review_after`(교수님 지정) 전에는 묻지 않음. 지난 회의 → `meeting_passed`, 기한 경과 → `overdue`, 당일 → `d_day`, 전날 → `d_minus_1`.
 그 밖에는 마지막 확인·보고·생성일에서 `check_every_days` 또는 중요도별 주기(high 1 · normal 2 · low 7일, normal·low 는 주말 제외).
 오늘 이미 물은 업무는 그날 내내 오늘의 확인 목록에 남는다(재실행해도 같은 보고). 추적 시작(`meta.tracking_since`) 전부터 있던 업무의
 첫 확인은 주기 안에서 번호 순으로 나눈다(0.6.1 — 업그레이드 첫날 밀린 업무가 한꺼번에 몰리지 않게).
+
+## 아침 보고 (v4, `claire_track.report_data`)
+
+활성 업무를 한 곳에만 넣는다: `today_cal`(오늘 시작하는 회의·작업 예약·마감 표시) → `today_due`(달력 밖 오늘 마감, 아직 안 지남) →
+`past_meetings`(끝난 일정 — 보고에서 빼고 건수만) → `captured` → `parked`(재확인일 전 대기·보류) → `snoozed` → `overdue`(기한 지남) →
+`progress`(오늘 확인 차례) → `upcoming`(앞으로의 일정) → `scheduled`(확인 차례 아님). `accounting.ok` = 합이 활성 수와 같음.
+기한 지남은 상세 10건(높음이 많으면 15건), 진행 확인은 쪽마다 15건 × 최대 2쪽. 상세 점수(`detail_score`): 중요도(300/200/100) +
+직접 요청 60 + 내일·마감 임박 120·재확인 90 + 최근에 지난 기한(최대 60) + 상세로 안 보인 날수×8(최대 80). 나머지는 `keyword_block`
+(분야별, `report.keyword_chars` 상한, 넘으면 "외 N건").
 
 ## 시간 종류 (v3, `time_kind`)
 
@@ -70,7 +81,7 @@ Calendar 동기화는 시각을 순간(instant)으로 비교한다(표기만 다
 
 ## 스키마 변환
 
-`SCHEMA_VERSION` 3(0.6.0). 기존 DB는 `connect()`가 열 때 `claire_core.migrate()`로 열만 추가한다(앞으로만, 멱등).
+`SCHEMA_VERSION` 4(0.7.0: 열 3개·`note_map` 표 추가, 값 변경 없음 — upkeep 이 재확인일 채우기·승인 대기 Tasks 자동 전환). 3(0.6.0). 기존 DB는 `connect()`가 열 때 `claire_core.migrate()`로 열만 추가한다(앞으로만, 멱등).
 v2→v3 은 값을 바꾸지 않는다(원본 ID·상태·완료 이력·"등록 안 함" 기록 보존). 기존 활성 업무의 중요도 소급 분류는 설정(본인 주소)이
 필요해서 `claire_track.upkeep`이 한다 — 설치(`claire_check init`)·`maintain`·업무 현황 앞에서, 분류 없는 활성 업무만 골라 멱등하게
 (Discord 등록 → 높음, 메일 → 잠정값 + 검토 필요, 캘린더·Obsidian → 보통, 이미 높음은 유지).

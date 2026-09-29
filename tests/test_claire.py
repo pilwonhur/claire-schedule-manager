@@ -86,6 +86,14 @@ class BaseTest(unittest.TestCase):
             self.assertEqual(proc.returncode, 1)
         return payload
 
+    def legacy_tasks(self):
+        """0.6.x Tasks 정책(마감일 Daily 에 줄 추가, 발견 항목은 승인 대기)을 그대로 쓰는 테스트용. 0.7.0 기본은 주제 문서·자동."""
+        p = self.data / "config.json"
+        c = json.loads(p.read_text(encoding="utf-8"))
+        c.setdefault("obsidian", {})["tasks_placement"] = "daily"
+        c.setdefault("apply", {})["obsidian_add_task"] = "confirm_unless_directed"
+        p.write_text(json.dumps(c, ensure_ascii=False), encoding="utf-8")
+
     def db(self):
         """테스트마다 연결 하나를 재사용하고 tearDown 에서 닫는다. Python 3.14 는 버린 연결을 늦게 닫아
         macOS 기본 한도(256)에서 'Too many open files' 가 났다 (0.5.1)."""
@@ -773,7 +781,9 @@ class Phase2Test(FixtureBase):
         os.utime(f, None)
         r = self.sh("claire_sync", "obsidian")["results"][0]
         self.assertEqual((r["new"], r["mirrored_to_linked_items"]), (1, 1))
-        self.assertEqual(self.db().execute("SELECT COUNT(*) FROM link WHERE system='obsidian_task'").fetchone()[0], 2)
+        # 0.7.0: 옛 줄이 없어졌으므로 연결을 🆔 줄로 옮긴다 (연결이 둘로 늘지 않는다)
+        links = self.db().execute("SELECT external_key FROM link WHERE system='obsidian_task'").fetchall()
+        self.assertEqual([l[0] for l in links], ["50 Daily/2026-09-11.md#clr0001"])
         self.assertEqual(self.db().execute("SELECT COUNT(*) FROM source_event WHERE platform='obsidian' AND triage='new'").fetchone()[0], 0)
         f.write_text("## Tasks\n- [x] #tasks 완전히 다른 문구 📅 2026-09-12 ✅ 2026-09-12\n", encoding="utf-8")
         os.utime(f, None)
@@ -1148,13 +1158,18 @@ class Phase3Test(FixtureBase):
     # -- wait / hold / cancel / reopen / progress / maintain -------------------
     def test_wait_hold_cancel_reopen_progress(self):
         self.seed_mail_items()
-        r = self.store("wait", "--item", "CLR-0001", "--waiting-on", "김 교수")       # 목(9/11) + 3영업일 = 화(9/16)
+        # 0.7.0: 기본 3일 뒤(9/14)지만 마감(9/12)이 더 빠르므로 마감 전날로 당긴다 — 오늘(9/11)이 전날이라 내일(9/12)
+        r = self.store("wait", "--item", "CLR-0001", "--waiting-on", "김 교수")
         self.assertEqual(r["status"], "waiting")
         it = self.item("CLR-0001")
-        self.assertEqual(it["waiting_on"], "김 교수"); self.assertEqual(it["next_check_at"], "2026-09-16T06:00:00+09:00")
+        self.assertEqual(it["waiting_on"], "김 교수"); self.assertEqual(it["next_check_at"], "2026-09-12T06:00:00+09:00")
+        self.assertIn("언제 다시 확인할까요?", r["message"]); self.assertTrue(r["recheck_defaulted"])
         w = self.sh("claire_search", "waiting", "--who", "김")
         self.assertEqual(w["waiting"][0]["ref"], "CLR-0001"); self.assertFalse(w["waiting"][0]["check_due"])
-        self.env["CLAIRE_NOW"] = "2026-09-16T06:30:00+09:00"
+        self.env["CLAIRE_NOW"] = "2026-09-12T06:30:00+09:00"
+        rv = self.sh("claire_search", "review")
+        self.assertEqual([i["ref"] for i in rv["waiting_check"]], ["CLR-0001"])
+        self.env["CLAIRE_NOW"] = "2026-09-16T06:30:00+09:00"                          # 답이 없으면 매일 계속 확인 대상
         rv = self.sh("claire_search", "review")
         self.assertEqual([i["ref"] for i in rv["waiting_check"]], ["CLR-0001"])
         self.store("progress", "--item", "CLR-0001", "--note", "초안은 보냈어", "--next-action", "최종본 보내기")
@@ -1314,6 +1329,7 @@ class Phase4Test(FixtureBase):
 
     # -- TC23: 메일에서 발견한 회의는 승인 전 실행되지 않는다 -------------------
     def test_TC23_discovered_meeting_requires_confirm(self):
+        self.legacy_tasks()
         self.sh("claire_sync", "gmail")
         m1 = self.gmail_event("m1")["id"]
         r = self.propose([{"op": "create", "source_event_ids": [m1], "kind": "meeting", "title": "IROS 조직위 회의",
@@ -1341,6 +1357,7 @@ class Phase4Test(FixtureBase):
 
     # -- TC18: Claire 가 만든 Daily 줄 ------------------------------------------
     def test_TC18_daily_line_with_id_relinks_on_rescan(self):
+        self.legacy_tasks()
         a = self.sh("claire_sync", "ingest-discord", "--message-id", "d2", "--text", "할일: 심사 의견 9/12까지 정리",
                     "--captured-at", "2026-09-11T09:00:00+09:00")
         r = self.propose([{"op": "create", "source_event_ids": [a["source_event_id"]], "kind": "task", "title": "심사 의견 정리",
@@ -1616,7 +1633,7 @@ class ButtonsTest(FixtureBase):
         self.sh("claire_store", "wait", "--item", "CLR-0001", "--waiting-on", "김 교수")
         c = self.buttons("actions", "--item", "CLR-0001")
         self.assertEqual(c["status"], "waiting")
-        self.assertEqual(c["buttons"][:2], ["CLR-0001 완료", "CLR-0001 재개"]); self.assertIn("김 교수 답 대기", c["message"])
+        self.assertEqual(c["buttons"][:2], ["CLR-0001 답 왔어", "CLR-0001 계속 대기"]); self.assertIn("김 교수 답 대기", c["message"])
         self.sh("claire_store", "complete", "--item", "CLR-0001", "--evidence", "user_report")
         c = self.buttons("actions", "--item", "CLR-0001")
         self.assertEqual(c["buttons"][:2], ["CLR-0001 다시 열어", "CLR-0001 상세"])
@@ -1632,6 +1649,7 @@ class V050Test(FixtureBase):
     def setUp(self):
         super().setUp()
         self.v050_setup()
+        self.legacy_tasks()          # 0.5.0 동작(Daily 줄·Tasks 승인 대기)을 그대로 확인한다. 0.7.0 은 V070Test
 
     def v050_setup(self):
         (self.vault / "92 Templates").mkdir()
@@ -1983,7 +2001,7 @@ class V050Test(FixtureBase):
             r = self.sh("claire_check", "integrity", env=env)
             self.assertEqual(r["counts"]["checkin"], 0)
             conn = sqlite3.connect(d / "claire.db")
-            self.assertEqual(conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()[0], "3")
+            self.assertEqual(conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()[0], str(claire_core.SCHEMA_VERSION))
             self.assertEqual([x[0] for x in conn.execute("SELECT due_precision FROM item ORDER BY id")], ["date", "time", None])
             self.assertTrue(conn.execute("SELECT value FROM meta WHERE key='daily_done_since'").fetchone())
             cols = {x[1] for x in conn.execute("PRAGMA table_info(outbox)")}
@@ -1994,7 +2012,7 @@ class V050Test(FixtureBase):
             self.assertEqual(r["counts"]["delivery"], 0)
             conn.close()
             v = self.sh("claire_check", "version", env=env)
-            self.assertEqual((v["version"], v["db_schema_version"]), (claire_core.CLAIRE_VERSION, 3))
+            self.assertEqual((v["version"], v["db_schema_version"]), (claire_core.CLAIRE_VERSION, claire_core.SCHEMA_VERSION))
         finally:
             shutil.rmtree(d, ignore_errors=True)
 
@@ -2111,7 +2129,7 @@ class V060Test(FixtureBase):
         self.assertEqual(self.sections(d)["today"], ["CLR-0001"])
         self.assertIn("CLR-0001", d["check_refs"])
         # 외부 반영 상태(승인 대기)는 업무 상태와 따로 보이고, 승인 대기여도 진행 확인은 계속된다 (R6)
-        self.assertIn("18:00 마감  심사평 제출 (CLR-0001) · 단체 요청 · 달력 승인 대기 · Tasks 승인 대기 · 진행 확인",
+        self.assertIn("18:00 마감  심사평 제출 (CLR-0001) · 단체 요청 · 달력 승인 대기 · 진행 확인",
                       self.agenda()["text"])
         self.at("2026-09-14T06:00:00+09:00")                           # 기한 경과: 정리될 때까지 매일
         self.assertEqual(self.ag_data()["check"][0]["check"]["reason"], "overdue")
@@ -2171,6 +2189,7 @@ class V060Test(FixtureBase):
 
     # -- §6-9·10 표시 제외 ≠ 업무 제외, 처리 불필요 --------------------------------------------------
     def test_display_exclusion_keeps_tracking_and_dismiss_removes_with_history(self):
+        self.legacy_tasks()          # Tasks 승인 대기가 있는 0.6.x 정책에서 "Tasks에 표시 안 함"을 확인
         V050Test.discovered(self)
         self.apply("--cancel", "CLR-0004", "--only", "tasks")                 # Tasks에 표시 안 함
         it = self.item("CLR-0004")
@@ -2199,16 +2218,18 @@ class V060Test(FixtureBase):
     def test_hold_rechecks_on_date_and_waiting_is_not_asked_before(self):
         self.discord_task("d1", "원고 수정")
         h = self.store("hold", "--item", "CLR-0001", "--until", "2026-09-14", "--reason", "리뷰 결과 대기")
-        self.assertIn("9/14에 다시 여쭙겠습니다", h["message"])
+        self.assertIn("9/14(월)에 재개할지 여쭙겠습니다", h["message"])
         self.at("2026-09-13T06:00:00+09:00")
         s = self.sections(); self.assertIn("CLR-0001", s["parked"]); self.assertNotIn("CLR-0001", s["check"])
         self.assertIn("원고 수정 (CLR-0001) · 보류(리뷰 결과 대기) · 다음 확인 9/14", self.agenda("--no-record")["text"])
         self.at("2026-09-14T06:00:00+09:00")
         self.assertEqual(self.ag_data()["check"][0]["check"]["reason"], "recheck")
         self.store("hold", "--item", "CLR-0001", "--reason", "x", expect_ok=True)   # 같은 상태 — 변화 없음
-        # 기본 재확인일 (7일)
+        # 기본 재확인일 (0.7.0: 3일) + 날짜 질문
         self.discord_task("d2", "다른 일")
-        self.assertEqual(self.store("hold", "--item", "CLR-0002")["next_check_at"][:10], "2026-09-21")
+        h2 = self.store("hold", "--item", "CLR-0002")
+        self.assertEqual(h2["next_check_at"][:10], "2026-09-17")      # 지금 9/14 + 3일
+        self.assertIn("언제 다시 확인할까요?", h2["message"])
 
     # -- §6-11 자동 마감 표시끼리 겹침은 충돌이 아니다 ------------------------------------------------
     def test_deadline_markers_overlapping_are_workload_not_conflict(self):
@@ -2359,7 +2380,7 @@ class V060Test(FixtureBase):
         r = self.sh("claire_check", "integrity")
         self.assertTrue(r["healthy"], r["problems"])
         conn = self.db()
-        self.assertEqual(conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()[0], "3")
+        self.assertEqual(conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()[0], str(claire_core.SCHEMA_VERSION))
         self.assertEqual([tuple(r) for r in conn.execute("SELECT ref, status, completed_at, due_at FROM item ORDER BY id")], before)
         self.assertEqual([tuple(r) for r in conn.execute("SELECT id, status, result FROM outbox WHERE result LIKE '%declined%'")], declined)
         self.assertTrue(self.store("maintain")["importance_backfill"]["done"])
@@ -2504,6 +2525,376 @@ class V060Test(FixtureBase):
 
 
 @unittest.skipUnless(shutil.which("git") and shutil.which("bash"), "git·bash 필요")
+class V070Test(FixtureBase):
+    """0.7.0 (ISSUE 2026-09-29): 아침 보고 간소화 · 대기·보류 재확인 · Tasks 주제 문서. 수용 기준 §7 을 하나씩 확인한다.
+    기준 시각 2026-09-11(금) 06:00."""
+
+    def setUp(self):
+        super().setUp()
+        V050Test.v050_setup(self)
+
+    store, apply, item, outbox, ingest = V050Test.store, V050Test.apply, V050Test.item, V050Test.outbox, V050Test.ingest
+    at, deliver_all, discord_task = V060Test.at, V060Test.deliver_all, V060Test.discord_task
+
+    def report(self, *extra):
+        return self.sh("claire_buttons", "report", *extra)
+
+    def many(self, n, *, due=None, prefix="일", mid="dm", project=None, kind="task", **kw):
+        a = self.ingest(mid, f"등록: {prefix} 여러 건")
+        props = []
+        for i in range(n):
+            p = {"op": "create", "source_event_ids": [a["source_event_id"]], "kind": kind, "title": f"{prefix} {i:03d}",
+                 "confidence": 0.9, "evidence": ["x"], **kw}
+            if due:
+                p["due_at"] = due
+            if project:
+                p["project"] = project
+            props.append(p)
+        return self.propose(props)
+
+    def page(self, rp, key):
+        return [m for m in rp["messages"] if m.get("page") == key]
+
+    # -- §7-1 오늘 달력 일정과 오늘 마감이 중복 없이, 실제 마감이 빠지지 않는다 ---------------------------
+    def test_today_calendar_and_due_without_duplicates(self):
+        V050Test.register_deadline(self, due="2026-09-11T18:00:00+09:00", title="출장 보고서", mid="d1")     # 달력 마감 표시
+        V050Test.register_deadline(self, due="2026-09-12T15:00:00+09:00", title="심사평", mid="d2")
+        self.store("update", "--item", "CLR-0002", "--set", "start_at=2026-09-11T10:00:00+09:00",
+                   "--set", "end_at=2026-09-11T12:00:00+09:00", "--reason", "오늘 작업")                 # 오늘 작업, 마감은 내일
+        self.discord_task("d3", "명단 회신", due_at="2026-09-11")                                      # 날짜만 오늘 마감(달력 밖)
+        a = self.ingest("d4", "등록: 면담")
+        self.propose([{"op": "create", "source_event_ids": [a["source_event_id"]], "kind": "meeting", "title": "김 교수 면담",
+                       "start_at": "2026-09-11T14:00:00+09:00", "end_at": "2026-09-11T15:00:00+09:00",
+                       "confidence": 0.95, "evidence": ["x"]}])
+        rp = self.report("--no-record")
+        d = self.sh("claire_search", "report")
+        self.assertEqual([e["ref"] for e in d["today_cal"]], ["CLR-0002", "CLR-0004", "CLR-0001"])
+        self.assertEqual([e["ref"] for e in d["today_due"]], ["CLR-0003"])
+        text = self.page(rp, "today")[0]["message"]
+        self.assertIn("10:00–12:00 작업 · 마감 9/12 15:00  심사평 (CLR-0002)", text)      # 작업 예약과 실제 마감을 한 항목에
+        self.assertIn("18:00 마감  출장 보고서 (CLR-0001)", text)
+        self.assertIn("오늘 마감  명단 회신 (CLR-0003)", text)
+        nums = [n for m in rp["messages"] for n in m["numbers"]]
+        self.assertEqual(sorted(set(nums)), sorted(nums))                                  # 한 업무는 한 곳에만
+        self.assertTrue(d["accounting"]["ok"])
+
+    # -- §7-2 연체 100건: 전체 건수, 상위 10~15건 버튼, 나머지 요약, 한 메시지 --------------------------------
+    def test_hundred_overdue_fit_one_message(self):
+        self.many(100, due="2026-09-05", prefix="밀린 일")
+        self.at("2026-09-12T06:00:00+09:00")
+        rp = self.report()
+        od = self.page(rp, "overdue")
+        self.assertEqual(len(od), 1)
+        m = od[0]
+        self.assertEqual(m["problems"], [])
+        self.assertIn("**3. 기한 지남 100건**", m["message"])
+        self.assertTrue(10 <= len(m["numbers"]) <= 15, len(m["numbers"]))
+        self.assertEqual(len(rp["overdue"]["detail"]), len(m["numbers"]))
+        kw, om = rp["overdue"]["keywords"], rp["overdue"]["omitted"]
+        self.assertEqual(len(m["numbers"]) + len(kw) + len(om), 100)                        # 빠진 업무 없이 셈
+        self.assertIn("기한 지남 전체 보기", json.dumps(m["components"], ensure_ascii=False))
+        self.assertLessEqual(len(m["message"]), 3800)
+        # 표시를 줄여도 상태·마감·추적은 그대로
+        st = self.db().execute("SELECT COUNT(*) FROM item WHERE status='todo' AND due_at LIKE '2026-09-05%'").fetchone()[0]
+        self.assertEqual(st, 100)
+        self.deliver_all(rp)
+        for ref in m["numbers"]:
+            self.assertIsNotNone(self.item(ref)["last_detailed_at"])
+            self.assertEqual(self.item(ref)["last_asked_at"][:10], "2026-09-12")
+        for ref in kw:
+            self.assertIsNotNone(self.item(ref)["last_exposed_at"])                         # 키워드도 "보여 줌"
+            self.assertIsNone(self.item(ref)["last_asked_at"])                              # 물은 것은 아니다
+        # 다음 날에는 어제 상세로 본 것 대신 다른 업무가 올라온다 (같은 항목만 반복하지 않는다)
+        self.at("2026-09-13T06:00:00+09:00")
+        rp2 = self.report("--no-record")
+        self.assertTrue(set(rp2["overdue"]["detail"]).isdisjoint(set(m["numbers"])))
+        # 전체 보기는 100건 모두 (여러 쪽 가능)
+        v = self.sh("claire_buttons", "agenda", "--view", "overdue", "--no-record")
+        self.assertEqual(sorted({n for mm in v["messages"] for n in mm["numbers"]}), [f"CLR-{i:04d}" for i in range(1, 101)])
+
+    # -- §7-3 기한 전 진행 확인이 많아도 최대 두 쪽, 쪽마다 10건 이상 ------------------------------------------------
+    def test_progress_at_most_two_messages_each_ten_plus(self):
+        self.many(50, prefix="진행 업무")                                                  # Discord 직접 등록 → 높음, 매일 확인
+        self.at("2026-09-12T06:00:00+09:00")
+        rp = self.report("--no-record")
+        pg = [m for m in rp["messages"] if m.get("page", "").startswith("progress")]
+        self.assertEqual(len(pg), 2)
+        for m in pg:
+            self.assertGreaterEqual(len(m["numbers"]), 10)
+            self.assertEqual(m["problems"], [])
+        self.assertEqual(rp["progress"]["total"], 50)
+        self.assertEqual(len(rp["progress"]["detail"]) + len(rp["progress"]["keywords"]) + len(rp["progress"]["omitted"]), 50)
+        self.assertIn("진행 확인 전체 보기", json.dumps(pg[-1]["components"], ensure_ascii=False))
+        self.assertTrue(rp["accounting"]["ok"])
+
+    # -- §7-5 완료 200건이 생겨도 완료 상세가 쏟아지지 않는다 --------------------------------------------------
+    def test_many_completions_are_one_line(self):
+        self.many(200, prefix="끝낸 일")
+        refs = ",".join(f"CLR-{i:04d}" for i in range(1, 201))
+        self.store("complete", "--item", refs, "--evidence", "user_report")
+        self.at("2026-09-11T20:00:00+09:00")
+        rp = self.report("--no-record")
+        st = self.page(rp, "status")[0]["message"]
+        self.assertIn("완료 반영 200건", st)
+        self.assertNotIn("끝낸 일 000", rp["text"])
+        self.assertLessEqual(len(rp["messages"]), 5)
+
+    # -- §7-6 지난 미팅은 기본 독촉에서 빠지지만 완료로 단정하지 않는다 -------------------------------------------
+    def test_past_meetings_hidden_not_completed(self):
+        a = self.ingest("d1", "등록: 면담")
+        self.propose([{"op": "create", "source_event_ids": [a["source_event_id"]], "kind": "meeting", "title": "지난 면담",
+                       "start_at": "2026-09-10T10:00:00+09:00", "end_at": "2026-09-10T11:00:00+09:00",
+                       "confidence": 0.95, "evidence": ["x"]}])
+        rp = self.report("--no-record")
+        self.assertNotIn("CLR-0001", [n for m in rp["messages"] for n in m["numbers"]])
+        self.assertIn("지난 일정 1건(완료 체크 목록에서 뺌 · 기록 유지)", rp["text"])
+        self.assertEqual(self.item("CLR-0001")["status"], "todo")
+        v = self.sh("claire_buttons", "agenda", "--view", "past", "--no-record")
+        self.assertEqual(v["messages"][0]["numbers"], ["CLR-0001"])
+        self.assertEqual(self.sh("claire_search", "agenda")["health"]["exposure_gaps"], [])  # 일부러 뺀 것은 누락이 아니다
+
+    # -- §7-7·8 대기: 날짜 질문·3일 기본값·마감 전 재확인·무응답에도 매일·계속 대기 ------------------------------
+    def test_wait_default_three_days_ask_and_recheck_daily(self):
+        self.discord_task("d1", "초록 승인 요청")
+        r = self.store("wait", "--item", "CLR-0001", "--waiting-on", "김 교수", "--about", "초록 승인")
+        self.assertEqual(r["next_check_at"], "2026-09-14T06:00:00+09:00")                   # 9/11 + 3일 (달력)
+        self.assertIn("언제 다시 확인할까요? 지정하지 않으시면 9/14(월)에 확인하겠습니다.", r["message"])
+        labels = [b["label"] for blk in r["components"]["blocks"] for b in blk["buttons"]]
+        self.assertEqual(labels, ["CLR-0001 9/12까지 대기", "CLR-0001 9/14까지 대기 (기본)", "CLR-0001 9/18까지 대기"])
+        self.at("2026-09-13T06:00:00+09:00")
+        self.assertNotIn("CLR-0001", self.report("--no-record")["check_refs"])             # 재확인일 전: 독촉 없음
+        for day in ("14", "15", "16"):                                                     # 재확인일부터 답이 없어도 매일
+            self.at(f"2026-09-{day}T06:00:00+09:00")
+            rp = self.report()
+            self.assertIn("CLR-0001", rp["check_refs"], day)
+            self.assertIn("재확인일·김 교수  초록 승인 요청 (CLR-0001)", rp["text"])
+            self.deliver_all(rp)
+            self.assertEqual(self.item("CLR-0001")["status"], "waiting")
+        # 계속 대기: 상대·내용은 그대로, 다음 확인일만 새로 (날짜를 말하면 그 날짜)
+        c = self.store("wait", "--item", "CLR-0001", "--until", "2026-09-20")
+        it = self.item("CLR-0001")
+        self.assertEqual((it["waiting_on"], it["blocked_reason"], it["next_check_at"][:10]), ("김 교수", "초록 승인", "2026-09-20"))
+        self.assertNotIn("ask", c)
+        # 답 왔어 → 재개
+        self.store("resume", "--item", "CLR-0001", "--reason", "답 왔어")
+        self.assertEqual(self.item("CLR-0001")["status"], "todo")
+
+    def test_wait_before_deadline_and_date_after_deadline(self):
+        V050Test.register_deadline(self, due="2026-09-13T18:00:00+09:00", title="추천서", mid="d1")
+        r = self.store("wait", "--item", "CLR-0001", "--waiting-on", "학생")
+        self.assertEqual(r["next_check_at"][:10], "2026-09-12")                             # 마감(9/13) 전날로 당김
+        self.assertEqual(self.item("CLR-0001")["due_at"], "2026-09-13T18:00:00+09:00")      # 마감은 그대로
+        # 교수님이 마감 뒤 날짜를 말하면 존중하되 마감 전날·당일에는 알린다
+        V050Test.register_deadline(self, due="2026-09-13T18:00:00+09:00", title="보고서", mid="d2")
+        r = self.store("hold", "--item", "CLR-0002", "--until", "2026-09-20", "--reason", "자료 대기")
+        self.assertIn("마감 9/13이 재확인일 9/20보다 먼저입니다", r["message"])
+        self.at("2026-09-12T06:00:00+09:00")
+        d = self.sh("claire_search", "report")
+        self.assertIn("CLR-0002", [e["ref"] for e in d["progress"]["detail"]])
+        self.assertEqual(next(e for e in d["progress"]["detail"] if e["ref"] == "CLR-0002")["check"], "wait_due")
+        # 이미 마감이 지난 업무를 날짜 없이 대기로 두면 다음 날 확인
+        self.discord_task("d3", "지난 일", due_at="2026-09-10")
+        r = self.store("wait", "--item", "CLR-0003", "--waiting-on", "행정실")
+        self.assertEqual(r["next_check_at"][:10], "2026-09-13")
+        self.assertIn("마감(9/10)이 이미 지나 내일(9/13) 다시 확인합니다", r["message"])
+        self.at("2026-09-12T12:00:00+09:00")
+        d = self.sh("claire_search", "report")
+        self.assertIn("CLR-0003", [e["ref"] for e in d["parked"]], json.dumps(d, ensure_ascii=False)[:3000])   # 재확인일 전: 연체 독촉 없음
+
+    def test_upkeep_sets_recheck_date_for_old_waiting(self):
+        self.discord_task("d1", "옛 대기")
+        self.db().execute("UPDATE item SET status='waiting', waiting_on='누군가', next_check_at=NULL WHERE ref='CLR-0001'")
+        self.db().commit()
+        rp = self.report("--no-record")
+        self.assertEqual(rp["upkeep"]["recheck_dates_set"], ["CLR-0001"])
+        self.assertEqual(self.item("CLR-0001")["next_check_at"][:10], "2026-09-14")
+
+    # -- 질문은 기본 3건, 나머지는 계속 추적 ------------------------------------------------------------------
+    def test_questions_capped_at_three(self):
+        a = self.ingest("d1", "등록: 질문 많은 일")
+        self.propose([{"op": "create", "source_event_ids": [a["source_event_id"]], "kind": "task", "title": f"질문 {i}",
+                       "confidence": 0.9, "evidence": ["x"], "unknown_fields": ["scope"],
+                       "questions": [{"field": "scope", "question": f"범위 {i}?"}]} for i in range(5)])
+        rp = self.report()
+        st = self.page(rp, "status")[0]
+        self.assertEqual(len(rp["questions"]), 3)
+        self.assertIn("질문 2건은 다음 보고에 (계속 추적)", st["message"])
+        self.deliver_all(rp)
+        asked = self.db().execute("SELECT COUNT(*) FROM question WHERE asked_count=1").fetchone()[0]
+        self.assertEqual(asked, 3)
+
+    # -- §5 Tasks: 주제 문서 · 수집함 · 위치 질문 · 옮기기 ------------------------------------------------------
+    def test_tasks_go_to_topic_note_or_inbox_and_move_after_confirm(self):
+        (self.vault / "10 Projects" / "IROS 2026").mkdir(parents=True)
+        (self.vault / "10 Projects" / "IROS 2026" / "IROS 2026 준비.md").write_text("# IROS 2026 준비\n\n메모\n", encoding="utf-8")
+        (self.vault / "20 Areas").mkdir()
+        (self.vault / "20 Areas" / "논문 심사.md").write_text("# 논문 심사\n\n## Tasks\n- [ ] #tasks 기존 줄\n\n## 메모\n", encoding="utf-8")
+        self.sh("claire_sync", "gmail")
+        m1 = self.gmail_event("m1")["id"]
+        r = self.propose([
+            {"op": "create", "source_event_ids": [m1], "kind": "deadline", "title": "심사 의견", "due_at": "2026-09-19",
+             "canonical_note": "논문 심사", "confidence": 0.9, "evidence": ["x"], "request_scope": "direct"},
+            {"op": "create", "source_event_ids": [m1], "kind": "task", "title": "IROS 명단 회신", "due_at": "2026-09-18",
+             "project": "IROS 2026", "confidence": 0.9, "evidence": ["x"], "request_scope": "direct"}])
+        # 승인 없이 자동 (메일에서 발견한 업무도)
+        self.assertEqual([p for c in r["created"] for p in c["planned"] if p["op"] == "obsidian.add_task"],
+                         [{"op": "obsidian.add_task", "requires_confirm": 0}] * 2)
+        a = self.apply()
+        placed = {d["item_ref"]: d["result"]["placement"] for d in a["done"] if d["op"] == "obsidian.add_task"}
+        self.assertEqual(placed, {"CLR-0001": "canonical_note", "CLR-0002": "inbox"})
+        topic = (self.vault / "20 Areas" / "논문 심사.md").read_text(encoding="utf-8")
+        self.assertIn("- [ ] #tasks 기존 줄\n- [ ] #tasks 심사 의견 📅 2026-09-19 🆔 clr0001\n\n## 메모", topic)
+        inbox = self.vault / "01 Inbox" / "Claire 업무 수집함.md"
+        self.assertIn("- [ ] #tasks IROS 명단 회신 📅 2026-09-18 🆔 clr0002", inbox.read_text(encoding="utf-8"))
+        self.assertIn("임시 위치", inbox.read_text(encoding="utf-8"))
+        self.assertFalse((self.vault / "50 Daily" / "2026-09-18.md").exists())             # Daily 에 미완료 Tasks 를 만들지 않는다
+        # 처음 보는 프로젝트: 문서 후보를 한 번 묻는다
+        rp = self.report()
+        st = self.page(rp, "status")[0]
+        self.assertIn("'IROS 2026' 업무의 Tasks 를 어느 문서에 둘까요?", st["message"])
+        self.assertIn("IROS 2026 → IROS 2026 준비", json.dumps(st["components"], ensure_ascii=False))
+        self.deliver_all(rp)
+        self.at("2026-09-12T06:00:00+09:00")
+        self.assertEqual(self.report("--no-record")["note_asks"], [])                       # 매일 묻지 않는다
+        # 확인 → 수집함의 줄을 옮긴다 (🆔 유지, 원래 줄 삭제)
+        nm = self.store("note-map", "--project", "IROS 2026", "--note", "IROS 2026 준비")
+        self.assertEqual(nm["moved"], ["CLR-0002"])
+        self.apply()
+        doc = (self.vault / "10 Projects" / "IROS 2026" / "IROS 2026 준비.md").read_text(encoding="utf-8")
+        self.assertIn("## Tasks\n- [ ] #tasks IROS 명단 회신 📅 2026-09-18 🆔 clr0002", doc)
+        self.assertNotIn("clr0002", inbox.read_text(encoding="utf-8"))
+        link = self.db().execute("SELECT external_key FROM link WHERE system='obsidian_task' AND item_id=2").fetchone()[0]
+        self.assertEqual(link, "10 Projects/IROS 2026/IROS 2026 준비.md#clr0002")
+        # 같은 프로젝트의 다음 업무는 바로 그 문서로
+        self.discord_task("d9", "IROS 등록", due_at="2026-09-20", project="IROS 2026")
+        a = self.apply()
+        self.assertIn("project", [d["result"].get("placement") for d in a["done"] if d["op"] == "obsidian.add_task"])
+
+    def test_completion_sync_both_ways_and_reopen_and_date_fix(self):
+        (self.vault / "20 Areas").mkdir()
+        note = self.vault / "20 Areas" / "학회.md"
+        note.write_text("# 학회\n", encoding="utf-8")
+        self.discord_task("d1", "학회 등록", due_at="2026-09-15", canonical_note="학회")
+        self.apply()
+        self.assertIn("## Tasks\n- [ ] #tasks 학회 등록 📅 2026-09-15 🆔 clr0001", note.read_text(encoding="utf-8"))
+        self.sh("claire_sync", "obsidian")
+        # Discord 완료 → 원문 Task 체크 + Daily 완료 기록
+        self.store("complete", "--item", "CLR-0001", "--evidence", "user_report")
+        self.apply()
+        self.assertIn("- [x] #tasks 학회 등록 📅 2026-09-15 🆔 clr0001 ✅ 2026-09-11", note.read_text(encoding="utf-8"))
+        self.assertIn("%%claire-done:CLR-0001%%", V050Test.daily_text(self, "2026-09-11"))
+        self.assertNotIn("- [ ] #tasks", V050Test.daily_text(self, "2026-09-11").split("## 완료한 일")[-1])
+        self.sh("claire_sync", "obsidian")
+        # 완료일 정정 → ✅ 날짜도
+        self.store("complete", "--item", "CLR-0001", "--evidence", "user_report", "--completed-at", "2026-09-10")
+        self.apply()
+        self.assertIn("🆔 clr0001 ✅ 2026-09-10", note.read_text(encoding="utf-8"))
+        self.assertIn("%%claire-done:CLR-0001%%", V050Test.daily_text(self, "2026-09-10"))
+        self.sh("claire_sync", "obsidian")
+        # Discord 완료 취소 → 줄 체크 해제
+        self.store("reopen", "--item", "CLR-0001", "--apply")
+        self.apply()
+        self.assertIn("- [ ] #tasks 학회 등록 📅 2026-09-15 🆔 clr0001", note.read_text(encoding="utf-8"))
+        self.assertNotIn("✅", note.read_text(encoding="utf-8"))
+        self.assertNotIn("%%claire-done:CLR-0001%%", V050Test.daily_text(self, "2026-09-10"))
+        self.sh("claire_sync", "obsidian")
+        self.assertEqual(self.item("CLR-0001")["status"], "todo")                         # 동기화가 되돌리지 않는다
+        # Obsidian 에서 직접 체크 → 완료, 체크 해제 → 다시 열기
+        self.at("2026-09-12T09:00:00+09:00")
+        note.write_text(note.read_text(encoding="utf-8").replace("- [ ] #tasks 학회 등록 📅 2026-09-15 🆔 clr0001",
+                                                                 "- [x] #tasks 학회 등록 📅 2026-09-15 🆔 clr0001 ✅ 2026-09-12"),
+                        encoding="utf-8")
+        os.utime(note, None)
+        self.sh("claire_sync", "obsidian")
+        self.assertEqual(self.item("CLR-0001")["status"], "done")
+        self.apply()
+        self.assertIn("%%claire-done:CLR-0001%%", V050Test.daily_text(self, "2026-09-12"))
+        # ✅ 날짜를 고치면 완료일 정정
+        note.write_text(note.read_text(encoding="utf-8").replace("✅ 2026-09-12", "✅ 2026-09-11"), encoding="utf-8")
+        os.utime(note, None)
+        self.sh("claire_sync", "obsidian")                                                 # 예전에 본 줄 모양이어도 반영
+        self.assertEqual(self.item("CLR-0001")["completed_at"][:10], "2026-09-11")
+        self.apply()
+        self.assertIn("%%claire-done:CLR-0001%%", V050Test.daily_text(self, "2026-09-11"))
+        self.assertNotIn("%%claire-done:CLR-0001%%", V050Test.daily_text(self, "2026-09-12"))
+        note.write_text(note.read_text(encoding="utf-8").replace("- [x] #tasks 학회 등록 📅 2026-09-15 🆔 clr0001 ✅ 2026-09-11",
+                                                                 "- [ ] #tasks 학회 등록 📅 2026-09-15 🆔 clr0001"), encoding="utf-8")
+        os.utime(note, None)
+        self.sh("claire_sync", "obsidian")
+        self.assertEqual(self.item("CLR-0001")["status"], "todo")
+        self.apply()
+        self.assertNotIn("%%claire-done:CLR-0001%%", V050Test.daily_text(self, "2026-09-11"))
+        self.assertEqual(self.db().execute("SELECT COUNT(*) FROM item").fetchone()[0], 1)
+
+    def test_moved_note_relinks_and_duplicate_line_is_not_linked(self):
+        (self.vault / "20 Areas").mkdir()
+        note = self.vault / "20 Areas" / "학회.md"
+        note.write_text("# 학회\n", encoding="utf-8")
+        self.discord_task("d1", "학회 등록", due_at="2026-09-15", canonical_note="학회")
+        self.apply(); self.sh("claire_sync", "obsidian")
+        # 문서 이름 변경 → 🆔 로 연결을 옮긴다
+        (self.vault / "30 Resources").mkdir()
+        moved = self.vault / "30 Resources" / "학회 2026.md"
+        note.rename(moved); os.utime(moved, None)
+        self.sh("claire_sync", "obsidian")
+        link = self.db().execute("SELECT external_key FROM link WHERE system='obsidian_task'").fetchall()
+        self.assertEqual([l[0] for l in link], ["30 Resources/학회 2026.md#clr0001"])
+        # 완료 → 옮긴 문서의 줄을 체크
+        self.store("complete", "--item", "CLR-0001", "--evidence", "user_report")
+        self.apply()
+        self.assertIn("✅ 2026-09-11", moved.read_text(encoding="utf-8"))
+        # 같은 🆔 줄을 복사해 두면 연결하지 않는다 (중복 항목·잘못된 체크 없음)
+        other = self.vault / "30 Resources" / "복사.md"
+        other.write_text("- [ ] #tasks 학회 등록 📅 2026-09-15 🆔 clr0001\n", encoding="utf-8")
+        self.sh("claire_sync", "obsidian")
+        self.assertEqual(self.db().execute("SELECT COUNT(*) FROM link WHERE system='obsidian_task'").fetchone()[0], 1)
+        self.assertEqual(self.item("CLR-0001")["status"], "done")
+        self.assertEqual(self.db().execute("SELECT COUNT(*) FROM item").fetchone()[0], 1)
+
+    def test_pending_task_approvals_are_released_on_upgrade(self):
+        self.legacy_tasks()
+        self.sh("claire_sync", "gmail")
+        m1 = self.gmail_event("m1")["id"]
+        self.propose([{"op": "create", "source_event_ids": [m1], "kind": "task", "title": "명단 정리", "due_at": "2026-09-18",
+                       "confidence": 0.9, "evidence": ["x"], "request_scope": "group"}])
+        self.assertEqual(self.outbox("obsidian.add_task")[0]["status"], "awaiting_confirm")
+        c = json.loads((self.data / "config.json").read_text(encoding="utf-8"))
+        del c["obsidian"]["tasks_placement"]; del c["apply"]["obsidian_add_task"]          # 0.7.0 기본으로
+        (self.data / "config.json").write_text(json.dumps(c, ensure_ascii=False), encoding="utf-8")
+        self.assertEqual(self.sh("claire_check", "init")["upkeep"]["task_approvals_released"] if False else
+                         self.report("--no-record")["upkeep"]["task_approvals_released"], ["CLR-0001"])
+        self.assertEqual(self.apply("--approvals")["counts"]["tasks"], 0)
+        a = self.apply()
+        self.assertEqual([d["result"]["placement"] for d in a["done"] if d["op"] == "obsidian.add_task"], ["inbox"])
+
+    def test_keyword_labels_and_short_number(self):
+        self.many(20, due="2026-09-05", prefix="긴 제목의 연체 업무입니다")
+        lf = self.data / "labels.json"
+        lf.write_text(json.dumps({"CLR-0020": "RiTA 회신"}, ensure_ascii=False), encoding="utf-8")
+        self.assertEqual(self.store("labels", "--file", lf)["updated"], ["CLR-0020"])
+        self.at("2026-09-12T06:00:00+09:00")
+        rp = self.report("--no-record")
+        if "CLR-0020" in rp["overdue"]["keywords"]:
+            self.assertIn("RiTA 회신(20)", rp["text"])
+        miss = self.sh("claire_search", "labels-missing")
+        self.assertNotIn("CLR-0020", [x["ref"] for x in miss["items"]])
+        self.assertEqual(self.sh("claire_search", "find", "--q", "RiTA")["results"][0]["ref"], "CLR-0020")
+
+    def test_report_delivery_dedup_and_status_page(self):
+        self.discord_task("d1", "추천서 작성")
+        self.at("2026-09-12T06:00:00+09:00")
+        rp = self.report()
+        self.assertTrue(rp["accounting"]["ok"])
+        keys = [m["page"] for m in rp["messages"]]
+        self.assertEqual(keys, ["today", "progress1", "status"])          # 빈 구역은 쪽을 만들지 않는다
+        self.assertTrue(rp["messages"][0]["message"].startswith("[아침 보고 9/12(토)] 활성 1건"))
+        for m in rp["messages"]:
+            self.assertEqual(m["problems"], [])
+        self.deliver_all(rp)
+        self.assertTrue(self.report()["duplicate"])
+        self.assertIn("전체 목록", json.dumps(rp["messages"][-1]["components"], ensure_ascii=False))
+
+
 class InstallTest(unittest.TestCase):
     """0.5.0: install.sh(설치 기록·claire-update·업그레이드 전 DB 사본)와 get.sh(릴리스 태그 설치·고정·확인)."""
 

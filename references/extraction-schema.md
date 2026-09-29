@@ -12,6 +12,7 @@ Claire는 자유 텍스트로 DB를 바꾸지 않는다. 해석 결과를 이 �
       "source_event_ids": [981],
       "kind": "reply",
       "title": "IROS 워크숍 발표자 명단 회신",
+      "short_label": "IROS 명단",
       "project": "IROS 2026 워크숍",
       "due_at": "2026-09-12",
       "done_criteria": "명단 회신 발송",
@@ -44,7 +45,7 @@ Claire는 자유 텍스트로 DB를 바꾸지 않는다. 해석 결과를 이 �
 
 | op | 필수 | 선택 | 2단계 |
 |---|---|---|---|
-| `create` | `source_event_ids`, `kind`, `title`, `evidence`(1개 이상). 메일 원문이면 `request_scope`(0.6.0) | `request_scope`(direct/group/self/none), `priority_reason`(분류 근거), `project`, `priority`(high/normal/low), `owner`(user/claire/other), `next_action`, `done_criteria`, `start_at`, `end_at`, `all_day`, `due_at`, `scheduled_on`, `tentative`, `confidence`(0~1), `waiting_on`, `next_check_at`, `canonical_note`, `ledger_note`, `series_key`, `occurrence_at`, `attendance`(undecided/attending/declined), `unknown_fields`, `questions`, `note` | ✅ |
+| `create` | `source_event_ids`, `kind`, `title`, `evidence`(1개 이상). 메일 원문이면 `request_scope`(0.6.0) | `request_scope`(direct/group/self/none), `priority_reason`(분류 근거), `short_label`(0.7.0, 1~3단어 키워드), `project`, `priority`(high/normal/low), `owner`(user/claire/other), `next_action`, `done_criteria`, `start_at`, `end_at`, `all_day`, `due_at`, `scheduled_on`, `tentative`, `confidence`(0~1), `waiting_on`, `next_check_at`, `canonical_note`, `ledger_note`, `series_key`, `occurrence_at`, `attendance`(undecided/attending/declined), `unknown_fields`, `questions`, `note` | ✅ |
 | `ignore` | `source_event_ids`, `reason` | `note` | ✅ |
 | `update` | `item_ref`, `source_event_ids`, `changes`(필드→값), `evidence` | `reason` | ✅ 같은 스레드·시리즈·연결 원문만. 아니면 `--force-cross-thread` |
 | `complete` | `item_ref`, `source_event_ids`, `evidence` | `reason`, `evidence_code`(기본 `criteria_evidence:<첫 source_event_id>`) | ✅ 보낸 메일·제출 확인 등 완료 증거 |
@@ -71,6 +72,9 @@ Claire는 자유 텍스트로 DB를 바꾸지 않는다. 해석 결과를 이 �
     `group`/`self`/`none` → normal, 메일인데 `request_scope`가 없으면 normal + "검토 필요"(`warnings.request_scope_missing`).
     마감 유무는 보지 않는다. `priority`를 주면 Claire 판단(`priority_source=claire`)이고 `priority_reason`이 없으면 `warnings.priority_reason_missing`.
     단체 메일이라도 개인 의무(결재·필수 제출)는 `request_scope: group` + `priority: high` + `priority_reason`.
+13. **키워드·자리 (0.7.0)**: `short_label`은 아침 보고에서 키워드로 줄일 때의 이름(1~3단어, 24자 이내, 예: "RiTA 회신"). 없으면 도구가
+    제목 앞부분을 쓴다. `project`는 같은 프로젝트면 늘 같은 이름으로 — Tasks 줄의 문서 위치(`note_map`)가 이 이름으로 이어진다.
+    `canonical_note`는 볼트에 실제로 있는 노트 이름만(있으면 그 노트의 `## Tasks`에 줄이 들어간다).
 11. `update`의 `changes` 값은 `claire_store update`와 같은 형식 검증을 받는다. `status`는 바꿀 수 없다(전이는 `complete`/`cancel`로).
     Calendar 연결 항목의 `start_at`/`end_at`은 Calendar가 원본이라 거부된다(4단계 outbox).
 

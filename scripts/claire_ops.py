@@ -28,6 +28,8 @@ UPDATABLE = {
     "due_precision": "precision", "attendance": "attendance", "window_auto": "bool",
     # 0.6.0 — 중요도·진행 확인 (교수님이 지정한 값은 priority_source='user' 로 기록되어 Claire 가 덮지 않는다)
     "request_scope": "scope", "priority_reason": "text", "check_every_days": "int", "review_after": "date",
+    # 0.7.0 — 보고의 키워드 요약 이름 (1~3단어)
+    "short_label": "text",
 }
 REQUEST_SCOPES = ["direct", "group", "self", "none"]
 CLOSE_REASONS = ["cancelled", "not_needed", "not_mine"]
@@ -327,8 +329,10 @@ def set_status(conn, cfg, item, new_status: str, *, actor: str, ts: str, reason:
         _withdraw_questions(conn, item["id"], ts, f"항목 {new_status}")
         _cancel_outbox(conn, item["id"], ts)
     if cur == "done":
-        # 완료 취소(다시 열기): Daily 완료 기록도 지운다
-        plan_daily_done(conn, cfg, conn.execute("SELECT * FROM item WHERE id=?", (item["id"],)).fetchone(), ts)
+        # 완료 취소(다시 열기): Daily 완료 기록도 지우고, 원래 Tasks 줄의 체크도 푼다 (0.7.0)
+        fresh = conn.execute("SELECT * FROM item WHERE id=?", (item["id"],)).fetchone()
+        plan_daily_done(conn, cfg, fresh, ts)
+        plan_task_state(conn, cfg, fresh, ts)
     if evidence_sid:
         conn.execute("INSERT OR IGNORE INTO item_source(item_id,source_event_id,role) VALUES(?,?,?)",
                      (item["id"], evidence_sid, "cancel" if new_status == "cancelled" else "update"))
@@ -358,6 +362,7 @@ def complete_item(conn, cfg, item, evidence: str, *, actor: str, ts: str, note: 
                 conn.execute("UPDATE item SET completed_at=?, updated_at=? WHERE id=?", (new_at, ts, item["id"]))
                 fresh = conn.execute("SELECT * FROM item WHERE id=?", (item["id"],)).fetchone()
                 daily = plan_daily_done(conn, cfg, fresh, ts)
+                plan_task_state(conn, cfg, fresh, ts)          # 0.7.0: 원래 Tasks 줄의 ✅ 날짜도 정정
                 return {"changed": True, "status": "done", "ref": item["ref"], "completed_at": new_at,
                         "corrected_from": item["completed_at"], "action_id": aid, "daily": daily,
                         "questions_withdrawn": []}
@@ -388,11 +393,8 @@ def complete_item(conn, cfg, item, evidence: str, *, actor: str, ts: str, note: 
                      (item["id"], sid))
     if actor == "user":
         touch_reported(conn, item["id"], ts)
-    # 4단계 반영 예약: Obsidian 줄 체크 (requires_confirm=0). 지금은 대기열에만 둔다.
-    for l in conn.execute("SELECT external_key FROM link WHERE item_id=? AND system='obsidian_task'", (item["id"],)):
-        _enqueue(conn, "obsidian.check_task", item["id"], {"external_key": l["external_key"], "completed_on": done_at[:10]},
-                 f"obsidian.check_task:{item['ref']}:{l['external_key']}", ts)
     reindex_item(conn, item["id"])
+    plan_task_state(conn, cfg, conn.execute("SELECT * FROM item WHERE id=?", (item["id"],)).fetchone(), ts)
     daily = plan_daily_done(conn, cfg, conn.execute("SELECT * FROM item WHERE id=?", (item["id"],)).fetchone(), ts)
     return {"changed": True, "ref": item["ref"], "status": "done", "completed_at": done_at, "evidence": evidence,
             "action_id": aid, "questions_withdrawn": payload["questions_withdrawn"], "daily": daily}
@@ -527,12 +529,11 @@ def undo_action(conn, cfg, act, *, ts: str, actor: str = "user") -> dict:
             restored[k] = v
         for qref in payload.get("questions_withdrawn", []):
             conn.execute("UPDATE question SET status='open', resolution=NULL WHERE ref=? AND status='withdrawn'", (qref,))
-        if act["action"] == "complete":
-            conn.execute("UPDATE outbox SET status='cancelled', done_at=? WHERE item_id=? AND op='obsidian.check_task' "
-                         "AND status='pending'", (ts, item["id"]))
     conn.execute("UPDATE activity_log SET undone_at=? WHERE id=?", (ts, act["id"]))
-    # 완료·완료일 정정·다시 열기 등 무엇을 되돌렸든 Daily 완료 기록을 현재 상태에 맞춘다 (멱등)
-    plan_daily_done(conn, cfg, conn.execute("SELECT * FROM item WHERE id=?", (item["id"],)).fetchone(), ts)
+    # 완료·완료일 정정·다시 열기 등 무엇을 되돌렸든 Daily 완료 기록과 Tasks 줄 체크를 현재 상태에 맞춘다 (멱등, 0.7.0)
+    fresh = conn.execute("SELECT * FROM item WHERE id=?", (item["id"],)).fetchone()
+    plan_daily_done(conn, cfg, fresh, ts)
+    plan_task_state(conn, cfg, fresh, ts)
     uid = log_activity(conn, item_id=item["id"], action="undo", actor=actor, ts=ts, field=act["field"],
                        old_value=act["new_value"], new_value=act["old_value"],
                        reason=f"이력 {act['id']}({act['action']}) 되돌림", payload={"undone_action_id": act["id"]})
@@ -612,7 +613,8 @@ def plan_external(conn, cfg, item, ts: str, *, directed: bool | None = None) -> 
     """항목 상태에 맞는 외부 반영을 outbox 에 예약한다. 이미 있으면(dedupe_key) 건너뛴다.
 
     - Calendar 등록: meeting 이고 start_at 이 있고 calendar link 가 없을 때. 지시·답변 확정 항목은 자동, 그 외는 승인(D5 b).
-    - Obsidian Daily 줄 추가: 마감(due_at)이 있고 obsidian link 가 없을 때. 정책은 config.apply.obsidian_add_task.
+    - Obsidian Tasks 줄 추가: 마감(due_at)이 있고 obsidian link 가 없을 때. 정책은 config.apply.obsidian_add_task
+      (0.7.0 기본 always — 승인 없이). 자리는 obsidian.tasks_placement(topic: 정본 노트 → 프로젝트 문서 → 임시 수집 노트).
     - Obsidian 🆔 부여: obsidian link 가 있는데 키가 🆔가 아닐 때 (D12, 항상 자동).
     """
     if item["status"] in ("done", "cancelled", "captured", "needs_info"):
@@ -639,10 +641,12 @@ def plan_external(conn, cfg, item, ts: str, *, directed: bool | None = None) -> 
             key = f"obsidian.add_task:{item['ref']}"
             due_time = (parse_iso(item["due_at"]).astimezone(tz_of(cfg)).strftime("%H:%M")
                         if item["due_precision"] == "time" else None)
-            if _enqueue_new(conn, "obsidian.add_task", item["id"], {
-                    "ref": item["ref"], "title": item["title"], "due": item["due_at"][:10], "due_time": due_time,
-                    "note": item["canonical_note"],
-                    "day": item["due_at"][:10] if ap.get("daily_for_due_date", True) else ts[:10]}, key, ts, confirm):
+            payload = {"ref": item["ref"], "title": item["title"], "due": item["due_at"][:10], "due_time": due_time,
+                       "note": item["canonical_note"]}
+            if cfg["obsidian"].get("tasks_placement", "topic") == "daily":
+                payload["day"] = item["due_at"][:10] if ap.get("daily_for_due_date", True) else ts[:10]
+            # topic(0.7.0): 자리는 반영할 때 정한다 — 업무의 정본 노트 → 프로젝트 연결 문서 → 임시 수집 노트
+            if _enqueue_new(conn, "obsidian.add_task", item["id"], payload, key, ts, confirm):
                 planned.append({"op": "obsidian.add_task", "requires_confirm": confirm})
 
     ol = links.get("obsidian_task")
@@ -652,6 +656,41 @@ def plan_external(conn, cfg, item, ts: str, *, directed: bool | None = None) -> 
                         key, ts, 0):
             planned.append({"op": "obsidian.assign_id", "requires_confirm": 0})
     return planned
+
+
+def plan_task_state(conn, cfg, item, ts: str) -> list[str]:
+    """0.7.0: 연결된 Obsidian Tasks 줄을 업무 상태에 맞춘다 — 완료면 `[x] ✅ 완료일`(완료일 정정이면 날짜만), 아니면 `[ ]`.
+    같은 키(obsidian.check_task:CLR:줄)의 op 하나를 원하는 상태로 덮어쓴다(여러 번 눌러도 한 번). 원래 줄을 지우거나 옮기지 않는다."""
+    if item is None:
+        return []
+    want = "done" if item["status"] == "done" else "open"
+    day = local_day(cfg, item["completed_at"]) if want == "done" and item["completed_at"] else None
+    out = []
+    for l in conn.execute("SELECT external_key FROM link WHERE item_id=? AND system='obsidian_task'", (item["id"],)).fetchall():
+        key = f"obsidian.check_task:{item['ref']}:{l['external_key']}"
+        payload = {"external_key": l["external_key"], "state": want, "completed_on": day}
+        row = conn.execute("SELECT * FROM outbox WHERE dedupe_key=?", (key,)).fetchone()
+        if row is None:
+            if want == "open":
+                continue                     # 한 번도 체크하지 않은 줄: 풀 것이 없다 (Obsidian 에서 체크했다면 아래 경로)
+            _enqueue(conn, "obsidian.check_task", item["id"], payload, key, ts)
+        elif json.loads(row["payload"]) != payload or row["status"] in ("cancelled", "failed"):
+            conn.execute("UPDATE outbox SET status='pending', payload=?, attempts=0, last_error=NULL, not_before=NULL, "
+                         "result=NULL, done_at=NULL, created_at=? WHERE id=?",
+                         (json.dumps(payload, ensure_ascii=False), ts, row["id"]))
+        else:
+            continue
+        out.append(l["external_key"])
+    if want == "open" and not out:
+        # Obsidian 에서 체크(→ 동기화로 완료)된 줄을 Discord 에서 다시 열면 그 줄도 푼다
+        for l in conn.execute("SELECT external_key FROM link WHERE item_id=? AND system='obsidian_task'", (item["id"],)).fetchall():
+            if conn.execute("SELECT 1 FROM activity_log WHERE item_id=? AND action='complete' AND actor='sync' LIMIT 1",
+                            (item["id"],)).fetchone():
+                key = f"obsidian.check_task:{item['ref']}:{l['external_key']}"
+                _enqueue(conn, "obsidian.check_task", item["id"], {"external_key": l["external_key"], "state": "open",
+                                                                 "completed_on": None}, key, ts)
+                out.append(l["external_key"])
+    return out
 
 
 def calendar_eligible(cfg, item) -> bool:

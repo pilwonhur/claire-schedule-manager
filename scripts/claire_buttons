@@ -17,6 +17,12 @@
           업무 현황(0.6.0, 아침 보고 §5): 오늘 일정·마감 → 오늘 진행 확인 → 그 외 활성 업무(마감 없는 업무 포함) →
           답변 대기·보류 → 승인 대기 → 반영·전달 점검. 활성 미완료 업무를 "외 N건"으로 숨기지 않고 페이지로 나눈다.
           페이지마다 전달 기록(delivery_id)을 만들고, 보낸 뒤 claire_run deliver 로 성공·실패를 남긴다.
+  report [--no-record]
+          아침 보고(0.7.0, ISSUE 2026-09-29): 1쪽 오늘(달력 일정·달력 밖 오늘 마감) · 기한 지남 한 쪽(전체 건수, 상위 10~15건
+          버튼, 나머지 키워드) · 진행 확인 최대 두 쪽 · 확인·상태 한 쪽(질문 최대 3, 완료 반영 N건, 문서 위치 질문, 운영 요약,
+          전체 보기 버튼). 전체 업무는 계속 추적하고 보고에는 필요한 만큼만 싣는다.
+  agenda --view overdue|progress|past|waiting|done|questions [--no-record]
+          "전체 보기" 버튼·요청의 전체 목록 (구역 하나를 빠짐없이, 여러 쪽 가능). --view 없이 쓰면 업무 현황 전체(0.6.1 그대로).
   resend  전송 실패·확인 없는 페이지만 다시 보낼 페이로드 (같은 보고의 다른 페이지는 다시 보내지 않는다)
 
 --record KIND (build·approvals): 보낼 메시지를 전달 기록에 남긴다(KIND: brief|answer|list|approvals). 브리핑은
@@ -32,6 +38,7 @@ import argparse
 import json
 import re
 import sys
+from datetime import timedelta
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -322,8 +329,14 @@ def _state_rows(ref: str, status: str) -> list[dict]:
         return [_row([(f"{ref} 완료", "success"), (f"{ref} 진행 중", "primary"), (f"{ref} 보류", "secondary"),
                       (f"{ref} 답변 대기", "secondary"), (f"{ref} 상세", "secondary")]),
                 _row([(f"{ref} 처리 불필요", "secondary"), (f"{ref} 내 할 일 아님", "secondary"), (f"{ref} 취소", "danger")])]
-    if status in ("waiting", "on_hold"):
-        return [_row([(f"{ref} 완료", "success"), (f"{ref} 재개", "primary"), (f"{ref} 상세", "secondary")]),
+    if status == "waiting":
+        # 0.7.0: 재확인일에 — 답이 왔는지, 계속 기다릴지 (계속 대기는 날짜를 다시 묻고 기본 3일 뒤)
+        return [_row([(f"{ref} 답 왔어", "primary"), (f"{ref} 계속 대기", "secondary"), (f"{ref} 완료", "success"),
+                      (f"{ref} 상세", "secondary")]),
+                _row([(f"{ref} 처리 불필요", "secondary"), (f"{ref} 내 할 일 아님", "secondary"), (f"{ref} 취소", "danger")])]
+    if status == "on_hold":
+        return [_row([(f"{ref} 재개", "primary"), (f"{ref} 계속 보류", "secondary"), (f"{ref} 완료", "success"),
+                      (f"{ref} 상세", "secondary")]),
                 _row([(f"{ref} 처리 불필요", "secondary"), (f"{ref} 내 할 일 아님", "secondary"), (f"{ref} 취소", "danger")])]
     return [_row([(f"{ref} 다시 열어", "primary"), (f"{ref} 상세", "secondary")])]
 
@@ -534,6 +547,14 @@ def _agenda_units(rows: list[dict]) -> list[dict]:
         pending, group = [], []
 
     for r in rows:
+        if r.get("nav"):
+            # 0.7.0: "전체 보기"·문서 위치 같은 명령 버튼 한 줄. 라벨이 그대로 교수님 지시로 읽힌다.
+            flush_group()
+            blocks = [{"type": "text", "text": "\n".join(pending)}] if pending else []
+            blocks.append({"type": "actions", "buttons": [_button(lbl) for lbl in r["nav"][:5]]})
+            units.append({"blocks": blocks, "raw": pending + [f"[{lbl}]" for lbl in r["nav"][:5]], "numbers": []})
+            pending = []
+            continue
         if not r.get("ref"):
             flush_group()
             pending.append(r.get("heading") or r["text"])
@@ -603,6 +624,8 @@ def agenda_messages(conn, cfg, now, max_components: int = DEFAULT_MAX_COMPONENTS
 
 
 def cmd_agenda(args, cfg):
+    if getattr(args, "view", None):
+        return cmd_view(args, cfg)
     conn = connect(create=False)
     now = now_dt(cfg)
     with tx(conn):
@@ -627,6 +650,165 @@ def cmd_agenda(args, cfg):
             result["message"] = rec["message"]
     result["send_with"] = SEND_WITH
     return result
+
+
+def _page_messages(header: str, pages: list[dict], max_components: int, max_chars: int, *, split_ok=("today",)) -> list[dict]:
+    """쪽(page) → 메시지. 오늘 쪽만 길면 여러 메시지로 나누고, 나머지 쪽은 한 메시지여야 한다(넘으면 problems 에 표시)."""
+    messages = []
+    for pi, pg in enumerate(pages):
+        chunks = _chunk_units(_agenda_units(pg["rows"]), max_components, max_chars)
+        for ci, chunk in enumerate(chunks):
+            head = header if (pi == 0 and ci == 0) else (f"{header} (계속)" if pi == 0 else None)
+            blocks = [b for u in chunk for b in u["blocks"]]
+            lines = ([head] if head else []) + [line for u in chunk for line in u["raw"]]
+            comp = {"reusable": True, "blocks": blocks}
+            if head:
+                comp["text"] = head
+            m = {"message": "\n".join(lines), "components": comp, "numbers": [n for u in chunk for n in u["numbers"]],
+                 "component_count": (2 if head else 1) + sum(_cost(b) for b in blocks), "page": pg["key"],
+                 "mentions": pg.get("mentions", []) if ci == len(chunks) - 1 else [],
+                 "question_refs": [q for q in pg.get("question_refs", [])
+                                   if any(q == n for u in chunk for n in u["numbers"]) or q.startswith("NOTE:")]
+                 if ci == len(chunks) - 1 else [q for q in pg.get("question_refs", [])
+                                                if any(q == n for u in chunk for n in u["numbers"])]}
+            m["problems"] = track.validate_message(m)
+            if len(chunks) > 1 and pg["key"] not in split_ok:
+                m["problems"].append(f"section_overflow:{pg['key']}")
+            messages.append(m)
+    return messages
+
+
+def report_messages(conn, cfg, now, max_components: int = DEFAULT_MAX_COMPONENTS, max_chars: int = DEFAULT_MAX_CHARS) -> dict:
+    """아침 보고(0.7.0). 오늘 · 기한 지남(한 쪽) · 진행 확인(최대 두 쪽) · 확인·상태(한 쪽)."""
+    today = now.astimezone(tz_of(cfg)).strftime("%Y-%m-%d")
+    data = track.report_data(conn, cfg, now, overlays=track.overlay_on(conn, cfg, today))
+    ap = ops.approval_queue(conn, cfg, now)["counts"]
+    h = track.health(conn, cfg, now, exclude_kind_today="report")
+    htext = track.health_text(h)
+    health_lines = [ln for ln in (htext or "").split("\n")[1:] if ln.strip()] or None
+    pages = track.report_pages(cfg, data, approvals=ap, health_lines=health_lines)
+    messages = _page_messages(track.report_header(data), pages, max_components, max_chars)
+    for i, m in enumerate(messages, 1):
+        m["index"], m["of"] = i, len(messages)
+    return {"data": data, "messages": messages, "approvals": ap, "health": h,
+            "text": "\n\n".join(m["message"] for m in messages)}
+
+
+def _slim(e: dict) -> dict:
+    return {k: e.get(k) for k in ("ref", "title", "kind", "status_label", "priority", "due_text", "when", "short_label",
+                                  "project", "score")} | {"check": e["check"].get("reason")}
+
+
+def cmd_report(args, cfg):
+    conn = connect(create=False)
+    now = now_dt(cfg)
+    with tx(conn):
+        upkeep = track.upkeep(conn, cfg, now_iso(cfg))
+    out = report_messages(conn, cfg, now)
+    d = out["data"]
+    result = {"counts": d["counts"], "accounting": d["accounting"], "upkeep": upkeep, "check_refs": d["check_refs"],
+              "overdue": {"total": d["overdue"]["total"], "detail": [e["ref"] for e in d["overdue"]["detail"]],
+                          "keywords": d["overdue"]["keywords"]["mentions"], "omitted": d["overdue"]["keywords"]["omitted"]},
+              "progress": {"total": d["progress"]["total"], "detail": [e["ref"] for e in d["progress"]["detail"]],
+                           "keywords": d["progress"]["keywords"]["mentions"],
+                           "omitted": d["progress"]["keywords"]["omitted"]},
+              "questions": [q["ref"] for q in d["questions"]["shown"]], "note_asks": d["note_asks"],
+              "approvals": out["approvals"],
+              "health": {k: (v if k != "delivery" else {"count": v["count"]}) for k, v in out["health"].items()},
+              "text": out["text"], "messages": out["messages"]}
+    result.update(_send_to(cfg))
+    problems = [(m["index"], p) for m in out["messages"] for p in (m.get("problems") or [])]
+    if problems:
+        result["problems"] = [{"page": i, "problem": p} for i, p in problems]
+    if not args.no_record:
+        with tx(conn):
+            rec = track.register_delivery(conn, cfg, "report", out["messages"], now_iso(cfg), check_refs=d["check_refs"])
+        result.update(report_key=rec["report_key"], duplicate=rec["duplicate"], messages=rec["messages"])
+        if rec.get("resend"):
+            result["resend"] = True
+        if rec.get("message"):
+            result["message"] = rec["message"]
+    result["send_with"] = SEND_WITH
+    return result
+
+
+VIEW_TITLES = {"overdue": "기한 지남 전체", "progress": "진행 확인 전체", "past": "지난 일정 (완료 체크 목록에서 뺀 것 · 기록 유지)",
+               "waiting": "답변 대기·보류", "done": "완료 내역", "questions": "열린 질문 전체"}
+
+
+def view_rows(conn, cfg, now, view: str) -> tuple[list[dict], int]:
+    """전체 보기: 한 구역의 업무를 빠짐없이 번호 버튼과 함께 (여러 쪽 가능)."""
+    today = now.astimezone(tz_of(cfg)).date()
+    rows: list[dict] = []
+    if view == "questions":
+        qs = conn.execute("SELECT q.*, i.ref AS item_ref, i.title AS item_title FROM question q LEFT JOIN item i ON i.id=q.item_id "
+                          "WHERE q.status='open' ORDER BY q.id").fetchall()
+        rows.append({"heading": f"**{VIEW_TITLES[view]} ({len(qs)})**"})
+        for q in qs:
+            opts = json.loads(q["options"]) if q["options"] else None
+            rows.append({"text": f"  {q['ref']} ({q['item_ref']} {(q['item_title'] or '')[:24]}) {q['question']}"
+                                 + (f" 후보 {' / '.join(str(o) for o in opts)}" if opts else ""), "ref": q["ref"], "section": "5"})
+        return rows, len(qs)
+    if view == "done":
+        since = (now - timedelta(days=7)).isoformat()
+        its = conn.execute("SELECT * FROM item WHERE deleted_at IS NULL AND status='done' AND completed_at >= ? "
+                           "ORDER BY completed_at DESC", (since,)).fetchall()
+        rows.append({"heading": f"**{VIEW_TITLES[view]} — 최근 7일 ({len(its)})**"})
+        for it in its:
+            rows.append({"text": f"  {track.md(track.local_date(cfg, it['completed_at']))} ✅ {it['title']} ({it['ref']})",
+                         "ref": it["ref"], "section": "3"})
+        return rows, len(its)
+    d = track.report_data(conn, cfg, now)
+    if view == "overdue":
+        es = d["overdue"]["detail"] + d["overdue"]["rest"]
+        rows.append({"heading": f"**{VIEW_TITLES[view]} ({len(es)})** — 점수 순(중요도·직접 요청·최근)"})
+        rows += [{"text": track._detail_line(cfg, e, today, overdue=True), "ref": e["ref"], "section": "3"} for e in es]
+    elif view == "progress":
+        es = d["progress"]["detail"] + d["progress"]["rest"]
+        rows.append({"heading": f"**{VIEW_TITLES[view]} ({len(es)})**"})
+        rows += [{"text": track._detail_line(cfg, e, today), "ref": e["ref"], "section": "4"} for e in es]
+    elif view == "past":
+        es = sorted(d["past_meetings"], key=lambda e: e["start_at"] or "")
+        rows.append({"heading": f"**{VIEW_TITLES[view]} ({len(es)})** — 끝난 것은 '지난 일정 다 끝났어' 또는 번호로 완료"})
+        rows += [{"text": f"  {ops.fmt_when(cfg, e['start_at'], e['end_at'], bool(e['all_day']))}  {e['title']} ({e['ref']})",
+                  "ref": e["ref"], "section": "3"} for e in es]
+    elif view == "waiting":
+        es = sorted(d["parked"], key=lambda e: (e["next_check_at"] or "9999", e["id"]))
+        rows.append({"heading": f"**{VIEW_TITLES[view]} ({len(es)})** — 재확인일 전에는 묻지 않습니다"})
+        for e in es:
+            nc = track.local_date(cfg, e["next_check_at"])
+            who = (f"{e['waiting_on']} 답변 대기" if e["status"] == "waiting" else "보류") + \
+                (f"({e['blocked_reason']})" if e.get("blocked_reason") else "")
+            rows.append({"text": f"  {e['title']} ({e['ref']}) · {who} · 다음 확인 {track.md(nc) if nc else '미정'}"
+                                 + (f" · {e['due_text']}" if e["due_at"] else ""), "ref": e["ref"], "section": "3"})
+    else:
+        raise ClaireError("bad_value", f"--view 는 {sorted(VIEW_TITLES)} 중 하나", view=view)
+    if len(rows) == 1:
+        rows.append({"text": "  없음"})
+    return rows, len(rows) - 1
+
+
+def cmd_view(args, cfg):
+    conn = connect(create=False)
+    now = now_dt(cfg)
+    rows, n = view_rows(conn, cfg, now, args.view)
+    header = f"[{VIEW_TITLES[args.view]}] {now.astimezone(tz_of(cfg)):%m/%d %H:%M} 기준"
+    msgs = _page_messages(header, [{"key": "today", "rows": rows}], DEFAULT_MAX_COMPONENTS, DEFAULT_MAX_CHARS)
+    for i, m in enumerate(msgs, 1):
+        m["index"], m["of"] = i, len(msgs)
+        if i > 1:
+            m["message"] = f"{header} (계속 {i}/{len(msgs)})\n" + m["message"]
+            m["components"]["text"] = f"{header} (계속 {i}/{len(msgs)})"
+    out = {"view": args.view, "count": n, "messages": msgs, "text": "\n\n".join(m["message"] for m in msgs)}
+    out.update(_send_to(cfg))
+    if not args.no_record:
+        with tx(conn):
+            rec = track.register_delivery(conn, cfg, "list", msgs, now_iso(cfg))
+        out.update(report_key=rec["report_key"], messages=rec["messages"], duplicate=rec["duplicate"])
+        if rec.get("message"):
+            out["message"] = rec["message"]
+    out["send_with"] = SEND_WITH
+    return out
 
 
 def cmd_resend(args, cfg):
@@ -670,6 +852,10 @@ def build_parser():
     ap.add_argument("--record", action="store_true", help="전달 기록에 남긴다 (0.6.0)")
     ag = sub.add_parser("agenda", help="업무 현황 — 활성 미완료 업무 전체 (0.6.0)")
     ag.add_argument("--no-record", action="store_true", help="전달 기록 없이 미리 보기")
+    ag.add_argument("--view", choices=["overdue", "progress", "past", "waiting", "done", "questions"],
+                    help="구역 하나의 전체 보기 (0.7.0 '전체 보기' 버튼)")
+    rp = sub.add_parser("report", help="아침 보고 — 필요한 만큼만 (0.7.0)")
+    rp.add_argument("--no-record", action="store_true", help="전달 기록 없이 미리 보기")
     rs = sub.add_parser("resend", help="전송 실패·확인 없는 페이지 다시 보내기")
     rs.add_argument("--id", type=int, action="append", help="delivery_id (없으면 실패·확인 없는 쪽 전부)")
     return p
@@ -677,7 +863,7 @@ def build_parser():
 
 def dispatch(args, cfg):
     return {"build": cmd_build, "actions": cmd_actions, "approvals": cmd_approvals, "agenda": cmd_agenda,
-            "resend": cmd_resend}[args.cmd](args, cfg)
+            "report": cmd_report, "resend": cmd_resend}[args.cmd](args, cfg)
 
 
 if __name__ == "__main__":

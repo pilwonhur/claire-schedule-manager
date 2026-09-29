@@ -405,3 +405,147 @@ def remove_done_line(cfg: dict, day: str, ref: str) -> dict:
         return {"path": str(p), "action": "absent"}
     _write_lines(p, keep, mtime)
     return {"path": str(p), "action": "removed", "count": len(lines) - len(keep)}
+
+
+# --------------------------------------------------------------------------
+# 0.7.0 — Tasks 줄의 자리: 주제 문서(업무의 자리) · 임시 수집 노트 · Daily 는 하루 활동 기록 (ISSUE 2026-09-29 §5)
+# --------------------------------------------------------------------------
+
+INBOX_HEADER = ("---\ntags:\n  - \"Claire\"\n---\n\n# Claire 업무 수집함\n\n"
+                "> 관련 문서를 아직 정하지 못한 업무의 **임시 위치**입니다. 문서가 정해지면 Claire 가 줄을 그 문서로 옮깁니다(🆔 유지).\n"
+                "> 여기서 체크해도 Claire 에 완료로 반영됩니다.\n")
+
+
+def line_unchecked(line: str) -> str:
+    """`[x]` → `[ ]`, `✅ 날짜`를 지운다 (완료 취소). 줄을 지우거나 옮기지 않는다."""
+    m = TASK_RE.match(line)
+    if not m:
+        raise ClaireError("not_a_task_line", "체크박스 줄이 아닙니다", line=line)
+    new = re.sub(r"^(\s*[-*+]\s+)\[.\]", lambda mm: mm.group(1) + "[ ]", line, count=1)
+    return re.sub(r"\s*✅\s*\d{4}-\d{2}-\d{2}", "", new).rstrip()
+
+
+def line_done_on(line: str, done_day: str) -> str:
+    """체크된 줄의 ✅ 날짜를 바꾼다 (완료일 정정). 없으면 붙인다."""
+    if re.search(r"✅\s*\d{4}-\d{2}-\d{2}", line):
+        return re.sub(r"✅\s*\d{4}-\d{2}-\d{2}", f"✅ {done_day}", line, count=1)
+    return line.rstrip() + f" ✅ {done_day}"
+
+
+def note_rel(cfg: dict, path: Path) -> str:
+    return str(path.relative_to(vault_path(cfg)))
+
+
+def find_notes(cfg: dict, name: str) -> list[str]:
+    """문서 이름(확장자 없이) 또는 볼트 기준 경로 → 볼트 기준 경로 목록. 제외 폴더는 보지 않는다."""
+    name = (name or "").strip().strip("[]")
+    if not name:
+        return []
+    root = vault_path(cfg)
+    direct = root / (name if name.endswith(".md") else name + ".md")
+    if "/" in name and direct.is_file():
+        return [note_rel(cfg, direct)]
+    want = unicodedata.normalize("NFC", name[:-3] if name.endswith(".md") else name).lower()
+    return [note_rel(cfg, p) for p in iter_markdown_files(cfg)
+            if unicodedata.normalize("NFC", p.stem).lower() == want]
+
+
+def note_candidates(cfg: dict, project: str, limit: int = 3) -> list[dict]:
+    """처음 보는 프로젝트의 Tasks 문서 후보: 후보 폴더(10 Projects·20 Areas·30 Resources)에서 경로에 프로젝트 이름의
+    낱말이 많이 들어간 문서. 제목 유사성만으로 고르지 않는다 — 교수님께 보여 드리고 확인받는 후보일 뿐이다."""
+    toks = [t for t in re.split(r"[\s_\-·/,()]+", unicodedata.normalize("NFC", project or "").lower()) if len(t) >= 2]
+    if not toks:
+        return []
+    root = vault_path(cfg)
+    folders = cfg["obsidian"].get("candidate_folders") or []
+    daily = cfg["obsidian"].get("daily_folder", "50 Daily")
+    scored = []
+    for p in iter_markdown_files(cfg):
+        rel = note_rel(cfg, p)
+        if rel.startswith(daily + "/") or (folders and not any(rel.startswith(f.rstrip("/") + "/") for f in folders)):
+            continue
+        low = unicodedata.normalize("NFC", rel).lower()
+        stem = unicodedata.normalize("NFC", p.stem).lower()
+        hit = sum(1 for t in toks if t in low)
+        if not hit:
+            continue
+        score = hit * 2 + sum(1 for t in toks if t in stem)
+        scored.append((score, p.stat().st_mtime, rel, p.stem))
+    scored.sort(key=lambda x: (-x[0], -x[1]))
+    out, seen = [], set()
+    for _, _, rel, stem in scored:
+        if stem in seen:
+            continue
+        seen.add(stem)
+        out.append({"name": stem, "path": rel})
+        if len(out) >= limit:
+            break
+    return out
+
+
+def ensure_inbox(cfg: dict) -> Path:
+    p = vault_path(cfg) / cfg["obsidian"].get("inbox_note", "01 Inbox/Claire 업무 수집함.md")
+    if not p.exists():
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_name(f".{p.name}.claire-tmp")
+        tmp.write_text(INBOX_HEADER + "\n" + cfg["obsidian"].get("topic_task_section", "## Tasks") + "\n", encoding="utf-8")
+        os.replace(tmp, p)
+    return p
+
+
+def add_task_to_note(cfg: dict, rel_path: str, line: str) -> dict:
+    """주제 문서의 Tasks 섹션(`## Tasks`) 끝에 줄을 넣는다. 섹션이 없으면 문서 끝에 만든다. 같은 🆔 줄이 있으면 넣지 않는다.
+    문서가 없으면 만들지 않는다(주제 노트는 만들지 않는다 — 임시 수집 노트만 예외)."""
+    p = vault_path(cfg) / rel_path
+    if not p.exists():
+        raise ClaireError("note_missing", f"문서가 없습니다: {rel_path}", path=rel_path)
+    mtime = p.stat().st_mtime
+    lines = p.read_text(encoding="utf-8").split("\n")
+    m_id = re.search(r"🆔\s+(\S+)", line)
+    if m_id and any(re.search(r"🆔\s+" + re.escape(m_id.group(1)) + r"(\s|$)", l) for l in lines):
+        return {"path": rel_path, "added": False, "reason": "already_present"}
+    section = cfg["obsidian"].get("topic_task_section", "## Tasks")
+    b = _section_bounds(lines, section)
+    if b is None:
+        while lines and not lines[-1].strip():
+            lines.pop()
+        lines += ["", section, line, ""]
+    else:
+        start, end = b
+        last = start
+        for i in range(start + 1, end):
+            if lines[i].strip():
+                last = i
+        lines.insert(last + 1, line)
+    _write_lines(p, lines, mtime)
+    return {"path": rel_path, "added": True}
+
+
+def remove_task_line(cfg: dict, rel_path: str, task_id: str) -> dict:
+    """🆔 가 task_id 인 체크박스 줄을 지운다 (임시 수집 노트에서 옮긴 뒤). 없으면 할 일이 없다."""
+    p = vault_path(cfg) / rel_path
+    if not p.exists():
+        return {"path": rel_path, "action": "absent"}
+    mtime = p.stat().st_mtime
+    lines = p.read_text(encoding="utf-8").split("\n")
+    pat = re.compile(r"🆔\s+" + re.escape(task_id) + r"(\s|$)")
+    keep = [l for l in lines if not (TASK_RE.match(l) and pat.search(l))]
+    if len(keep) == len(lines):
+        return {"path": rel_path, "action": "absent"}
+    _write_lines(p, keep, mtime)
+    return {"path": rel_path, "action": "removed"}
+
+
+def find_task_anywhere(cfg: dict, ref: str) -> list[dict]:
+    """🆔 clrNNNN 줄을 볼트 전체에서 찾는다 (문서 이동·이름 변경 뒤 연결 갱신용)."""
+    tid = format_id(ref)
+    root = vault_path(cfg)
+    out = []
+    for p in iter_markdown_files(cfg):
+        try:
+            if tid not in p.read_text(encoding="utf-8"):
+                continue
+        except UnicodeDecodeError:
+            continue
+        out += [t for t in scan_file(p, cfg, root) if t.get("id") == tid]
+    return out

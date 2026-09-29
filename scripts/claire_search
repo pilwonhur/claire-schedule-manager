@@ -15,6 +15,8 @@
   dupcheck --title "김 교수 면담" [--date YYYY-MM-DD]   등록 전 중복 후보 (미등록 일정 확인 답변용, 0.5.0)
   agenda                                 업무 현황 재료 (활성 미완료 전체·구역·진행 확인 대상, 0.6.0). 보낼 때는 claire_buttons agenda
   importance-review                      중요도 검토 필요(소급 분류·요청 범위 미분류) 업무와 판단 근거 (0.6.0)
+  report                                 아침 보고 재료 (0.7.0: 구역별 상세·키워드·숨김 건수·accounting). 보낼 때는 claire_buttons report
+  labels-missing [--limit 40]            키워드 이름(short_label)이 없는 활성 업무 — 보고의 키워드 요약용 (0.7.0)
 
 0.5.0: 항목마다 업무 상태(status)와 별개로 외부 반영 상태(sync: calendar·tasks·daily)와 한 줄 요약(state_line)을 낸다.
 0.6.0: 항목마다 중요도·근거·진행 확인 계획(tracking)과 시간 종류(time_kind: appointment|work|deadline_marker).
@@ -251,6 +253,45 @@ def cmd_agenda(args, cfg):
     data["health"] = track.health(conn, cfg, now)
     data["data_as_of"] = _data_as_of(conn)
     return data
+
+
+def cmd_report(args, cfg):
+    conn = _ctx(connect(create=False), cfg)
+    now = now_dt(cfg)
+    d = track.report_data(conn, cfg, now, overlays=_overlay_on(conn, cfg, now.strftime("%Y-%m-%d")))
+
+    def slim(e):
+        return {k: e.get(k) for k in ("ref", "title", "kind", "status_label", "priority", "request_scope", "due_text",
+                                      "when", "short_label", "project", "score", "waiting_on", "next_check_at")} | \
+            {"check": e["check"].get("reason"), "keyword": track.keyword_of(e)}
+    out = {"counts": d["counts"], "accounting": d["accounting"], "check_refs": d["check_refs"],
+           "today_cal": [slim(e) for e in d["today_cal"]], "today_due": [slim(e) for e in d["today_due"]],
+           "overlaps": d["overlaps"], "deadline_clusters": d["deadline_clusters"]}
+    for key in ("overdue", "progress"):
+        sec = d[key]
+        out[key] = {"total": sec["total"], "detail": [slim(e) for e in sec["detail"]], "rest": [slim(e) for e in sec["rest"]],
+                    "keyword_lines": sec["keywords"]["lines"], "omitted": sec["keywords"]["omitted"]}
+    out.update(questions=d["questions"], done_refs=d["done_refs"], note_asks=d["note_asks"],
+               past_meetings=[slim(e) for e in d["past_meetings"]], parked=[slim(e) for e in d["parked"]],
+               health=track.health(conn, cfg, now), data_as_of=_data_as_of(conn))
+    return out
+
+
+def cmd_labels_missing(args, cfg):
+    """키워드 이름이 없는 활성 업무 (기한 지남·진행 확인 대상 먼저). Claire 가 1~3단어로 지어 claire_store labels 로 적는다."""
+    conn = _ctx(connect(create=False), cfg)
+    now = now_dt(cfg)
+    d = track.report_data(conn, cfg, now)
+    order = d["overdue"]["detail"] + d["overdue"]["rest"] + d["progress"]["detail"] + d["progress"]["rest"]
+    seen, out = set(), []
+    for e in order:
+        if not e.get("short_label") and e["ref"] not in seen:
+            seen.add(e["ref"])
+            out.append({"ref": e["ref"], "title": e["title"], "project": e.get("project"), "auto": track.auto_label(e["title"])})
+    total = conn.execute(f"SELECT COUNT(*) c FROM item WHERE deleted_at IS NULL AND {OPEN_SQL} AND "
+                         "(short_label IS NULL OR short_label='')").fetchone()["c"]
+    return {"items": out[:args.limit], "total_missing": total,
+            "note": "제목을 보고 1~3단어로(예: 'RiTA 회신', 'IROS 명단'). 없으면 도구가 제목 앞부분(auto)을 쓴다."}
 
 
 def cmd_importance_review(args, cfg):
@@ -528,6 +569,9 @@ def build_parser():
     ag = sub.add_parser("agenda", help="업무 현황 재료 (0.6.0)"); ag.set_defaults(fn=cmd_agenda)
     ir = sub.add_parser("importance-review", help="중요도 검토 필요 업무 (0.6.0)")
     ir.add_argument("--limit", type=int, default=20); ir.set_defaults(fn=cmd_importance_review)
+    rp = sub.add_parser("report", help="아침 보고 재료 (0.7.0)"); rp.set_defaults(fn=cmd_report)
+    lm = sub.add_parser("labels-missing", help="키워드 이름 없는 활성 업무 (0.7.0)")
+    lm.add_argument("--limit", type=int, default=40); lm.set_defaults(fn=cmd_labels_missing)
     return p
 
 

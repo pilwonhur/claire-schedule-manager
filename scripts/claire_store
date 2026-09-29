@@ -5,11 +5,16 @@
   update   --item CLR --set k=v ... --reason   교수님 지시로 필드 변경
   complete --item CLR[,CLR…] | --find "문구"  --evidence user_report|tasks_checked|criteria_evidence:<id> [--note]
   reopen | cancel --item CLR --reason
-  hold     --item CLR [--until YYYY-MM-DD] --reason      보류: 재확인일에 다시 묻는다 (기본 tracking.hold_default_days)
+  hold     --item CLR [--until YYYY-MM-DD] --reason      보류: 재확인일에 재개 여부를 묻는다 (기본 3일 뒤, 0.7.0)
   dismiss  --item CLR[,CLR…] --why not_needed|not_mine [--reason]   처리 불필요 / 내 할 일 아님 (0.6.0, 이력 보관·되돌리기 가능)
   link-task --item <일정 CLR> --role prep|followup --title "..." [--due-at] [--kind prep|task] [--next-action]
            일정에 연결된 준비·후속 업무 (0.6.0). 일정 완료가 이 업무를 완료시키지 않는다
-  wait     --item CLR --waiting-on "김 교수" [--next-check YYYY-MM-DD]   (기본 +3영업일, D6)
+  wait     --item CLR --waiting-on "김 교수" [--about "초록 승인"] [--until YYYY-MM-DD]
+           답변 대기: 기본 3일 뒤(달력) 재확인, 마감이 더 빠르면 마감 전날. 날짜 없이 부르면 결과에 날짜 질문(ask)이 붙는다 (0.7.0).
+           이미 대기 중이면 "계속 대기" — 상대·내용은 그대로 두고 다음 확인일만 새로 잡는다.
+  note-map --project P --note "문서" | --project P --inbox | --item CLR --note "문서" | (목록)
+           Tasks 줄의 자리(0.7.0): 프로젝트 → 주제 문서 연결. 확인하면 임시 수집 노트의 그 프로젝트 줄을 옮긴다.
+  labels   --file labels.json   {"CLR-0764": "RiTA 회신", ...}  보고의 키워드 요약 이름(1~3단어)을 한꺼번에 (0.7.0)
   progress --item CLR --note "절반 했어" [--next-action ...]
   answer   --question Q-0007 --answer "..." [--resolve '{"start_at": "..."}']   | --auto (열린 질문 1건일 때만)
   relate --from CLR --to CLR --type prep_for|subtask_of|blocks|follow_up_of|related|same_thread
@@ -47,7 +52,7 @@ ALLOWED_OPS = {"create", "ignore", "update", "complete", "cancel", "relate"}
 CREATE_FIELDS = {"kind", "title", "project", "priority", "owner", "next_action", "done_criteria",
                  "start_at", "end_at", "all_day", "due_at", "scheduled_on", "tentative", "confidence",
                  "waiting_on", "next_check_at", "canonical_note", "ledger_note", "series_key", "occurrence_at",
-                 "attendance", "request_scope", "priority_reason"}
+                 "attendance", "request_scope", "priority_reason", "short_label"}
 ISO_DT = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2})?([+-]\d{2}:\d{2}|Z)$")
 ISO_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 DEFAULT_CRITERIA = {"deadline": "제출·발송 완료", "reply": "회신 발송", "prep": "자료 준비 완료",
@@ -56,6 +61,12 @@ DEFAULT_CRITERIA = {"deadline": "제출·발송 완료", "reply": "회신 발송
 
 def _bad(msg, **extra):
     raise ClaireError("proposal_rejected", msg, **extra)
+
+
+def _short_label(v):
+    """0.7.0: 보고의 키워드 요약에 쓰는 1~3단어 이름 (예: "RiTA 회신"). 비우면 도구가 제목에서 자른다."""
+    v = re.sub(r"\s+", " ", str(v or "")).strip()
+    return v[:24] or None
 
 
 def _norm_dt(value, field: str, cfg, end_of_day: bool):
@@ -108,6 +119,7 @@ def _validate_create(p: dict, idx: int, cfg, evs=None) -> dict:
         "series_key": p.get("series_key"), "occurrence_at": p.get("occurrence_at"),
         "due_precision": ops.precision_of(p.get("due_at")), "window_auto": 0,
         "attendance": p.get("attendance"),
+        "short_label": _short_label(p.get("short_label")),
     }
     if fields["attendance"] is not None and fields["attendance"] not in ops.ATTENDANCE:
         _bad(f"제안 {idx}: attendance 는 {ops.ATTENDANCE} 중 하나", attendance=fields["attendance"])
@@ -622,21 +634,72 @@ def cmd_cancel(args, cfg):
     return r
 
 
-def cmd_hold(args, cfg):
-    """보류: 재확인 날짜에 다시 묻는다(R5). 날짜를 안 주면 tracking.hold_default_days 뒤. 그 전에는 진행 질문을 하지 않는다."""
-    def extra(conn, item, ts):
-        if args.until:
-            nxt = ops.norm_value("next_check_at", args.until, cfg)
+def _until(value) -> "date | None":
+    if not value:
+        return None
+    from datetime import date as _date
+    v = str(value).strip()
+    m = re.fullmatch(r"(\d{4})-(\d{1,2})-(\d{1,2})(T.*)?", v)
+    if not m:
+        _bad("날짜는 YYYY-MM-DD", value=value)
+    return _date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+
+
+def _park(args, cfg, target: str, action: str, fields_fn) -> dict:
+    """대기·보류 공통 (0.7.0, ISSUE 2026-09-29 §4). 모든 대기·보류에 재확인일을 둔다.
+    날짜가 없으면 기본(3일 뒤, 마감이 더 빠르면 마감 전날)을 바로 적용하고 "언제 다시 확인할까요?" 질문(ask)을 붙인다 —
+    답이 없어도 무기한 기다리지 않는다. 대기 설정이 업무 마감을 늦추지 않는다. 이미 같은 상태면 다음 확인일만 새로 잡는다."""
+    conn = connect(create=False); now = now_dt(cfg); now_s = now.isoformat()
+    with tx(conn):
+        item = get_item(conn, args.item)
+        plan = track.recheck_plan(cfg, now, target, _until(args.until), item["due_at"])
+        nxt = track.at_daily_hour(cfg, plan["date"])
+        fields = {"next_check_at": nxt, **fields_fn(item)}
+        if item["status"] == target:
+            before = {k: item[k] for k in fields}
+            changed = {k: v for k, v in fields.items() if v != item[k]}
+            if changed:
+                conn.execute("UPDATE item SET " + ", ".join(f"{k}=?" for k in changed) + ", updated_at=? WHERE id=?",
+                             (*changed.values(), now_s, item["id"]))
+                log_activity(conn, item_id=item["id"], action=action, actor=args.actor, ts=now_s, field="next_check_at",
+                             old_value=item["next_check_at"], new_value=nxt,
+                             reason=args.reason or ("계속 대기" if target == "waiting" else "계속 보류"),
+                             run_id=args.run, payload={"before": before})
+            if args.actor == "user":
+                ops.touch_reported(conn, item["id"], now_s)
+            r = {"ref": item["ref"], "changed": bool(changed), "status": target, "continued": True}
         else:
-            nxt = (now_dt(cfg) + timedelta(days=int(cfg.get("tracking", {}).get("hold_default_days", 7)))) \
-                .replace(hour=int(cfg["run"]["daily_hour"]), minute=0, second=0).isoformat()
-        return {"blocked_reason": args.reason, "next_check_at": nxt}
-    r = _status_cmd(args, cfg, "on_hold", "hold", extra=extra)
-    conn = connect(create=False)
-    nxt = get_item(conn, r["ref"])["next_check_at"]
-    r["next_check_at"] = nxt
-    r["message"] = f"{r['ref']} 보류했습니다. {int(nxt[5:7])}/{int(nxt[8:10])}에 다시 여쭙겠습니다 (날짜를 바꾸려면 답장으로)."
+            r = {"ref": item["ref"], **ops.set_status(conn, cfg, item, target, actor=args.actor, ts=now_s, reason=args.reason,
+                                                      action=action, run_id=args.run, extra_fields=fields)}
+        it = get_item(conn, item["ref"])
+    d = plan["date"]
+    r["next_check_at"] = it["next_check_at"]
+    r["recheck_defaulted"] = plan["defaulted"]
+    when = f"{d.month}/{d.day}({track.WEEKDAY_KO[d.weekday()]})"
+    # 날짜를 기본값으로 잡았으면 날짜는 아래 질문에서 한 번만 말한다
+    then = "" if plan["defaulted"] else (f" {when}에 답이 왔는지 여쭙겠습니다." if target == "waiting"
+                                         else f" {when}에 재개할지 여쭙겠습니다.")
+    if target == "waiting":
+        who = it["waiting_on"] + (f" — {it['blocked_reason']}" if it["blocked_reason"] else "")
+        msg = f"{it['ref']} {'계속 ' if r.get('continued') else ''}답변 대기({who})로 두었습니다.{then}"
+    else:
+        msg = (f"{it['ref']} {'계속 ' if r.get('continued') else ''}보류했습니다"
+               + (f"({it['blocked_reason']})" if it["blocked_reason"] else "") + f".{then}")
+    if plan.get("note") and not plan["defaulted"]:
+        msg += " " + plan["note"]
+    if plan["defaulted"]:
+        ask = track.recheck_ask(cfg, it["ref"], target, plan, now)
+        r["ask"] = ask
+        msg += " " + ask["text"]
+        r["components"] = {**ask["components"], "text": msg}
+    r["message"] = msg
     return r
+
+
+def cmd_hold(args, cfg):
+    """보류: 재확인일에 재개 여부를 묻는다(R5). 날짜를 안 주면 기본 3일 뒤 + 날짜 질문. 그 전에는 진행 질문을 하지 않는다."""
+    return _park(args, cfg, "on_hold", "hold",
+                 lambda item: {"blocked_reason": args.reason or (item["blocked_reason"] if item["status"] == "on_hold" else None)})
 
 
 def cmd_dismiss(args, cfg):
@@ -717,17 +780,99 @@ def cmd_link_task(args, cfg):
 
 
 def cmd_wait(args, cfg):
-    if not (args.waiting_on or "").strip():
-        _bad("wait 에는 --waiting-on 이 필요합니다")
+    """답변 대기 (0.7.0): 상대(waiting_on)와 기다리는 내용(--about)을 남기고 재확인일을 둔다. 이미 대기 중이면 계속 대기."""
+    args.until = args.until or args.next_check
+    conn = connect(create=False)
+    item = get_item(conn, args.item)
+    who = (args.waiting_on or "").strip() or (item["waiting_on"] if item["status"] == "waiting" else None)
+    if not who:
+        _bad("wait 에는 --waiting-on 이 필요합니다 (누구의 답을 기다리는지 — 모르면 교수님께 여쭙니다)")
+    about = (args.about or "").strip() or (item["blocked_reason"] if item["status"] == "waiting" else None)
+    return _park(args, cfg, "waiting", "wait", lambda it: {"waiting_on": who, "blocked_reason": about})
 
-    def extra(conn, item, ts):
-        if args.next_check:
-            nxt = ops.norm_value("next_check_at", args.next_check, cfg)
+
+def cmd_note_map(args, cfg):
+    """Tasks 줄의 자리 (0.7.0, ISSUE 2026-09-29 §5): 프로젝트(또는 업무 하나) → Obsidian 주제 문서.
+    확인한 연결은 보존하고 같은 프로젝트 업무에 재사용한다. 확인하면 임시 수집 노트에 있던 그 프로젝트(업무)의 줄을 옮긴다."""
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "connectors"))
+    import obsidian_tasks
+    conn = connect(create=False); now_s = now_iso(cfg)
+    if not args.project and not args.item:
+        rows = [dict(r) for r in conn.execute("SELECT project, note, status, asked_count, last_asked_at FROM note_map ORDER BY project")]
+        return {"mappings": rows, "message": f"프로젝트 문서 연결 {len(rows)}개" if rows else "프로젝트 문서 연결이 없습니다."}
+    inbox_rel = cfg["obsidian"].get("inbox_note", "01 Inbox/Claire 업무 수집함.md")
+
+    def resolve(name: str, cands: list[dict]) -> str:
+        for c in cands:
+            if name in (c["name"], c["path"]):
+                return c["path"]
+        hits = obsidian_tasks.find_notes(cfg, name)
+        if not hits:
+            raise ClaireError("note_not_found", f"볼트에서 '{name}' 문서를 찾지 못했습니다. 정확한 문서 이름이나 경로를 알려 주세요.",
+                              candidates=cands)
+        if len(hits) > 1:
+            raise ClaireError("ambiguous_note", f"'{name}' 이름의 문서가 {len(hits)}개입니다. 경로로 알려 주세요.", paths=hits)
+        return hits[0]
+
+    moved = []
+    with tx(conn):
+        if args.item:
+            item = get_item(conn, args.item)
+            if not args.note:
+                _bad("--item 에는 --note 가 필요합니다")
+            path = resolve(args.note, [])
+            name = re.sub(r"\.md$", "", path.rsplit("/", 1)[-1])
+            ops.apply_update(conn, cfg, item, {"canonical_note": name}, actor=args.actor, ts=now_s,
+                             reason="교수님 지시: Tasks 문서 지정")
+            targets = [(get_item(conn, item["ref"]), path)]
+            msg = f"{item['ref']} 의 Tasks 문서를 '{name}'(으)로 정했습니다."
         else:
-            nxt = ops.business_days_after(now_dt(cfg), int(cfg["followup"]["waiting_business_days"])) \
-                .replace(hour=int(cfg["run"]["daily_hour"]), minute=0, second=0).isoformat()
-        return {"waiting_on": args.waiting_on.strip(), "next_check_at": nxt}
-    return _status_cmd(args, cfg, "waiting", "wait", extra=extra)
+            project = args.project.strip()
+            row = conn.execute("SELECT * FROM note_map WHERE project=?", (project,)).fetchone()
+            cands = json.loads(row["candidates"] or "[]") if row else []
+            if args.inbox:
+                conn.execute("INSERT INTO note_map(project,note,status,candidates,created_at,updated_at) VALUES(?,?,?,?,?,?) "
+                             "ON CONFLICT(project) DO UPDATE SET note=NULL, status='inbox', updated_at=excluded.updated_at",
+                             (project, None, "inbox", json.dumps(cands, ensure_ascii=False), now_s, now_s))
+                return {"project": project, "status": "inbox",
+                        "message": f"'{project}' 업무는 임시 수집 노트({inbox_rel})에 두고 다시 묻지 않겠습니다."}
+            if not args.note:
+                _bad("--note 또는 --inbox 가 필요합니다")
+            path = resolve(args.note, cands)
+            conn.execute("INSERT INTO note_map(project,note,status,candidates,created_at,updated_at) VALUES(?,?,?,?,?,?) "
+                         "ON CONFLICT(project) DO UPDATE SET note=excluded.note, status='confirmed', updated_at=excluded.updated_at",
+                         (project, path, "confirmed", json.dumps(cands, ensure_ascii=False), now_s, now_s))
+            targets = [(it, path) for it in conn.execute(
+                "SELECT * FROM item WHERE deleted_at IS NULL AND project=? AND (canonical_note IS NULL OR canonical_note='') "
+                "AND status IN (%s)" % ",".join("?" * len(OPEN_STATUSES)), (project, *OPEN_STATUSES)).fetchall()]
+            msg = f"'{project}' 업무의 Tasks 는 앞으로 '{path}'에 둡니다."
+        for it, path in targets:
+            link = conn.execute("SELECT external_key FROM link WHERE item_id=? AND system='obsidian_task'", (it["id"],)).fetchone()
+            if link and link["external_key"].split("#", 1)[0] == inbox_rel:
+                key = f"obsidian.move_task:{it['ref']}:{path}"
+                ops._enqueue(conn, "obsidian.move_task", it["id"], {"ref": it["ref"], "to": path}, key, now_s)
+                moved.append(it["ref"])
+    if moved:
+        msg += f" 수집함에 있던 {len(moved)}건({', '.join(moved[:5])}{' 외' if len(moved) > 5 else ''})을 옮깁니다(다음 claire_apply)."
+    return {"moved": moved, "message": msg}
+
+
+def cmd_labels(args, cfg):
+    """보고의 키워드 요약 이름(short_label, 1~3단어)을 한꺼번에 적는다 (0.7.0). {"CLR-0764": "RiTA 회신", ...}"""
+    data = json.loads(Path(args.file).read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        _bad("labels 파일은 {\"CLR-0001\": \"키워드\"} 모양")
+    conn = connect(create=False); now_s = now_iso(cfg)
+    done = []
+    with tx(conn):
+        for ref, label in data.items():
+            item = get_item(conn, ref)
+            v = _short_label(label)
+            if v != item["short_label"]:
+                conn.execute("UPDATE item SET short_label=?, updated_at=? WHERE id=?", (v, now_s, item["id"]))
+                reindex_item(conn, item["id"])
+                done.append(item["ref"])
+    return {"updated": done, "message": f"키워드 {len(done)}건을 적었습니다."}
 
 
 def cmd_resume(args, cfg):
@@ -974,7 +1119,7 @@ def build_parser():
         if name == "reopen":
             x.add_argument("--apply", action="store_true")
         if name == "hold":
-            x.add_argument("--until", help="재확인 날짜 YYYY-MM-DD (기본 tracking.hold_default_days 뒤)")
+            x.add_argument("--until", help="재확인 날짜 YYYY-MM-DD (없으면 기본 3일 뒤 + 날짜 질문)")
         x.set_defaults(fn=fn)
     ds = _common(sub.add_parser("dismiss", help="처리 불필요 / 내 할 일 아님"))
     ds.add_argument("--item", required=True); ds.add_argument("--why", choices=["not_needed", "not_mine"], required=True)
@@ -988,8 +1133,18 @@ def build_parser():
     pt.add_argument("--add"); pt.add_argument("--remove"); pt.add_argument("--title", help="예: '{title} 준비'")
     pt.add_argument("--days-before", type=int, default=1); pt.add_argument("--due-time", help="HH:MM (없으면 일정 시각)")
     pt.set_defaults(fn=cmd_prep_template)
-    w = _common(sub.add_parser("wait")); w.add_argument("--item", required=True); w.add_argument("--waiting-on", required=True)
-    w.add_argument("--next-check"); w.add_argument("--reason"); w.set_defaults(fn=cmd_wait)
+    w = _common(sub.add_parser("wait")); w.add_argument("--item", required=True)
+    w.add_argument("--waiting-on", help="누구의 답 (이미 대기 중이면 생략 = 계속 대기)")
+    w.add_argument("--about", help="기다리는 내용")
+    w.add_argument("--until", help="재확인 날짜 YYYY-MM-DD (없으면 기본 3일 뒤 + 날짜 질문)")
+    w.add_argument("--next-check", help="(옛 이름) --until")
+    w.add_argument("--reason"); w.set_defaults(fn=cmd_wait)
+    nm = _common(sub.add_parser("note-map", help="Tasks 문서 위치: 프로젝트/업무 → 주제 문서 (0.7.0)"))
+    nm.add_argument("--project"); nm.add_argument("--item"); nm.add_argument("--note")
+    nm.add_argument("--inbox", action="store_true", help="이 프로젝트는 임시 수집 노트에 두고 다시 묻지 않는다")
+    nm.set_defaults(fn=cmd_note_map)
+    lb = sub.add_parser("labels", help="키워드 요약 이름 한꺼번에 (0.7.0)"); lb.add_argument("--file", required=True)
+    lb.set_defaults(fn=cmd_labels)
     rs = _common(sub.add_parser("resume")); rs.add_argument("--item", required=True); rs.add_argument("--reason"); rs.set_defaults(fn=cmd_resume)
     ig = sub.add_parser("ignore-sender"); ig.add_argument("--address"); ig.add_argument("--domain"); ig.set_defaults(fn=cmd_ignore_sender)
     g = _common(sub.add_parser("progress")); g.add_argument("--item", required=True); g.add_argument("--note", required=True)
