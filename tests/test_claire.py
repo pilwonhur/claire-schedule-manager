@@ -2950,6 +2950,357 @@ class V070Test(FixtureBase):
         self.assertNotIn(first[0], {x["ref"] for x in self.report("--no-record")["labels_needed"]})
 
 
+class V080Test(FixtureBase):
+    """0.8.0 (ISSUE 2026-10-11): 독립 메모함. 수용 기준 §8 을 하나씩 확인한다. 기준 시각 2026-09-11(금) 06:00."""
+
+    def setUp(self):
+        super().setUp()
+        V050Test.v050_setup(self)
+
+    store, apply, item, outbox, ingest = V050Test.store, V050Test.apply, V050Test.item, V050Test.outbox, V050Test.ingest
+    at, discord_task = V060Test.at, V060Test.discord_task
+
+    NOTE = "01 Inbox/Claire 메모함.md"
+
+    def memo(self, *args, expect_ok=True):
+        return self.sh("claire_memo", *args, expect_ok=expect_ok)
+
+    def add(self, text, mid, *extra, **kw):
+        return self.memo("add", "--text", text, "--message-id", mid, "--channel", "C1",
+                         "--captured-at", kw.pop("captured_at", "2026-09-11T09:00:00+09:00"), *extra)
+
+    def note(self):
+        p = self.vault / self.NOTE
+        return p.read_text(encoding="utf-8") if p.exists() else ""
+
+    def row(self, ref):
+        return self.db().execute("SELECT * FROM memo WHERE ref=?", (ref,)).fetchone()
+
+    def task_state(self):
+        """업무 보고·추적의 지문: 아침 보고 건수·구역, 업무 현황 건수, 브리핑 재료의 신규·변경, 업무 표 내용."""
+        rp = self.sh("claire_search", "report")
+        ag = self.sh("claire_search", "agenda")
+        rv = self.sh("claire_search", "review")
+        cnt = lambda t: self.db().execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]   # noqa: E731
+        return {"report_counts": rp["counts"], "report_check": rp["check_refs"], "accounting": rp["accounting"]["ok"],
+                "overdue": rp["overdue"]["total"], "progress": rp["progress"]["total"],
+                "agenda_counts": ag["counts"], "agenda_check": ag["check_refs"],
+                "health_failed": rp["health"]["failed_ops"], "gaps": rp["health"]["exposure_gaps"],
+                "new": [x["ref"] for x in rv["new_items"]], "changed": [x["ref"] for x in rv["changed_items"]],
+                "items": cnt("item"), "questions": cnt("question"), "task_ops": self.db().execute(
+                    "SELECT COUNT(*) FROM outbox WHERE op <> 'obsidian.memo'").fetchone()[0],
+                "events": cnt("source_event"), "hash": claire_core.content_hash(self.db(), ["item", "question", "relation",
+                                                                                          "link", "item_source"])}
+
+    # -- §8-1 `메모:` 와 `메모해줘` 모두 원문·작성일·출처를 갖는 메모 ------------------------------------------
+    def test_prefix_and_natural_request_both_make_memo_with_source(self):
+        a = self.add("메모: NAS에 학생별 공간을 나누면 좋을 듯", "m100", captured_at="2026-09-11T08:30:00+09:00")
+        b = self.add("다음에 공유 방식을 한번 알아볼 것", "m101", "--title", "공유 방식 알아보기", "--url", "https://discord.com/x/m101")
+        self.assertEqual((a["memo"]["ref"], b["memo"]["ref"]), ("MEM-0001", "MEM-0002"))
+        self.assertTrue(a["obsidian"]["ok"]); self.assertIn("일정·할 일·알림은 만들지 않았습니다", a["message"])
+        m1, m2 = self.row("MEM-0001"), self.row("MEM-0002")
+        self.assertEqual(m1["original_text"], "메모: NAS에 학생별 공간을 나누면 좋을 듯")
+        self.assertEqual(m1["title"], "NAS에 학생별 공간을 나누면 좋을 듯")          # 제목은 접두어를 뺀 앞부분 (요약을 지어내지 않음)
+        self.assertEqual((m1["recorded_at"], m1["source_message_id"], m1["source_channel"]),
+                         ("2026-09-11T08:30:00+09:00", "m100", "C1"))
+        self.assertEqual((m2["title"], m2["source_url"], m2["status"]), ("공유 방식 알아보기", "https://discord.com/x/m101", "open"))
+        text = self.note()
+        self.assertIn("%%claire-memo:MEM-0001:start%%", text); self.assertIn("> 다음에 공유 방식을 한번 알아볼 것", text)
+        self.assertIn("출처: Discord 메시지 m101 [원문](https://discord.com/x/m101)", text)
+        self.assertNotIn("- [ ]", text)
+
+    # -- §8-2·3 메모만 등록하면 일정/할 일/달력/알림 없음. 날짜가 있어도 자동 마감·독촉 없음 ------------------------
+    def test_memo_with_date_creates_no_task_calendar_or_reminder(self):
+        before = self.task_state()
+        self.add("메모: 내일 시간이 되면 IROS 숙소를 알아볼 것", "m200")
+        self.add("메모: 10/2 15시 회의실 예약 방식 확인 — 이건 나중에", "m201")
+        self.apply()
+        after = self.task_state()
+        self.assertEqual(before, after)
+        self.assertEqual(self.writes(), [])                                         # 달력 쓰기 없음
+        self.assertEqual(self.db().execute("SELECT COUNT(*) FROM question").fetchone()[0], 0)
+        rp = self.sh("claire_buttons", "report", "--no-record")
+        self.assertNotIn("MEM-", json.dumps(rp, ensure_ascii=False))                # 아침 보고에 메모가 나오지 않는다
+        ag = self.sh("claire_buttons", "agenda", "--no-record")
+        self.assertNotIn("MEM-", json.dumps(ag["messages"], ensure_ascii=False))
+
+    writes = V050Test.writes
+
+    # -- §8-4 같은 메시지 재처리는 중복 없음, 한 메시지의 서로 다른 메모는 유실 없음 --------------------------------
+    def test_reprocessing_same_message_is_idempotent_and_parts_are_kept(self):
+        a = self.add("메모: 첫째 생각", "m300")
+        again = self.add("메모: 첫째 생각", "m300")
+        self.assertTrue(again["duplicate"]); self.assertEqual(again["memo"]["ref"], a["memo"]["ref"])
+        no_ch = self.memo("add", "--text", "메모: 첫째 생각", "--message-id", "m300")    # 채널 인자를 빠뜨려도 같은 메시지
+        self.assertTrue(no_ch["duplicate"])
+        b = self.add("둘째 생각", "m300", "--part", "2")
+        self.assertFalse(b["duplicate"]); self.assertEqual(b["memo"]["ref"], "MEM-0002")
+        self.add("둘째 생각", "m300", "--part", "2")
+        self.add("메모: 첫째 생각", "m301")                                        # 내용이 같아도 다른 메시지는 합치지 않는다
+        self.assertEqual(self.db().execute("SELECT COUNT(*) FROM memo").fetchone()[0], 3)
+        self.assertEqual(self.note().count("%%claire-memo:MEM-0001:start%%"), 1)
+
+    # -- §8-5 기본 목록·키워드 검색·전체/상태별 조회, 닫힌 기록도 다시 찾는다 -------------------------------------
+    def test_list_search_and_status_filters(self):
+        for i, t in enumerate(["NAS 학생별 공간", "NAS 백업 주기", "연구실 커피 머신", "IROS 숙소"]):
+            self.add(f"메모: {t}", f"m4{i}", captured_at=f"2026-09-1{i}T09:00:00+09:00")
+        self.memo("status", "--memo", "MEM-0002", "--to", "resolved", "--reason", "주 1회로 정함")
+        self.memo("status", "--memo", "MEM-0003", "--to", "reference")
+        ls = self.memo("list")
+        self.assertEqual([m["ref"] for m in ls["memos"]], ["MEM-0004", "MEM-0001"])     # 열린 것만, 기록일 최신순
+        found = self.memo("list", "--q", "NAS")
+        self.assertEqual([m["ref"] for m in found["memos"]], ["MEM-0001", "MEM-0002"])  # 닫힌 메모도 찾는다(열린 것 먼저)
+        self.assertEqual(found["memos"][1]["status"], "resolved")
+        self.assertEqual([m["ref"] for m in self.memo("list", "--status", "closed")["memos"]], ["MEM-0002"])
+        self.assertEqual([m["ref"] for m in self.memo("list", "--status", "reference")["memos"]], ["MEM-0003"])
+        allm = self.memo("list", "--status", "all", "--limit", "2")
+        self.assertEqual((allm["total"], allm["count"], allm["has_more"], allm["next_offset"]), (4, 2, True, 2))
+        rest = self.memo("list", "--status", "all", "--limit", "2", "--offset", "2")
+        self.assertEqual(len({m["ref"] for m in allm["memos"] + rest["memos"]}), 4)       # 쪽이 나뉘어도 전부 닿는다
+        self.assertEqual(self.memo("list", "--q", "커피", "--status", "open")["total"], 0)
+        # 업무 검색과 섞이지 않는다
+        self.assertEqual(self.sh("claire_search", "find", "--q", "NAS", "--status", "all")["results"], [])
+
+    # -- §8-6·7 해결·불필요·참고·재개방·수정이 Obsidian·이력에 반영, 사유를 지어내지 않는다 -----------------------
+    def test_status_changes_edit_history_and_reason_not_invented(self):
+        self.add("메모: 연구실 NAS 권한 정리", "m500")
+        r = self.memo("status", "--memo", "mem1", "--to", "resolved", "--reason", "IT팀이 처리함", "--message-id", "c1")
+        self.assertTrue(r["obsidian"]["ok"])
+        self.assertIn("- 정리: 해결됨 2026-09-11 — IT팀이 처리함", self.note())
+        again = self.memo("status", "--memo", "mem1", "--to", "resolved", "--reason", "IT팀이 처리함", "--message-id", "c1")
+        self.assertFalse(again["changed"])
+        self.memo("status", "--memo", "1", "--to", "open", "--message-id", "c2")
+        # 같은 지시(c1)가 재전달돼도 다시 닫지 않는다
+        self.assertFalse(self.memo("status", "--memo", "1", "--to", "resolved", "--message-id", "c1")["changed"])
+        self.assertEqual(self.row("MEM-0001")["status"], "open")
+        n = self.memo("status", "--memo", "1", "--to", "not_needed")
+        self.assertIsNone(self.row("MEM-0001")["status_reason"])                    # 사유를 말하지 않으면 비워 둔다
+        self.assertIn("- 정리: 불필요 2026-09-11", self.note()); self.assertNotIn("— IT팀", self.note().split("MEM-0001:start")[1])
+        self.memo("status", "--memo", "1", "--to", "reference")
+        e = self.memo("edit", "--memo", "1", "--text", "연구실 NAS 권한: 학생별 폴더", "--topic", "NAS")
+        self.assertTrue(e["changed"])
+        m = self.row("MEM-0001")
+        self.assertEqual((m["body"], m["original_text"], m["topic"], m["status"]),
+                         ("연구실 NAS 권한: 학생별 폴더", "메모: 연구실 NAS 권한 정리", "NAS", "reference"))
+        text = self.note()
+        self.assertIn("> 연구실 NAS 권한: 학생별 폴더", text); self.assertIn("- 처음 기록:", text); self.assertIn("주제: NAS", text)
+        hist = [(h["action"], h["new_value"]) for h in self.db().execute(
+            "SELECT action, new_value FROM memo_log WHERE memo_id=1 ORDER BY id")]
+        self.assertEqual([a for a, _ in hist], ["create", "status", "status", "status", "status", "edit", "edit"])
+        self.assertEqual([v for a, v in hist if a == "status"], ["resolved", "open", "not_needed", "reference"])
+        show = self.memo("show", "--memo", "1")["memo"]
+        self.assertEqual(len(show["history"]), 7)
+        self.assertEqual(self.db().execute("SELECT COUNT(*) FROM memo").fetchone()[0], 1)     # 상태 변경은 삭제가 아니다
+
+    # -- §8-8 답장(원래 메시지)·식별자로 고르고, 애매하면 임의로 처리하지 않는다 -----------------------------------
+    def test_target_selection_by_reply_and_ambiguity(self):
+        self.add("NAS 공간 나누기", "m600")
+        self.add("NAS 백업 주기 정하기", "m600", "--part", "2")
+        self.add("커피 원두 주문 방식", "m601")
+        e = self.memo("status", "--source-message", "m600", "--to", "resolved", expect_ok=False)
+        self.assertEqual(e["error"]["code"], "ambiguous_memo"); self.assertEqual(len(e["error"]["candidates"]), 2)
+        self.assertEqual(self.memo("status", "--source-message", "m601", "--to", "resolved")["memo"]["ref"], "MEM-0003")
+        e = self.memo("status", "--find", "NAS", "--to", "resolved", expect_ok=False)
+        self.assertEqual(e["error"]["code"], "ambiguous_memo")
+        self.assertEqual(self.memo("status", "--find", "NAS 백업", "--to", "resolved")["memo"]["ref"], "MEM-0002")
+        self.assertEqual(self.memo("status", "--find", "없는말", "--to", "resolved", expect_ok=False)["error"]["code"], "no_candidate")
+        self.assertEqual([r["status"] for r in self.db().execute("SELECT status FROM memo ORDER BY id")],
+                         ["open", "resolved", "resolved"])
+
+    # -- §8-9 메모 증감·상태 변경 전후 업무 보고의 건수·추적 대상은 같다 ----------------------------------------
+    def test_task_reports_identical_with_memo_activity(self):
+        V050Test.register_deadline(self, due="2026-09-10T15:00:00+09:00", title="밀린 보고서", mid="d1")
+        self.discord_task("d2", "명단 회신")
+        self.discord_task("d3", "학회 등록", due_at="2026-09-12")
+        self.apply()                                                                # 업무 쪽 반영을 먼저 끝내 둔다
+        before = self.task_state()
+        for i in range(12):
+            self.add(f"메모: 생각 {i}", f"m7{i:02d}")
+        self.memo("status", "--memo", "3", "--to", "resolved")
+        self.memo("status", "--memo", "4", "--to", "not_needed")
+        self.memo("link", "--memo", "5", "--item", "CLR-0002")                      # 연결만으로 업무가 "변경"되지 않는다
+        self.apply()
+        self.assertEqual(before, self.task_state())
+        h = self.sh("claire_search", "report")["health"]
+        self.assertEqual(h["memo_sync"], {"failed": [], "conflict": []})
+
+    # -- §8-10 Obsidian 재수집 뒤 메모가 Tasks 로 역수집되지 않는다 (노트를 옮겨도) --------------------------------
+    def test_obsidian_rescan_never_collects_memos(self):
+        self.add("메모: 체크리스트 예시\n- [ ] #tasks 이건 업무가 아님 📅 2026-09-12\n* [x] #tasks 끝난 것", "m800")
+        text = self.note()
+        self.assertIn("> - \\[ ] #tasks 이건 업무가 아님", text)
+        self.assertIsNone(obsidian_tasks.parse_task_line("> - \\[ ] #tasks 이건 업무가 아님"))
+        self.sh("claire_sync", "obsidian")
+        files = {e["external_id"].split("#")[0] for e in self.events("obsidian")}
+        self.assertNotIn(self.NOTE, files)
+        # 교수님이 메모 블록 안에 체크박스를 직접 넣어도(블록 안) 수집하지 않는다
+        p = self.vault / self.NOTE
+        p.write_text(p.read_text(encoding="utf-8").replace("- 출처:", "- [ ] #tasks 블록 안 체크박스\n- 출처:"), encoding="utf-8")
+        new_dir = self.vault / "30 Resources"; new_dir.mkdir()
+        os.replace(p, new_dir / "내 메모.md")                                         # 노트를 옮김
+        self.sh("claire_sync", "obsidian")
+        self.assertFalse([e for e in self.events("obsidian") if "메모" in e["external_id"]])
+        # 옮긴 노트에서 블록을 찾는다. 블록 안을 고쳤으므로 덮어쓰지 않고, --overwrite 면 그 자리(옮긴 노트)를 고친다
+        r = self.memo("status", "--memo", "1", "--to", "reference")
+        self.assertFalse(r["obsidian"]["ok"]); self.assertIn("30 Resources/내 메모.md", self.row("MEM-0001")["sync_error"] or "x")
+        self.memo("sync", "--memo", "1", "--overwrite")
+        self.assertFalse((self.vault / self.NOTE).exists())                          # 새 노트를 만들지 않는다
+        moved = (new_dir / "내 메모.md").read_text(encoding="utf-8")
+        self.assertIn("상태: 참고 보관", moved); self.assertEqual(moved.count("MEM-0001:start"), 1)
+        self.assertEqual(self.row("MEM-0001")["obsidian_note"], "30 Resources/내 메모.md")
+
+    events = FixtureBase.events
+
+    # -- §8-11 외부 반영 실패 → 부분 성공 안내 → 재시도 뒤 중복 없이 복구 ---------------------------------------
+    def test_obsidian_failure_partial_success_then_retry_without_duplicates(self):
+        real = self.vault
+        cfgp = self.data / "config.json"
+        c = json.loads(cfgp.read_text(encoding="utf-8"))
+        c["obsidian"]["vault"] = str(self.vault / "no-such-vault")
+        cfgp.write_text(json.dumps(c, ensure_ascii=False), encoding="utf-8")
+        r = self.add("메모: 볼트가 없을 때", "m900")
+        self.assertTrue(r["saved"]); self.assertFalse(r["obsidian"]["ok"]); self.assertTrue(r["obsidian"]["will_retry"])
+        self.assertIn("저장은 되었고 반영만 자동으로 다시 시도합니다", r["message"])
+        self.assertEqual(self.row("MEM-0001")["sync_status"], "failed")
+        ob = self.outbox("obsidian.memo")
+        self.assertEqual([(o["status"], o["attempts"]) for o in ob], [("pending", 1)])
+        h = self.sh("claire_search", "report")["health"]
+        self.assertEqual(h["memo_sync"]["failed"], ["MEM-0001"]); self.assertEqual(h["failed_ops"], [])
+        # 재처리(같은 메시지)도 중복 메모를 만들지 않고 반영만 다시 시도한다
+        self.assertTrue(self.add("메모: 볼트가 없을 때", "m900")["duplicate"])
+        c["obsidian"]["vault"] = str(real)
+        cfgp.write_text(json.dumps(c, ensure_ascii=False), encoding="utf-8")
+        self.at("2026-09-11T08:00:00+09:00")
+        out = self.apply()
+        self.assertEqual([d["op"] for d in out["done"]], ["obsidian.memo"])
+        self.assertEqual(self.row("MEM-0001")["sync_status"], "ok")
+        self.assertEqual(self.note().count("%%claire-memo:MEM-0001:start%%"), 1)
+        self.apply()
+        self.assertEqual(self.note().count("%%claire-memo:MEM-0001:start%%"), 1)
+        self.assertEqual(self.sh("claire_search", "report")["health"]["memo_sync"], {"failed": [], "conflict": []})
+        self.assertTrue(self.sh("claire_check", "integrity")["healthy"])
+
+    # -- 역동기화 미지원: Obsidian 에서 고친 블록을 조용히 덮어쓰지 않는다, 블록 밖 글은 보존 --------------------------
+    def test_obsidian_edit_is_not_silently_overwritten(self):
+        self.add("메모: 원래 생각", "m950")
+        p = self.vault / self.NOTE
+        p.write_text(p.read_text(encoding="utf-8").replace("> 메모: 원래 생각", "> 메모: 원래 생각 (Obsidian 에서 덧붙임)")
+                     + "\n교수님이 노트 끝에 쓴 글\n", encoding="utf-8")
+        r = self.memo("status", "--memo", "1", "--to", "resolved")
+        self.assertTrue(r["changed"]); self.assertFalse(r["obsidian"]["ok"]); self.assertFalse(r["obsidian"]["will_retry"])
+        self.assertIn("덮어쓰지 않았습니다", r["message"])
+        self.assertIn("(Obsidian 에서 덧붙임)", self.note())
+        self.assertEqual(self.row("MEM-0001")["sync_status"], "conflict")
+        self.assertEqual([o["status"] for o in self.outbox("obsidian.memo")][-1], "failed")
+        self.at("2026-09-11T12:00:00+09:00")
+        self.apply()
+        self.assertIn("(Obsidian 에서 덧붙임)", self.note())                         # 재시도도 덮어쓰지 않는다
+        self.memo("sync", "--memo", "1", "--overwrite")
+        text = self.note()
+        self.assertNotIn("(Obsidian 에서 덧붙임)", text); self.assertIn("상태: 해결됨", text)
+        self.assertIn("교수님이 노트 끝에 쓴 글", text)
+        self.assertEqual(self.row("MEM-0001")["sync_status"], "ok")
+        self.assertTrue(self.sh("claire_check", "integrity")["healthy"])
+
+    # -- §8-12·13 명시적 전환으로만 할 일, 원문·연결 보존, 재시도 중복 없음, 상태는 서로 독립 ----------------------------
+    def test_to_task_is_explicit_linked_idempotent_and_independent(self):
+        self.add("메모: 다음에 공유 방식을 한번 알아볼 것", "m1000")
+        self.assertEqual(self.db().execute("SELECT COUNT(*) FROM item").fetchone()[0], 0)
+        t = self.memo("to-task", "--memo", "1", "--title", "공유 방식 조사", "--message-id", "c10")
+        self.assertEqual(t["task"], "CLR-0001"); self.assertTrue(t["created"])
+        it = self.item("CLR-0001")
+        self.assertEqual((it["title"], it["status"], it["due_at"], it["priority"]), ("공유 방식 조사", "todo", None, "high"))
+        self.assertEqual(self.db().execute("SELECT COUNT(*) FROM outbox WHERE op LIKE 'calendar.%'").fetchone()[0], 0)
+        again = self.memo("to-task", "--memo", "1", "--message-id", "c10")
+        self.assertTrue(again["duplicate"]); self.assertEqual(again["task"], "CLR-0001")
+        self.assertEqual(self.db().execute("SELECT COUNT(*) FROM item").fetchone()[0], 1)
+        m = self.row("MEM-0001")
+        self.assertEqual((m["status"], m["original_text"]), ("open", "메모: 다음에 공유 방식을 한번 알아볼 것"))
+        self.assertIn("- 관련 업무: CLR-0001 공유 방식 조사", self.note())
+        trace = self.sh("claire_search", "trace", "--item", "CLR-0001")
+        self.assertIn("메모: 다음에 공유 방식을", json.dumps(trace, ensure_ascii=False))
+        self.store("complete", "--item", "CLR-0001", "--evidence", "user_report")
+        self.assertEqual(self.row("MEM-0001")["status"], "open")                     # 업무 완료가 메모를 닫지 않는다
+        self.store("reopen", "--item", "CLR-0001")
+        r = self.memo("status", "--memo", "1", "--to", "resolved")
+        self.assertIn("연결된 업무(CLR-0001)의 상태는 바꾸지 않았습니다", r["message"])
+        self.assertEqual(self.item("CLR-0001")["status"], "todo")                   # 메모 해결이 업무를 완료하지 않는다
+        # 실패한 전환(마감 업무인데 날짜 없음)은 업무도 연결도 남기지 않고, 원문이 해석 대기열에 남지 않는다
+        self.add("메모: 보고서", "m1001")
+        e = self.memo("to-task", "--memo", "2", "--kind", "deadline", expect_ok=False)
+        self.assertEqual(e["error"]["code"], "proposal_rejected")
+        self.assertEqual(self.db().execute("SELECT COUNT(*) FROM item").fetchone()[0], 1)
+        self.assertEqual(self.sh("claire_sync", "pending")["total_pending_events"], 0)
+        ok = self.memo("to-task", "--memo", "2", "--kind", "deadline", "--due-at", "2026-09-20")
+        self.assertEqual(ok["task"], "CLR-0002")
+
+    # -- §8-14 마이그레이션 전후 기존 데이터·식별자 보존 (v4 → v5 추가만) -----------------------------------------
+    def test_migration_v4_to_v5_is_additive(self):
+        self.discord_task("d1", "기존 업무", due_at="2026-09-12")
+        tables = ["item", "source_event", "item_source", "question", "activity_log", "relation", "link"]
+        conn = self.db()
+        before = claire_core.content_hash(conn, tables)
+        counts = claire_core.table_counts(conn, tables + ["outbox", "delivery", "note_map"])
+        for t in ("memo_fts", "memo_link", "memo_log", "memo"):
+            conn.execute(f"DROP TABLE {t}")
+        conn.execute("UPDATE meta SET value='4' WHERE key='schema_version'"); conn.commit()
+        self.assertEqual(claire_core.table_counts(conn, ["memo"]), {"memo": 0})     # 없는 표는 0 (옛 백업 대조)
+        r = self.sh("claire_check", "init")
+        self.assertEqual(r["schema_version"], 5)
+        conn = self.db()
+        self.assertEqual(claire_core.content_hash(conn, tables), before)
+        self.assertEqual(claire_core.table_counts(conn, tables + ["outbox", "delivery", "note_map"]), counts)
+        self.assertEqual(self.add("메모: 업그레이드 뒤 첫 메모", "m1100")["memo"]["ref"], "MEM-0001")
+        # 백업에 메모가 들어가고(markdown 포함) 복구 대조가 맞는다
+        b = self.sh("claire_check", "backup")
+        dest = Path(b["backup_dir"]) if b.get("backup_dir") else sorted((self.data / "backups").iterdir())[-1]
+        self.assertIn("업그레이드 뒤 첫 메모", (dest / "markdown" / "claire-memos.md").read_text(encoding="utf-8"))
+        rt = self.sh("claire_check", "restore-test", "--from", str(dest))
+        self.assertTrue(rt.get("match", rt.get("ok")))
+        ex = self.memo("export", "--format", "json")
+        self.assertEqual(json.loads(Path(ex["out"]).read_text(encoding="utf-8"))["memos"][0]["ref"], "MEM-0001")
+
+    # -- §8-15 Clio 글감 기능을 부르지 않는다 ---------------------------------------------------------------
+    def test_memo_code_never_calls_clio(self):
+        for f in ("claire_memo", "claire_memos.py"):
+            code = "\n".join(l for l in (SCRIPTS / f).read_text(encoding="utf-8").splitlines()
+                             if not l.strip().startswith(("#", "-", "Clio", "메모는", "\"\"\"")))
+            self.assertNotRegex(code, r"clio_|Clio\w*\(|idea_manager")
+        self.add("메모: 좋은 글감이 될 듯한 생각", "m1200")
+        self.assertFalse(list(self.data.glob("**/clio*")))
+
+    # -- 버튼: 메모 카드·목록 (메모 전용 동작, 달력·완료 없음) -----------------------------------------------------
+    def test_memo_card_and_list_buttons(self):
+        self.add("메모: NAS 생각", "m1300")
+        card = self.sh("claire_buttons", "actions", "--memo", "mem1")
+        self.assertEqual(card["buttons"], ["MEM-0001 해결됨", "MEM-0001 불필요", "MEM-0001 참고 보관", "MEM-0001 상세",
+                                           "MEM-0001 할 일로 등록"])
+        self.assertFalse([b for b in card["buttons"] if "달력" in b or "완료" in b])
+        self.memo("status", "--memo", "1", "--to", "resolved")
+        self.assertEqual(self.sh("claire_buttons", "actions", "--memo", "1")["buttons"], ["MEM-0001 다시 열기", "MEM-0001 상세"])
+        for i in range(2, 95):
+            self.add(f"메모: 생각 {i}", f"m13{i:02d}", "--no-sync")
+        ls = self.sh("claire_buttons", "memos")
+        self.assertEqual((ls["total"], ls["count"], ls["next_offset"]), (93, 80, 80))
+        nums = [n for m in ls["messages"] for n in m["numbers"]]
+        self.assertEqual(len(nums), 80); self.assertTrue(all(n.startswith("MEM-") for n in nums))
+        self.assertTrue(all(not m["problems"] for m in ls["messages"]))
+        last = ls["messages"][-1]["components"]["blocks"][-1]
+        self.assertEqual([b["label"] for b in last["buttons"]][:2], ["메모 더 보기 81", "참고 보관 메모 보기"])
+        rest = self.sh("claire_buttons", "memos", "--offset", "80")
+        self.assertEqual(rest["count"], 13); self.assertFalse(rest["has_more"])
+        self.assertEqual(len(set(nums) | {n for m in rest["messages"] for n in m["numbers"]}), 93)
+        b = self.sh("claire_buttons", "build", "--file", self._f("MEM-0002 메모로 저장했습니다.\n```MEM-0002```\n"))
+        self.assertEqual(b["numbers"], ["MEM-0002"])
+        # 메모 목록·카드는 전달 기록(업무 노출)을 만들지 않는다
+        self.assertEqual(self.db().execute("SELECT COUNT(*) FROM delivery").fetchone()[0], 0)
+
+    def _f(self, text):
+        p = self.data / "body.md"
+        p.write_text(text, encoding="utf-8")
+        return p
+
+
 class InstallTest(unittest.TestCase):
     """0.5.0: install.sh(설치 기록·claire-update·업그레이드 전 DB 사본)와 get.sh(릴리스 태그 설치·고정·확인)."""
 

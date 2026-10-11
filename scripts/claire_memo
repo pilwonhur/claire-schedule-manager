@@ -1,0 +1,512 @@
+#!/usr/bin/env python3
+"""claire_memo — 메모함 (0.8.0, ISSUE 2026-10-11). 업무와 분리된 기록의 등록·조회·수정·상태·연결.
+
+  add      --text "원문" [--title "짧은 제목"] [--topic NAS] --message-id <id> [--channel <id>] [--part N] [--url <링크>]
+           [--captured-at ISO] [--related CLR-0031|MEM-0002]... [--no-sync]
+           메모 하나를 저장한다. 같은 메시지(·같은 part)를 다시 처리하면 새로 만들지 않고 기존 메모를 돌려준다.
+           일정·할 일·달력·알림은 만들지 않는다. 저장 결과와 Obsidian 반영 결과를 따로 돌려준다.
+  list     [--status open|reference|resolved|not_needed|closed|all] [--q "NAS"] [--topic T] [--limit 20] [--offset 0]
+           기본: 열린 메모, 기록일 최신순. --q 를 주면 기본으로 모든 상태에서 찾는다(닫힌 기록도).
+  show     <대상> [--format text]            원문·출처·연결·Obsidian 반영·변경 이력
+  edit     <대상> [--text "새 내용"] [--title …] [--topic …] [--reason …] [--message-id <지시 메시지>]
+  status   <대상> --to open|reference|resolved|not_needed [--reason "사유"] [--message-id <지시 메시지>]
+           해결됨·불필요·참고 보관·다시 열기. 삭제가 아니다(이력 보관). 사유를 지어내지 않는다 — 말씀이 없으면 비워 둔다.
+  link     <대상> --item CLR-0031[,…] | --other MEM-0002[,…] [--remove]     관련 업무·관련 메모 (상태는 바꾸지 않는다)
+  to-task  <대상> [--title …] [--kind task|deadline|reply|prep] [--due-at …] [--project …] [--short-label …]
+           [--next-action …] [--message-id <지시 메시지>] [--new]
+           교수님이 "이 메모를 할 일로 등록해줘" 했을 때만. 기존 업무 생성 절차(claire_store propose)로 만들고 메모와 연결한다.
+           같은 메모를 다시 요청하면 이미 만든 업무를 돌려준다(--new 일 때만 하나 더). 메모 상태는 그대로다.
+  sync     [--memo MEM-0001 [--overwrite] | --pending]   Obsidian 메모함 반영(재시도). --overwrite: Obsidian 에서 고친 블록을
+           Claire 내용으로 다시 쓴다(교수님이 원할 때만).
+  export   [--out 파일] [--format md|json] [--status all]   메모 내보내기 (되돌리기·이전용)
+
+<대상>: --memo MEM-0001(짧게 `mem1`·`1`도) | --source-message <원래 메모 메시지 id> | --find "문구" (후보가 1건일 때만).
+여러 후보면 ambiguous_memo 로 거부한다 — 후보를 보여 드리고 고르게 한다. 최근 메모를 임의로 고르지 않는다.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+import tempfile
+from datetime import timedelta
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from claire_core import (  # noqa: E402
+    ClaireError, atomic_write_text, connect, data_dir, fingerprint, get_item, log_activity, next_ref, now_dt, now_iso,
+    reindex_memo, run_cli, tx,
+)
+import claire_memos as M  # noqa: E402
+
+
+def _bad(msg, **extra):
+    raise ClaireError("bad_args", msg, **extra)
+
+
+def _split(values) -> list[str]:
+    out = []
+    for v in values or []:
+        out += [x for x in str(v).replace(",", " ").split() if x]
+    return out
+
+
+# --------------------------------------------------------------------------
+# 대상 고르기
+# --------------------------------------------------------------------------
+
+def _target(conn, cfg, args, statuses=None):
+    if getattr(args, "memo", None):
+        return M.get(conn, cfg, args.memo)
+    if getattr(args, "source_message", None):
+        rows = conn.execute("SELECT * FROM memo WHERE source_message_id=? ORDER BY source_part, id",
+                            (args.source_message,)).fetchall()
+        if len(rows) == 1:
+            return rows[0]
+        if not rows:
+            raise ClaireError("memo_not_found", f"메시지 {args.source_message} 에서 만든 메모가 없습니다.", candidates=[])
+        raise ClaireError("ambiguous_memo", f"메시지 {args.source_message} 에서 만든 메모가 {len(rows)}건입니다. 어느 것인지 확인하세요.",
+                          candidates=[M.summary(conn, cfg, r) for r in rows])
+    if getattr(args, "find", None):
+        toks_all = M.search(conn, cfg, q=args.find, statuses=statuses or M.STATUSES)
+        from claire_core import hits, tokenize
+        toks = tokenize(args.find)
+        full = [r for r in toks_all if all(hits(t, " ".join(x for x in (r["title"], r["body"], r["original_text"],
+                                                                         r["topic"]) if x)) for t in toks)]
+        if len(full) == 1:
+            return full[0]
+        if not full:
+            raise ClaireError("no_candidate", f"'{args.find}' 에 맞는 메모가 없습니다.",
+                              candidates=[M.summary(conn, cfg, r) for r in toks_all[:5]])
+        raise ClaireError("ambiguous_memo", f"'{args.find}' 메모 후보가 {len(full)}건입니다. 어느 것인지 확인하세요.",
+                          candidates=[M.summary(conn, cfg, r) for r in full[:8]])
+    _bad("--memo, --source-message 또는 --find 가 필요합니다")
+
+
+# --------------------------------------------------------------------------
+# Obsidian 반영 (저장과 분리해서 결과를 돌려준다)
+# --------------------------------------------------------------------------
+
+def _attempt(conn, cfg, ref: str, overwrite: bool = False) -> dict:
+    now = now_dt(cfg); now_s = now.isoformat()
+    try:
+        with tx(conn):
+            res = M.sync_one(conn, cfg, ref, now_s, overwrite=overwrite)
+        return {"ok": True, **res}
+    except Exception as e:  # noqa: BLE001 — 저장은 이미 끝났다. 반영 실패만 기록하고 돌려준다
+        code = e.code if isinstance(e, ClaireError) else type(e).__name__
+        msg = e.message if isinstance(e, ClaireError) else str(e)
+        retry = code not in M.NO_RETRY
+        steps = cfg["apply"].get("backoff_minutes", [1, 5, 15, 60, 240])
+        with tx(conn):
+            M.mark_failed(conn, ref, code, msg)
+            for r in conn.execute("SELECT id, attempts FROM outbox WHERE op=? AND status='pending' "
+                                  "AND json_extract(payload,'$.memo')=?", (M.OP, ref)).fetchall():
+                if retry:
+                    nb = (now + timedelta(minutes=int(steps[min(r["attempts"] + 1, len(steps)) - 1]))).isoformat()
+                    conn.execute("UPDATE outbox SET attempts=attempts+1, last_error=?, not_before=? WHERE id=?",
+                                 (msg[:500], nb, r["id"]))
+                else:
+                    conn.execute("UPDATE outbox SET status='failed', attempts=attempts+1, last_error=?, done_at=? WHERE id=?",
+                                 (msg[:500], now_s, r["id"]))
+        return {"ok": False, "code": code, "error": msg, "will_retry": retry}
+
+
+def _obsidian_note(ob: dict | None) -> str:
+    if ob is None:
+        return " Obsidian 메모함 반영은 대기 중입니다(다음 claire_apply)."
+    if ob["ok"]:
+        moved = f" {ob['note_moved']}" if ob.get("note_moved") else ""
+        return (" Obsidian 메모함에 반영했습니다." if ob["action"] != "unchanged" else " Obsidian 메모함은 이미 같은 내용입니다.") + moved
+    if ob["will_retry"]:
+        return f" Obsidian 메모함 반영은 실패했습니다({ob['error'][:120]}). 저장은 되었고 반영만 자동으로 다시 시도합니다."
+    return f" Obsidian 메모함 반영은 보류했습니다 — {ob['error']}"
+
+
+# --------------------------------------------------------------------------
+# 명령
+# --------------------------------------------------------------------------
+
+def cmd_add(args, cfg):
+    text = (args.text or "").strip()
+    if not text:
+        _bad("--text 가 비어 있습니다")
+    if args.part < 1:
+        _bad("--part 는 1 이상")
+    mc = M.mcfg(cfg)
+    conn = connect(create=False); now_s = now_iso(cfg)
+    recorded = M.now_parts(cfg, args.captured_at, now_s)
+    key = M.source_key(args.platform, args.message_id, args.part)
+    related = _split(args.related)
+    dup = None
+    with tx(conn):
+        row = conn.execute("SELECT * FROM memo WHERE source_key=?", (key,)).fetchone() if key else None
+        if row is not None:
+            dup = {"duplicate": True, "memo": M.summary(conn, cfg, row), "saved": True}
+        else:
+            ref = next_ref(conn, "memo", mc["prefix"], int(cfg.get("ref_digits", 4)))
+            title = (args.title or "").strip() or M.auto_title(cfg, text)
+            mid = conn.execute(
+                "INSERT INTO memo(ref,title,original_text,body,status,topic,source_platform,source_channel,source_message_id,"
+                "source_part,source_url,source_key,recorded_at,tz,created_at,updated_at) "
+                "VALUES(?,?,?,?,'open',?,?,?,?,?,?,?,?,?,?,?)",
+                (ref, title, text, text, (args.topic or "").strip() or None, args.platform, args.channel, args.message_id,
+                 args.part, args.url, key, recorded, cfg.get("timezone", "Asia/Seoul"), now_s, now_s)).lastrowid
+            lid = M.log(conn, mid, "create", args.actor, now_s, field="status", new="open", reason="메모 등록",
+                        message_id=args.message_id)
+            for r in related:
+                _link_one(conn, cfg, mid, r, args.actor, now_s, args.message_id)
+            reindex_memo(conn, mid)
+            M.enqueue_sync(conn, mid, ref, now_s, lid)
+    if dup:
+        s = dup["memo"]
+        ob = None if args.no_sync or M.get(conn, cfg, s["ref"])["sync_status"] == "ok" else _attempt(conn, cfg, s["ref"])
+        return {**dup, "obsidian": ob, "message": f"이미 저장한 메모입니다: {s['ref']} {s['title']} (같은 메시지). 새로 만들지 않았습니다."
+                + (_obsidian_note(ob) if ob else "")}
+    ob = None if args.no_sync else _attempt(conn, cfg, ref)
+    m = M.get(conn, cfg, ref)
+    return {"duplicate": False, "saved": True, "memo": M.summary(conn, cfg, m), "obsidian": ob,
+            "message": f"{ref} 메모로 저장했습니다: {m['title']}. 일정·할 일·알림은 만들지 않았습니다." + _obsidian_note(ob)}
+
+
+def _status_list(value: str | None, q: str | None) -> list[str]:
+    v = value or ("all" if q else "open")
+    if v == "all":
+        return list(M.STATUSES)
+    if v == "closed":
+        return list(M.CLOSED)
+    if v not in M.STATUSES:
+        _bad(f"--status 는 open|reference|resolved|not_needed|closed|all", value=v)
+    return [v]
+
+
+def cmd_list(args, cfg):
+    conn = connect(create=False)
+    statuses = _status_list(args.status, args.q)
+    rows = M.search(conn, cfg, q=args.q, statuses=statuses, topic=args.topic)
+    total = len(rows)
+    page = rows[args.offset:args.offset + args.limit] if args.limit else rows[args.offset:]
+    memos = [M.summary(conn, cfg, r) for r in page]
+    counts = {s: conn.execute("SELECT COUNT(*) FROM memo WHERE status=?", (s,)).fetchone()[0] for s in M.STATUSES}
+    what = {"open": "열린 메모", "reference": "참고 보관 메모", "resolved": "해결된 메모", "not_needed": "불필요로 정리한 메모"}
+    label = ("메모 전체" if len(statuses) == 4 else "닫힌 메모(해결·불필요)" if statuses == list(M.CLOSED)
+             else what.get(statuses[0], "메모"))
+    if args.q:
+        label = f"'{args.q}' 메모 검색 ({label})"
+    end = args.offset + len(memos)
+    head = f"{label} {total}건" + (f" — {args.offset + 1}~{end}" if total > len(memos) else "")
+    lines = [head] + [M.list_line(cfg, s) for s in memos]
+    if not memos:
+        lines = [f"{label}: 없습니다."]
+    more = end < total
+    if more:
+        lines.append(f"더 있습니다: {end + 1}번째부터 (claire_memo list --offset {end})")
+    return {"memos": memos, "total": total, "offset": args.offset, "count": len(memos), "has_more": more,
+            "next_offset": end if more else None, "statuses": statuses, "counts": counts, "text": "\n".join(lines)}
+
+
+def cmd_show(args, cfg):
+    conn = connect(create=False)
+    m = _target(conn, cfg, args)
+    d = M.detail(conn, cfg, m, history=args.history)
+    return {"memo": d, "text": M.detail_text(cfg, d)}
+
+
+def cmd_edit(args, cfg):
+    conn = connect(create=False); now_s = now_iso(cfg)
+    changes = {}
+    if args.text is not None:
+        if not args.text.strip():
+            _bad("--text 가 비어 있습니다")
+        changes["body"] = args.text.strip()
+    if args.title is not None:
+        if not args.title.strip():
+            _bad("--title 이 비어 있습니다")
+        changes["title"] = args.title.strip()
+    if args.topic is not None:
+        changes["topic"] = args.topic.strip() or None
+    if not changes:
+        _bad("--text, --title, --topic 중 하나는 필요합니다")
+    with tx(conn):
+        m = _target(conn, cfg, args)
+        if M.already_done(conn, m["id"], "edit", args.message_id):
+            return {"memo": M.summary(conn, cfg, m), "changed": False, "duplicate": True,
+                    "message": f"{m['ref']} 이 지시는 이미 반영했습니다."}
+        diff = {k: v for k, v in changes.items() if v != m[k]}
+        lid = None
+        for k, v in diff.items():
+            lid = M.log(conn, m["id"], "edit", args.actor, now_s, field=k, old=m[k], new=v, reason=args.reason,
+                        message_id=args.message_id)
+        if diff:
+            conn.execute("UPDATE memo SET " + ", ".join(f"{k}=?" for k in diff) + " WHERE id=?", (*diff.values(), m["id"]))
+            M.touch(conn, m["id"], now_s)
+            M.enqueue_sync(conn, m["id"], m["ref"], now_s, lid)
+    if not diff:
+        return {"memo": M.summary(conn, cfg, m), "changed": False, "message": f"{m['ref']} 바뀐 내용이 없습니다."}
+    ob = _attempt(conn, cfg, m["ref"])
+    names = {"body": "내용", "title": "제목", "topic": "주제"}
+    return {"memo": M.summary(conn, cfg, M.get(conn, cfg, m["ref"])), "changed": True, "fields": sorted(diff), "obsidian": ob,
+            "message": f"{m['ref']} {'·'.join(names[k] for k in diff)} 수정했습니다(처음 기록은 그대로 보관)." + _obsidian_note(ob)}
+
+
+def cmd_status(args, cfg):
+    conn = connect(create=False); now_s = now_iso(cfg)
+    to = args.to
+    # --find 로 고를 때: 다시 열기는 닫힌·참고 메모에서, 그 밖에는 열린·참고 메모에서 찾는다
+    statuses = ["reference", *M.CLOSED] if to == "open" else ["open", "reference"]
+    with tx(conn):
+        m = _target(conn, cfg, args, statuses=statuses)
+        if M.already_done(conn, m["id"], "status", args.message_id):
+            return {"memo": M.summary(conn, cfg, m), "changed": False, "duplicate": True,
+                    "message": f"{m['ref']} 이 지시는 이미 반영했습니다(현재 {M.STATUS_KO[m['status']]})."}
+        if m["status"] == to:
+            return {"memo": M.summary(conn, cfg, m), "changed": False,
+                    "message": f"{m['ref']} 는 이미 '{M.STATUS_KO[to]}' 상태입니다."}
+        reason = (args.reason or "").strip() or None
+        lid = M.log(conn, m["id"], "status", args.actor, now_s, field="status", old=m["status"], new=to, reason=reason,
+                    message_id=args.message_id)
+        conn.execute("UPDATE memo SET status=?, status_reason=?, status_changed_at=? WHERE id=?", (to, reason, now_s, m["id"]))
+        M.touch(conn, m["id"], now_s)
+        M.enqueue_sync(conn, m["id"], m["ref"], now_s, lid)
+        before = m["status"]
+    ob = _attempt(conn, cfg, m["ref"])
+    m = M.get(conn, cfg, m["ref"])
+    verb = {"open": "다시 열었습니다", "reference": "참고용으로 보관했습니다", "resolved": "해결됨으로 정리했습니다",
+            "not_needed": "불필요로 정리했습니다"}[to]
+    tail = " 기록과 이력은 그대로 남습니다." if to != "open" else " 이전 정리 이력은 남아 있습니다."
+    linked = M.links(conn, m["id"])["tasks"]
+    if linked and to in M.CLOSED:
+        tail += f" 연결된 업무({', '.join(t['ref'] for t in linked)})의 상태는 바꾸지 않았습니다."
+    return {"memo": M.summary(conn, cfg, m), "changed": True, "from": before, "to": to, "reason": m["status_reason"],
+            "obsidian": ob, "message": f"{m['ref']} {m['title']} — {verb}." + tail + _obsidian_note(ob)}
+
+
+def _link_one(conn, cfg, memo_id: int, ref: str, actor: str, ts: str, message_id=None, remove=False) -> dict | None:
+    r = ref.strip()
+    if M.norm_ref(cfg, r).startswith(M.mcfg(cfg)["prefix"].upper() + "-") and not r.isdigit():
+        other = M.get(conn, cfg, r)
+        kind, tid, tref = "memo", other["id"], other["ref"]
+    else:
+        it = get_item(conn, r)
+        kind, tid, tref = "task", it["id"], it["ref"]
+    if remove:
+        a, b = (sorted((memo_id, tid)) if kind == "memo" else (memo_id, tid))
+        n = conn.execute("DELETE FROM memo_link WHERE memo_id=? AND kind=? AND target_id=?", (a, kind, b)).rowcount
+        if n:
+            M.log(conn, memo_id, "unlink", actor, ts, field=kind, old=tref, message_id=message_id)
+        return {"kind": kind, "ref": tref, "changed": bool(n)}
+    new = M.add_link(conn, memo_id, kind, tid, "user" if actor == "user" else "claire", ts)
+    if new:
+        M.log(conn, memo_id, "link", actor, ts, field=kind, new=tref, message_id=message_id)
+        if kind == "task":
+            mref = conn.execute("SELECT ref FROM memo WHERE id=?", (memo_id,)).fetchone()["ref"]
+            # 업무 이력에는 남기되 'link'(브리핑의 "변경")가 아닌 별도 동작으로 — 메모 때문에 업무 보고가 달라지지 않게
+            log_activity(conn, item_id=tid, action="memo_link", actor=actor, ts=ts, field="memo", new_value=mref,
+                         reason="메모와 연결 (업무 상태와 무관)")
+    return {"kind": kind, "ref": tref, "changed": new}
+
+
+def cmd_link(args, cfg):
+    targets = _split(args.item) + _split(args.other)
+    if not targets:
+        _bad("--item 또는 --other 가 필요합니다")
+    conn = connect(create=False); now_s = now_iso(cfg)
+    with tx(conn):
+        m = _target(conn, cfg, args)
+        out = [_link_one(conn, cfg, m["id"], t, args.actor, now_s, args.message_id, remove=args.remove) for t in targets]
+        changed = [o for o in out if o["changed"]]
+        if changed:
+            M.touch(conn, m["id"], now_s)
+            M.enqueue_sync(conn, m["id"], m["ref"], now_s, f"link:{now_s}:{len(out)}")
+    ob = _attempt(conn, cfg, m["ref"]) if changed else None
+    what = ", ".join(o["ref"] for o in changed)
+    msg = (f"{m['ref']} 와 {what} 의 연결을 {'풀었습니다' if args.remove else '기록했습니다'}. 서로의 상태는 바꾸지 않습니다."
+           if changed else f"{m['ref']} 연결에 바뀐 것이 없습니다.")
+    return {"memo": M.summary(conn, cfg, M.get(conn, cfg, m["ref"])), "links": out, "obsidian": ob,
+            "message": msg + (_obsidian_note(ob) if ob else "")}
+
+
+def cmd_to_task(args, cfg):
+    """메모 → 할 일 (교수님이 명시적으로 요청했을 때만). 업무는 기존 생성 절차(claire_store propose)로 만든다:
+    메모 원문을 platform=user · account=memo 원문 하나로 넣고 create 제안을 반영한다(검증·중요도·Tasks 자리 그대로).
+    메모 상태는 바꾸지 않는다. 같은 메모를 다시 요청하면 만든 업무를 돌려준다(재시도 중복 없음)."""
+    conn = connect(create=False); now_s = now_iso(cfg)
+    with tx(conn):
+        m = _target(conn, cfg, args)
+        linked = M.links(conn, m["id"])["tasks"]
+        if linked and not args.new:
+            return {"memo": M.summary(conn, cfg, m), "task": linked[0]["ref"], "tasks": [t["ref"] for t in linked],
+                    "created": False, "duplicate": True,
+                    "message": f"{m['ref']} 는 이미 {', '.join(t['ref'] + ' ' + t['title'] for t in linked)} 업무와 연결되어 있습니다. "
+                               "새로 만들지 않았습니다(하나 더 만들려면 --new)."}
+        n = conn.execute("SELECT COUNT(*) FROM source_event WHERE platform='user' AND account='memo' AND external_id=?",
+                         (m["ref"],)).fetchone()[0]
+        version = "to_task" if not args.new else f"to_task:{n + 1}"
+        ev = conn.execute("SELECT * FROM source_event WHERE platform='user' AND account='memo' AND external_id=? AND version=?",
+                          (m["ref"], version)).fetchone()
+        if ev is not None and ev["triage"] == "proposed":
+            it = conn.execute("SELECT i.* FROM item_source s JOIN item i ON i.id=s.item_id WHERE s.source_event_id=? "
+                              "ORDER BY i.id LIMIT 1", (ev["id"],)).fetchone()
+            if it is not None:                         # 업무는 만들었는데 연결 전에 멈춘 경우: 연결만 마저 한다
+                _link_one(conn, cfg, m["id"], it["ref"], args.actor, now_s, args.message_id)
+                M.log(conn, m["id"], "to_task", args.actor, now_s, field="task", new=it["ref"], message_id=args.message_id)
+                M.touch(conn, m["id"], now_s)
+                M.enqueue_sync(conn, m["id"], m["ref"], now_s, f"to_task:{it['ref']}")
+                return {"memo": M.summary(conn, cfg, M.get(conn, cfg, m["ref"])), "task": it["ref"], "created": False,
+                        "message": f"{m['ref']} 를 이미 만든 {it['ref']} {it['title']} 업무와 연결했습니다."}
+        hdr = {"memo_ref": m["ref"], "intent": "register", "from": "memo"}
+        if ev is None:
+            sid = conn.execute(
+                "INSERT INTO source_event(platform,account,external_id,thread_id,version,event_ts,ingested_at,fingerprint,"
+                "headers,excerpt,triage) VALUES('user','memo',?,NULL,?,?,?,?,?,?,'new')",
+                (m["ref"], version, m["recorded_at"], now_s, fingerprint(m["body"]),
+                 json.dumps(hdr, ensure_ascii=False), m["body"][:2000])).lastrowid
+        else:
+            sid = ev["id"]
+            conn.execute("UPDATE source_event SET triage='new', ignore_reason=NULL WHERE id=?", (sid,))
+    prop = {"op": "create", "source_event_ids": [sid], "kind": args.kind, "title": (args.title or "").strip() or m["title"],
+            "confidence": 0.95, "evidence": [m["body"][:300]], "request_scope": "self",
+            "note": f"메모 {m['ref']} 에서 교수님 요청으로 등록"}
+    for k in ("due_at", "project", "short_label", "next_action"):
+        v = getattr(args, k)
+        if v:
+            prop[k] = v
+    out = _propose(prop)
+    if not out.get("ok"):
+        with tx(conn):
+            conn.execute("UPDATE source_event SET triage='ignored', ignore_reason='memo_to_task_failed' WHERE id=?", (sid,))
+        err = out.get("error") or {}
+        raise ClaireError(err.get("code", "propose_failed"),
+                          f"{m['ref']} 를 할 일로 만들지 못했습니다: {err.get('message', out)}", detail=err)
+    made = (out.get("created") or out.get("captured") or [{}])[0]
+    ref = made.get("ref")
+    with tx(conn):
+        _link_one(conn, cfg, m["id"], ref, args.actor, now_s, args.message_id)
+        lid = M.log(conn, m["id"], "to_task", args.actor, now_s, field="task", new=ref, message_id=args.message_id)
+        M.touch(conn, m["id"], now_s)
+        M.enqueue_sync(conn, m["id"], m["ref"], now_s, lid)
+    ob = _attempt(conn, cfg, m["ref"])
+    return {"memo": M.summary(conn, cfg, M.get(conn, cfg, m["ref"])), "task": ref, "created": True, "item": made,
+            "planned": made.get("planned"), "warnings": out.get("warnings"), "obsidian": ob,
+            "message": f"{m['ref']} 메모로 {ref} {made.get('title')} 업무를 만들었습니다. 메모는 '{M.STATUS_KO[m['status']]}' 그대로이고 "
+                       f"할 일 연결됨으로 표시합니다(업무 완료와 메모 해결은 따로입니다). 날짜·알림은 말씀하신 것만 넣었습니다."
+                       + _obsidian_note(ob)}
+
+
+def _propose(prop: dict) -> dict:
+    tmp_dir = data_dir() / "tmp"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    fd, path = tempfile.mkstemp(prefix="memo-task-", suffix=".json", dir=tmp_dir)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump({"proposals": [prop]}, fh, ensure_ascii=False)
+        proc = subprocess.run([sys.executable, str(Path(__file__).resolve().parent / "claire_store"), "propose", "--file", path],
+                              capture_output=True, text=True, env=dict(os.environ))
+    finally:
+        Path(path).unlink(missing_ok=True)
+    try:
+        return json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        return {"ok": False, "error": {"code": "propose_crashed", "message": (proc.stderr or proc.stdout)[-300:]}}
+
+
+def cmd_sync(args, cfg):
+    conn = connect(create=False)
+    if args.memo:
+        refs = [M.get(conn, cfg, args.memo)["ref"]]
+    elif args.pending:
+        refs = [r["ref"] for r in conn.execute("SELECT ref FROM memo WHERE sync_status IN ('pending','failed') ORDER BY id")]
+    else:
+        _bad("--memo 또는 --pending 이 필요합니다")
+    if args.overwrite and not args.memo:
+        _bad("--overwrite 는 --memo 하나에만 씁니다")
+    results = [{"memo": r, **_attempt(conn, cfg, r, overwrite=args.overwrite)} for r in refs]
+    ok = [r["memo"] for r in results if r["ok"]]
+    bad = [r for r in results if not r["ok"]]
+    msg = f"Obsidian 메모함 반영 {len(ok)}건." + (f" 실패·보류 {len(bad)}건: " + "; ".join(f"{b['memo']} {b['error'][:80]}" for b in bad)
+                                            if bad else "")
+    return {"results": results, "synced": ok, "failed": [b["memo"] for b in bad], "message": msg}
+
+
+def cmd_export(args, cfg):
+    conn = connect(create=False); now_s = now_iso(cfg)
+    statuses = _status_list(args.status or "all", None)
+    rows = [r for r in conn.execute("SELECT * FROM memo ORDER BY id") if r["status"] in statuses]
+    stamp = now_s[:19].replace(":", "").replace("-", "")
+    out = Path(args.out).expanduser() if args.out else data_dir() / "exports" / f"claire-memos-{stamp}.{args.format}"
+    if args.format == "json":
+        payload = {"exported_at": now_s, "memos": [M.detail(conn, cfg, r, history=1000) for r in rows]}
+        atomic_write_text(out, json.dumps(payload, ensure_ascii=False, indent=1) + "\n")
+    else:
+        lines = ["# Claire 메모함 (내보내기)", "", f"내보낸 시각: {now_s} · 메모 {len(rows)}건", ""]
+        for r in rows:
+            lines += [l for l in M.render_block(conn, cfg, r) if not l.startswith("%%claire-memo:")] + [""]
+        atomic_write_text(out, "\n".join(lines) + "\n")
+    return {"out": str(out), "count": len(rows), "format": args.format,
+            "message": f"메모 {len(rows)}건을 {out} 로 내보냈습니다."}
+
+
+# --------------------------------------------------------------------------
+
+def _target_args(sp):
+    sp.add_argument("--memo", help="MEM-0001 (짧게 mem1·1)")
+    sp.add_argument("--source-message", help="메모를 만든 원래 메시지 id (답장 대상)")
+    sp.add_argument("--find", help="문구로 찾기 (후보 1건일 때만)")
+    return sp
+
+
+def _common(sp):
+    sp.add_argument("--actor", choices=["user", "claire"], default="user")
+    sp.add_argument("--message-id", help="이 지시가 온 Discord 메시지 id (재처리 중복 방지)")
+    return sp
+
+
+def build_parser():
+    p = argparse.ArgumentParser(prog="claire_memo", description="Claire 메모함 (0.8.0) — 업무와 분리된 기록")
+    sub = p.add_subparsers(dest="cmd")
+    a = sub.add_parser("add", help="메모 저장 (같은 메시지 재처리는 중복 없음)")
+    a.add_argument("--text", required=True); a.add_argument("--title"); a.add_argument("--topic")
+    a.add_argument("--message-id"); a.add_argument("--channel"); a.add_argument("--part", type=int, default=1)
+    a.add_argument("--url"); a.add_argument("--captured-at"); a.add_argument("--platform", choices=["discord", "user"], default="discord")
+    a.add_argument("--related", action="append", help="관련 CLR-·MEM- 번호 (여럿 가능)")
+    a.add_argument("--actor", choices=["user", "claire"], default="user")
+    a.add_argument("--no-sync", action="store_true", help="Obsidian 반영을 지금 하지 않는다(다음 claire_apply)")
+    a.set_defaults(fn=cmd_add)
+    ls = sub.add_parser("list", help="목록·검색")
+    ls.add_argument("--status", choices=["open", "reference", "resolved", "not_needed", "closed", "all"])
+    ls.add_argument("--q"); ls.add_argument("--topic")
+    ls.add_argument("--limit", type=int, default=50); ls.add_argument("--offset", type=int, default=0)
+    ls.add_argument("--format", choices=["json", "text"], default="json")
+    ls.set_defaults(fn=cmd_list)
+    sh = _target_args(sub.add_parser("show", help="상세 (원문·출처·연결·이력)"))
+    sh.add_argument("--history", type=int, default=10); sh.add_argument("--format", choices=["json", "text"], default="json")
+    sh.set_defaults(fn=cmd_show)
+    e = _common(_target_args(sub.add_parser("edit", help="내용·제목·주제 수정 (처음 기록 보관)")))
+    e.add_argument("--text"); e.add_argument("--title"); e.add_argument("--topic"); e.add_argument("--reason")
+    e.set_defaults(fn=cmd_edit)
+    st = _common(_target_args(sub.add_parser("status", help="해결됨·불필요·참고 보관·다시 열기")))
+    st.add_argument("--to", required=True, choices=M.STATUSES); st.add_argument("--reason")
+    st.set_defaults(fn=cmd_status)
+    lk = _common(_target_args(sub.add_parser("link", help="관련 업무·메모 연결")))
+    lk.add_argument("--item", action="append"); lk.add_argument("--other", action="append")
+    lk.add_argument("--remove", action="store_true"); lk.set_defaults(fn=cmd_link)
+    t = _common(_target_args(sub.add_parser("to-task", help="교수님 요청으로 할 일 등록 (메모와 연결)")))
+    t.add_argument("--title"); t.add_argument("--kind", default="task", choices=["task", "deadline", "reply", "prep"])
+    t.add_argument("--due-at"); t.add_argument("--project"); t.add_argument("--short-label"); t.add_argument("--next-action")
+    t.add_argument("--new", action="store_true", help="이미 연결된 업무가 있어도 하나 더 만든다")
+    t.set_defaults(fn=cmd_to_task)
+    sy = sub.add_parser("sync", help="Obsidian 메모함 반영(재시도)")
+    sy.add_argument("--memo"); sy.add_argument("--pending", action="store_true"); sy.add_argument("--overwrite", action="store_true")
+    sy.set_defaults(fn=cmd_sync)
+    ex = sub.add_parser("export", help="메모 내보내기")
+    ex.add_argument("--out"); ex.add_argument("--format", choices=["md", "json"], default="md")
+    ex.add_argument("--status", choices=["open", "reference", "resolved", "not_needed", "closed", "all"])
+    ex.set_defaults(fn=cmd_export)
+    return p
+
+
+if __name__ == "__main__":
+    run_cli(build_parser, lambda args, cfg: args.fn(args, cfg))

@@ -17,8 +17,15 @@
 | `checkin` | 12:00·18:00 미등록 일정 확인 (v2) | `(day, slot)` 유니크 — 하루·슬롯 1회. `message_id`, `result` |
 | `delivery` | 보고 전달 기록 (v3) | `(report_key, page)` 유니크. 페이지마다 `item_refs`(상세·버튼)·`check_refs`·`question_refs`(`NOTE:프로젝트` = 문서 위치 질문)·`mention_refs`(v4, 키워드로만 언급)·`payload`(재전송용). `status` generated→sent/failed(→superseded). sent 일 때만 항목 `last_exposed_at`(상세·키워드)·`last_detailed_at`·`last_asked_at`(상세의 진행 확인만)·질문 `asked_count`·`note_map.asked_count` 갱신 |
 | `note_map` | 프로젝트 → Obsidian 주제 문서 (v4) | `project` 기본 키, `note`(볼트 기준 경로), `status` pending(처음 봄, 후보 `candidates` JSON)/confirmed(교수님 확인)/inbox(수집함에 두고 묻지 않음), `asked_count`·`last_asked_at`(한 번 묻고 7일 뒤 한 번 더) |
+| `memo` | 메모함 (v5, 0.8.0) — 업무가 아니다 | `ref` 유니크(`MEM-0001`, 재사용 금지). `original_text`(처음 받은 원문, 바꾸지 않음)·`body`(현재 내용)·`title`·`topic`. `status` open/reference/resolved/not_needed(+ `status_reason`·`status_changed_at`). 출처 `source_platform`·`source_channel`·`source_message_id`·`source_part`·`source_url`, `source_key`=`platform:message:part` 유니크(재처리 중복 방지). `recorded_at`(메시지 시각). Obsidian `obsidian_note`·`obsidian_hash`(마지막으로 쓴 블록 — 다르면 고친 것)·`sync_status` pending/ok/failed/conflict. 기한·중요도·재확인일 없음 |
+| `memo_log` | 메모 이력 (v5) | `action` create/status/edit/link/unlink/to_task/sync, `old_value`·`new_value`·`reason`, `source_message_id`(같은 지시 재처리 방지) |
+| `memo_link` | 메모 → 관련 업무(`task`: item.id)·관련 메모(`memo`) (v5) | `(memo_id, kind, target_id)` 유니크. 상태를 서로 바꾸지 않는다. 업무 쪽 이력은 `activity_log.action='memo_link'`(브리핑 "변경"에 안 셈) |
 | `meta` | `schema_version`, `created_by_version`, `daily_done_since`(Daily 완료 기록 시작 시각), `migrated_v2`·`migrated_v3`, `tracking_since`(노출 추적 시작), `importance_backfilled`(소급 분류 1회) | |
 | `search_fts` | FTS5 (ref, title, project, next_action, waiting_on, excerpts) | rowid = item.id |
+| `memo_fts` | FTS5 (ref, title, body, topic) — 메모 검색 (v5) | rowid = memo.id. 업무 검색과 섞지 않는다 |
+
+메모의 Obsidian 반영은 outbox op `obsidian.memo`(`item_id` 없음, payload `{"memo": "MEM-0001"}`)다. 업무 반영 실패 목록·운영 점검의
+업무 건수에는 넣지 않고 `health.memo_sync`(실패·보류 메모 번호)로 따로 보인다.
 
 ## 상태 전이 (§5.3)
 

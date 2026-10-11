@@ -116,7 +116,13 @@ def scan_file(path: Path, cfg: dict, root: Path | None = None) -> list[dict]:
     mtime = path.stat().st_mtime
     out = []
     skip_level = None  # 제외 섹션 안이면 그 헤딩 레벨
+    in_memo = False    # 0.8.0: 메모함 블록(%%claire-memo:…:start%% ~ end%%) 안은 업무가 아니다
     for lineno, line in enumerate(text.splitlines(), 1):
+        if line.startswith("%%claire-memo:"):
+            in_memo = line.rstrip().endswith(":start%%")
+            continue
+        if in_memo:
+            continue
         hm = HEADING_RE.match(line)
         if hm:
             level, title = len(hm.group(1)), hm.group(2).strip()

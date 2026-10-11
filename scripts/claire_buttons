@@ -24,6 +24,10 @@
   agenda --view overdue|progress|past|waiting|done|questions [--no-record]
           "전체 보기" 버튼·요청의 전체 목록 (구역 하나를 빠짐없이, 여러 쪽 가능). --view 없이 쓰면 업무 현황 전체(0.6.1 그대로).
   resend  전송 실패·확인 없는 페이지만 다시 보낼 페이로드 (같은 보고의 다른 페이지는 다시 보내지 않는다)
+  memos   [--status open|reference|resolved|not_needed|closed|all] [--q 검색어] [--topic T] [--offset N]
+          메모 목록 (0.8.0, 요청할 때만): MEM 번호 버튼, 넘치면 "메모 더 보기 N". 업무 보고·전달 기록과 무관.
+  actions --memo MEM-0001 [--detail]
+          메모 카드: 해결됨·불필요·참고 보관·다시 열기·상세·할 일로 등록 (달력·완료 버튼 없음)
 
 --record KIND (build·approvals): 보낼 메시지를 전달 기록에 남긴다(KIND: brief|answer|list|approvals). 브리핑은
 --record brief --briefing <briefing_id>. 결과 messages[] 에 delivery_id·send_to 가 붙는다.
@@ -43,13 +47,14 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from claire_core import ClaireError, connect, get_item, normalize_ref, now_dt, now_iso, parse_iso, run_cli, tx, tz_of  # noqa: E402
+import claire_memos as memos  # noqa: E402
 import claire_ops as ops  # noqa: E402
 import claire_track as track  # noqa: E402
 
-NUMBER_RE = re.compile(r"(?<![A-Za-z0-9-])((?:CLR|Q)-\d{3,6})(?!\d)")   # 한글이 바로 붙어도(CLR-0031로) 잡는다
-ONE_LINE_BLOCK_RE = re.compile(r"^\s*```\s*((?:CLR|Q)-\d{3,6})\s*```\s*$")
+NUMBER_RE = re.compile(r"(?<![A-Za-z0-9-])((?:CLR|Q|MEM)-\d{3,6})(?!\d)")   # 한글이 바로 붙어도(CLR-0031로) 잡는다. MEM: 0.8.0 메모
+ONE_LINE_BLOCK_RE = re.compile(r"^\s*```\s*((?:CLR|Q|MEM)-\d{3,6})\s*```\s*$")
 FENCE_RE = re.compile(r"^\s*```\s*$")
-NUMBER_ONLY_RE = re.compile(r"^\s*((?:CLR|Q)-\d{3,6})\s*$")
+NUMBER_ONLY_RE = re.compile(r"^\s*((?:CLR|Q|MEM)-\d{3,6})\s*$")
 SKIP_PREFIXES = ("반영 상태", "참고")          # 번호가 있어도 버튼을 붙이지 않는 줄 (SKILL §5)
 
 # Discord Components V2: 컨테이너 안 컴포넌트 40개, 텍스트 합계 4,000자. 여유를 둔다.
@@ -424,13 +429,56 @@ def cmd_actions_question(conn, cfg, qref: str) -> dict:
             "buttons": [b["label"] for r in rows for b in r["buttons"]]}
 
 
+def cmd_actions_memo(conn, cfg, ref: str, detail: bool = False) -> dict:
+    """메모 카드 (0.8.0): 상태·기록일·내용과 메모 전용 버튼(해결됨·불필요·참고 보관·다시 열기·상세·할 일로 등록).
+    업무 카드와 달리 완료·보류·달력 등록 버튼이 없다 — 메모는 업무가 아니다."""
+    m = memos.get(conn, cfg, ref)
+    ref = m["ref"]
+    d = memos.detail(conn, cfg, m)
+    if detail:
+        lines = memos.detail_text(cfg, d).split("\n")
+    else:
+        body = m["body"] if len(m["body"]) <= 300 else m["body"][:299] + "…"
+        lines = [f"{ref} · {m['title']}",
+                 " · ".join(x for x in ("메모", d["status_ko"], f"기록 {memos.fmt_ts(cfg, m['recorded_at'])}",
+                                        f"주제 {m['topic']}" if m["topic"] else "") if x),
+                 f"내용: {body}"]
+        if m["status"] != "open" and m["status_reason"]:
+            lines.append(f"정리 사유: {m['status_reason']}")
+        if d["links"]["tasks"]:
+            lines.append("관련 업무: " + ", ".join(f"{t['ref']} {t['title']}" for t in d["links"]["tasks"]))
+        if m["sync_status"] in ("failed", "conflict"):
+            lines.append("Obsidian: " + ("반영 실패 — 재시도 중" if m["sync_status"] == "failed" else "반영 보류 (Obsidian 에서 고친 블록)"))
+    st = m["status"]
+    if st == "open":
+        rows = [_row([(f"{ref} 해결됨", "success"), (f"{ref} 불필요", "secondary"), (f"{ref} 참고 보관", "secondary"),
+                      (f"{ref} 상세", "secondary")])]
+    elif st == "reference":
+        rows = [_row([(f"{ref} 해결됨", "success"), (f"{ref} 불필요", "secondary"), (f"{ref} 다시 열기", "primary"),
+                      (f"{ref} 상세", "secondary")])]
+    else:
+        rows = [_row([(f"{ref} 다시 열기", "primary"), (f"{ref} 상세", "secondary")])]
+    linked = [t["ref"] for t in d["links"]["tasks"]]
+    if linked:
+        rows.append(_row([(r, "secondary") for r in linked[:5]]))
+    elif st in ("open", "reference"):
+        rows.append(_row([(f"{ref} 할 일로 등록", "secondary")]))
+    hint = "내용 수정·주제·정리 사유는 이 메시지에 답장으로 적어 주세요. 버튼이 만료되면 번호와 함께 적으면 됩니다(예: mem1 해결됨)."
+    lines.append(hint)
+    return {"memo": ref, "status": st, "message": "\n".join(lines),
+            "components": {"reusable": True, "text": "\n".join(lines[:-1]), "blocks": rows + [{"type": "text", "text": hint}]},
+            "buttons": [b["label"] for r in rows for b in r["buttons"]]}
+
+
 def cmd_actions(args, cfg):
     conn = connect(create=False)
+    if getattr(args, "memo", None):
+        return cmd_actions_memo(conn, cfg, args.memo.strip(), detail=args.detail)
     if args.item:
         return cmd_actions_item(conn, cfg, args.item.strip(), detail=args.detail)
     if args.question:
         return cmd_actions_question(conn, cfg, normalize_ref(args.question, default_prefix="Q"))
-    raise ClaireError("bad_args", "--item 또는 --question 이 필요합니다.")
+    raise ClaireError("bad_args", "--item, --question 또는 --memo 가 필요합니다.")
 
 
 # --------------------------------------------------------------------------
@@ -652,6 +700,69 @@ def cmd_agenda(args, cfg):
     return result
 
 
+MEMO_VIEW = {"open": "열린 메모", "reference": "참고 보관 메모", "resolved": "해결된 메모", "not_needed": "불필요로 정리한 메모",
+             "closed": "닫힌 메모(해결·불필요)", "all": "메모 전체"}
+MEMO_NAV = {"open": ["참고 보관 메모 보기", "닫힌 메모 보기", "메모 전체 보기"],
+            "reference": ["열린 메모 보기", "닫힌 메모 보기"], "closed": ["열린 메모 보기", "메모 전체 보기"],
+            "resolved": ["열린 메모 보기", "메모 전체 보기"], "not_needed": ["열린 메모 보기", "메모 전체 보기"],
+            "all": ["열린 메모 보기"]}
+
+
+def memo_messages(conn, cfg, *, status: str | None = None, q: str | None = None, topic: str | None = None, offset: int = 0,
+                  max_components: int = DEFAULT_MAX_COMPONENTS, max_chars: int = DEFAULT_MAX_CHARS) -> dict:
+    """메모 목록 (0.8.0, 요청할 때만). 줄마다 `MEM-0001 · 제목 · 10/11 · 열림`, 다섯 줄마다 번호 버튼 한 줄.
+    한 번에 list_page × list_messages 건까지, 넘치면 마지막에 "메모 더 보기 N" 버튼 — 요청한 메모 전부에 닿을 수 있다.
+    아침 보고·업무 현황과 무관하고 전달 기록(업무 노출)도 남기지 않는다."""
+    view = status or ("all" if q else "open")
+    statuses = list(memos.STATUSES) if view == "all" else list(memos.CLOSED) if view == "closed" else [view]
+    rows = memos.search(conn, cfg, q=q, statuses=statuses, topic=topic)
+    mc = memos.mcfg(cfg)
+    window = int(mc["list_page"]) * int(mc["list_messages"])
+    total = len(rows)
+    page = rows[offset:offset + window]
+    end = offset + len(page)
+    label = MEMO_VIEW[view] + (f" · '{q}' 검색" if q else "") + (f" · 주제 {topic}" if topic else "")
+    header = f"**{label} {total}건**" + (f" ({offset + 1}~{end})" if total > len(page) else "")
+    out_rows: list[dict] = []
+    for r in page:
+        s = memos.summary(conn, cfg, r)
+        out_rows.append({"ref": s["ref"], "text": memos.list_line(cfg, s), "section": "2"})
+    nav = []
+    if end < total:
+        nav.append(f"메모 더 보기 {end + 1}" + ("" if view == "open" and not q else f" · {MEMO_VIEW[view]}") + (f" · '{q}'" if q else ""))
+    if not q:
+        nav += MEMO_NAV.get(view, [])
+    if not page:
+        out_rows.append({"text": f"{label}: 없습니다."})
+    if nav:
+        out_rows.append({"nav": nav[:5]})
+    chunks = _chunk_units(_agenda_units(out_rows), max_components, max_chars)
+    messages = []
+    for i, chunk in enumerate(chunks, 1):
+        head = header if i == 1 else f"{header} (계속 {i}/{len(chunks)})"
+        blocks = [b for u in chunk for b in u["blocks"]]
+        m = {"message": "\n".join([head] + [line for u in chunk for line in u["raw"]]),
+             "components": {"reusable": True, "text": head, "blocks": blocks},
+             "numbers": [n for u in chunk for n in u["numbers"]], "component_count": 2 + sum(_cost(b) for b in blocks)}
+        m["problems"] = track.validate_message(m)
+        messages.append(m)
+    for i, m in enumerate(messages, 1):
+        m["index"], m["of"] = i, len(messages)
+    return {"view": view, "q": q, "total": total, "offset": offset, "count": len(page), "has_more": end < total,
+            "next_offset": end if end < total else None, "messages": messages}
+
+
+def cmd_memos(args, cfg):
+    conn = connect(create=False)
+    out = memo_messages(conn, cfg, status=args.status, q=args.q, topic=args.topic, offset=args.offset,
+                        max_components=args.max_components)
+    out.update(_send_to(cfg))
+    out["send_with"] = ("message 도구: channel=discord, action=send, to=<지금 대화 중인 채널>, message=<message>, "
+                        "components=<components>. 메모 목록은 전달 기록(deliver)을 남기지 않는다. 다 보낸 뒤 최종 답변은 NO_REPLY. "
+                        "도구가 없거나 실패하면 message 본문을 그대로 답한다.")
+    return out
+
+
 def _page_messages(header: str, pages: list[dict], max_components: int, max_chars: int, *, split_ok=("today",)) -> list[dict]:
     """쪽(page) → 메시지. 오늘 쪽만 길면 여러 메시지로 나누고, 나머지 쪽은 한 메시지여야 한다(넘으면 problems 에 표시)."""
     messages = []
@@ -846,7 +957,12 @@ def build_parser():
     a = sub.add_parser("actions", help="항목·질문 카드와 다음 행동 버튼")
     a.add_argument("--item")
     a.add_argument("--question")
+    a.add_argument("--memo", help="메모 카드 MEM-0001 (0.8.0)")
     a.add_argument("--detail", action="store_true", help="상세 보기(출처·완료 기준·최근 이력)")
+    mm = sub.add_parser("memos", help="메모 목록 (0.8.0, 요청 시) — 업무 보고와 무관")
+    mm.add_argument("--status", choices=["open", "reference", "resolved", "not_needed", "closed", "all"])
+    mm.add_argument("--q"); mm.add_argument("--topic"); mm.add_argument("--offset", type=int, default=0)
+    mm.add_argument("--max-components", type=int, default=DEFAULT_MAX_COMPONENTS)
     ap = sub.add_parser("approvals", help="승인 대기 목록 메시지 (달력/Tasks 구분)")
     ap.add_argument("--include-past", action="store_true")
     ap.add_argument("--max-components", type=int, default=DEFAULT_MAX_COMPONENTS)
@@ -864,7 +980,7 @@ def build_parser():
 
 def dispatch(args, cfg):
     return {"build": cmd_build, "actions": cmd_actions, "approvals": cmd_approvals, "agenda": cmd_agenda,
-            "report": cmd_report, "resend": cmd_resend}[args.cmd](args, cfg)
+            "report": cmd_report, "resend": cmd_resend, "memos": cmd_memos}[args.cmd](args, cfg)
 
 
 if __name__ == "__main__":

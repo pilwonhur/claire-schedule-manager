@@ -27,14 +27,15 @@ from zoneinfo import ZoneInfo
 #
 # 스킬 전체의 배포 버전 (SemVer). 동작이나 문서가 바뀌면 반드시 올리고
 # CHANGELOG.md에 항목을 남긴다. tests/test_claire.py가 둘의 일치를 검사한다.
-CLAIRE_VERSION = "0.7.1"
+CLAIRE_VERSION = "0.8.0"
 
 # 데이터 파일 형식의 버전. 스키마가 바뀌면 올리고 MIGRATIONS 에 기존 DB 변환을 적는다.
 # v2 (0.5.0): item.due_precision·window_auto·attendance·daily_logged_on, outbox.selected_at, checkin 표.
 # v3 (0.6.0): item.request_scope·priority_source·priority_reason·check_every_days·review_after·close_reason·
 #             last_exposed_at·last_asked_at·last_reported_at, delivery 표 (완료까지 추적·전달 기록).
 # v4 (0.7.0): item.short_label·last_detailed_at, delivery.mention_refs, note_map 표 (아침 보고 간소화·Tasks 주제 문서).
-SCHEMA_VERSION = 4
+# v5 (0.8.0): memo·memo_log·memo_link·memo_fts 표 (메모함 — 업무와 분리된 기록, ISSUE 2026-10-11). 기존 표는 그대로.
+SCHEMA_VERSION = 5
 
 # --------------------------------------------------------------------------
 # 설정 (PRD §12, §15)
@@ -184,6 +185,15 @@ DEFAULT_CONFIG = {
         "questions_max": 3,                 # 확인 필요 질문 (나머지는 계속 추적하고 다음에)
         "done_hours": 24,                   # "완료 반영 N건"을 셀 기간
     },
+    # 0.8.0 — 메모함 (ISSUE 2026-10-11). 업무가 아닌 기록: 아침 보고·진행 확인·달력·Tasks·Daily 와 무관하다.
+    "memo": {
+        "prefix": "MEM",                          # 메모 번호 접두어 (업무 CLR-, 질문 Q- 와 구분)
+        "note": "01 Inbox/Claire 메모함.md",       # 메모 전용 Obsidian 노트 (Tasks 체크박스가 아닌 메모 블록)
+        "list_page": 20,                          # 목록 한 메시지에 실을 메모 수
+        "list_messages": 4,                       # 목록 한 번에 보낼 메시지 수 (넘치면 "메모 더 보기")
+        "title_chars": 40,                        # 제목을 따로 주지 않으면 본문 앞부분을 이 길이까지
+    },
+
     # 0.6.0 — 정기 일정 회차의 준비 업무 템플릿 (교수님이 승인한 것만). 비어 있으면 만들지 않는다.
     # 예: {"match": "로봇공학", "title": "{title} 준비", "days_before": 1, "kind": "prep"}
     "prep_templates": [],
@@ -568,6 +578,68 @@ CREATE TABLE IF NOT EXISTS note_map (
   updated_at    TEXT NOT NULL
 );
 
+-- 0.8.0: 메모함. 업무(item)와 분리된 기록이다. 보고·진행 확인·달력·Tasks·Daily 의 어떤 집계에도 들어가지 않는다.
+-- original_text 는 처음 받은 원문(바꾸지 않는다), body 는 현재 내용(수정 가능, 이전 값은 memo_log).
+-- source_key = platform:message_id:part — 같은 메시지를 다시 처리해도 메모가 둘이 되지 않는다.
+CREATE TABLE IF NOT EXISTS memo (
+  id                INTEGER PRIMARY KEY,
+  ref               TEXT UNIQUE NOT NULL,
+  title             TEXT NOT NULL,
+  original_text     TEXT NOT NULL,
+  body              TEXT NOT NULL,
+  status            TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open','reference','resolved','not_needed')),
+  topic             TEXT,
+  status_reason     TEXT,
+  status_changed_at TEXT,
+  source_platform   TEXT NOT NULL DEFAULT 'discord' CHECK (source_platform IN ('discord','user')),
+  source_channel    TEXT,
+  source_message_id TEXT,
+  source_part       INTEGER NOT NULL DEFAULT 1,
+  source_url        TEXT,
+  source_key        TEXT UNIQUE,
+  recorded_at       TEXT NOT NULL,
+  tz                TEXT NOT NULL DEFAULT 'Asia/Seoul',
+  obsidian_note     TEXT,
+  obsidian_hash     TEXT,
+  sync_status       TEXT NOT NULL DEFAULT 'pending' CHECK (sync_status IN ('pending','ok','failed','conflict')),
+  sync_error        TEXT,
+  synced_at         TEXT,
+  created_at        TEXT NOT NULL,
+  updated_at        TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_memo_status ON memo(status);
+CREATE INDEX IF NOT EXISTS ix_memo_source ON memo(source_message_id);
+
+CREATE TABLE IF NOT EXISTS memo_log (
+  id                INTEGER PRIMARY KEY,
+  memo_id           INTEGER NOT NULL REFERENCES memo(id),
+  action            TEXT NOT NULL,
+  actor             TEXT NOT NULL CHECK (actor IN ('user','claire','sync','apply')),
+  field             TEXT,
+  old_value         TEXT,
+  new_value         TEXT,
+  reason            TEXT,
+  source_message_id TEXT,
+  created_at        TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_memo_log_memo ON memo_log(memo_id);
+
+-- 메모 → 관련 업무(task: item.id) / 관련 메모(memo: memo.id). 연결은 상태를 바꾸지 않는다.
+CREATE TABLE IF NOT EXISTS memo_link (
+  id          INTEGER PRIMARY KEY,
+  memo_id     INTEGER NOT NULL REFERENCES memo(id),
+  kind        TEXT NOT NULL CHECK (kind IN ('task','memo')),
+  target_id   INTEGER NOT NULL,
+  created_by  TEXT NOT NULL CHECK (created_by IN ('user','claire')),
+  created_at  TEXT NOT NULL,
+  UNIQUE (memo_id, kind, target_id)
+);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS memo_fts USING fts5(
+  ref, title, body, topic,
+  tokenize='unicode61 remove_diacritics 2'
+);
+
 -- 한국어 검색 (Clio의 어간 근사 처리 재사용)
 CREATE VIRTUAL TABLE IF NOT EXISTS search_fts USING fts5(
   ref, title, project, next_action, waiting_on, excerpts,
@@ -578,11 +650,11 @@ CREATE VIRTUAL TABLE IF NOT EXISTS search_fts USING fts5(
 # 백업·복구 대조와 무결성 집계에 쓰는 표 목록 (TC20)
 COUNT_TABLES = ["item", "source_event", "item_source", "attachment", "question",
                 "activity_log", "relation", "link", "sync_state", "run", "outbox",
-                "briefing", "checkin", "delivery", "note_map"]
+                "briefing", "checkin", "delivery", "note_map", "memo", "memo_log", "memo_link"]
 
 # 내용 해시에 참여하는 표. 복구 후 "건수·해시 일치"의 해시가 이것이다 (TC20).
 HASH_TABLES = ["item", "source_event", "item_source", "question", "activity_log",
-               "relation", "link"]
+               "relation", "link", "memo", "memo_log", "memo_link"]
 
 DB_NAME = "claire.db"
 
@@ -664,7 +736,7 @@ MIGRATION_COLUMNS = {
 
 
 def migrate(conn) -> list[str]:
-    """스키마 v1 → v2 → v3. 바꾼 것을 돌려준다. install.sh 가 migrate 전에 백업한다.
+    """스키마 v1 → … → v5. 바꾼 것을 돌려준다. (v5 의 메모 표는 SCHEMA_SQL 의 CREATE IF NOT EXISTS 가 추가한다.) install.sh 가 migrate 전에 백업한다.
     값은 지우거나 바꾸지 않는다: 원본 ID·상태·완료 이력·"등록 안 함" 기록은 그대로다. 기존 업무의 중요도 소급 분류는
     설정이 필요해서 claire_store maintain 이 한 번 한다(claire_track.backfill_importance)."""
     done = []
@@ -750,6 +822,8 @@ def content_hash(conn: sqlite3.Connection, tables: list[str] | None = None) -> s
     """표 내용의 결정론적 해시. 복구 대조(TC20)에 쓴다. rowid 순으로 모든 열을 직렬화한다."""
     h = hashlib.sha256()
     for t in (tables or HASH_TABLES):
+        if not _has_table(conn, t):
+            continue                     # 0.8.0 전 백업(메모 표 없음)도 같은 해시로 대조한다
         cols = [r[1] for r in conn.execute(f"PRAGMA table_info({t})")]
         h.update(f"#{t}:{','.join(cols)}\n".encode("utf-8"))
         order = "rowid" if "id" not in cols else "id"
@@ -761,7 +835,7 @@ def content_hash(conn: sqlite3.Connection, tables: list[str] | None = None) -> s
 
 
 def table_counts(conn: sqlite3.Connection, tables: list[str] | None = None) -> dict:
-    return {t: conn.execute(f"SELECT COUNT(*) c FROM {t}").fetchone()["c"]
+    return {t: conn.execute(f"SELECT COUNT(*) c FROM {t}").fetchone()["c"] if _has_table(conn, t) else 0
             for t in (tables or COUNT_TABLES)}
 
 
@@ -795,6 +869,14 @@ def next_question_ref(conn, cfg) -> str:
 
 
 _SHORT_REF = re.compile(r"^\s*(?:(CLR|Q)\s*-?\s*)?0*(\d{1,6})\s*$", re.IGNORECASE)
+
+
+def normalize_memo_ref(ref: str, prefix: str = "MEM", digits: int = 4) -> str:
+    """메모 번호 (0.8.0): `MEM-0001`·`mem1`·`MEM 1`·`메모 1`·`1` → `MEM-0001`. 형식이 다르면 대문자로만 바꿔 돌려준다."""
+    m = re.fullmatch(r"\s*(?:" + re.escape(prefix) + r"|메모)?\s*-?\s*0*(\d{1,6})\s*", ref or "", re.IGNORECASE)
+    if not m:
+        return (ref or "").strip().upper()
+    return f"{prefix.upper()}-{int(m.group(1)):0{digits}d}"
 
 
 def normalize_ref(ref: str, default_prefix: str = "CLR", digits: int = 4) -> str:
@@ -904,7 +986,22 @@ def rebuild_fts(conn) -> int:
     for (iid,) in conn.execute("SELECT id FROM item WHERE deleted_at IS NULL"):
         reindex_item(conn, iid)
         n += 1
+    if _has_table(conn, "memo"):
+        conn.execute("DELETE FROM memo_fts")
+        for (mid,) in conn.execute("SELECT id FROM memo"):
+            reindex_memo(conn, mid)
     return n
+
+
+def reindex_memo(conn, memo_id: int) -> None:
+    """메모 검색 색인 (0.8.0). 업무 색인(search_fts)과 섞지 않는다."""
+    m = conn.execute("SELECT * FROM memo WHERE id = ?", (memo_id,)).fetchone()
+    conn.execute("DELETE FROM memo_fts WHERE rowid = ?", (memo_id,))
+    if m is None:
+        return
+    body = m["body"] if m["body"] == m["original_text"] else f"{m['body']} {m['original_text']}"
+    conn.execute("INSERT INTO memo_fts(rowid, ref, title, body, topic) VALUES(?,?,?,?,?)",
+                 (memo_id, m["ref"], m["title"], body, m["topic"] or ""))
 
 
 # --------------------------------------------------------------------------

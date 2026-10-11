@@ -180,7 +180,8 @@ def cmd_review(args, cfg):
         (now_s,))]
     outbox = {"done_since_last": [], "awaiting_confirm": [], "pending": 0, "failed": []}
     for r in conn.execute("SELECT o.*, i.ref AS item_ref, i.title AS item_title FROM outbox o LEFT JOIN item i ON i.id=o.item_id "
-                          "WHERE (o.status='done' AND o.done_at > ?) OR o.status IN ('awaiting_confirm','pending','failed') ORDER BY o.id",
+                          "WHERE ((o.status='done' AND o.done_at > ?) OR o.status IN ('awaiting_confirm','pending','failed')) "
+                          "AND o.op <> 'obsidian.memo' ORDER BY o.id",
                           (since,)):
         p = json.loads(r["payload"])
         entry = {"outbox_id": r["id"], "op": r["op"], "item_ref": r["item_ref"], "title": r["item_title"],

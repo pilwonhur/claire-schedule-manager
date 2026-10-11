@@ -1,6 +1,6 @@
 ---
 name: claire-schedule-manager
-version: 0.7.1
+version: 0.8.0
 description: >-
   교수님의 일정·업무를 Gmail(기관 메일 포워드 포함)·Google Calendar·Obsidian Tasks·Discord 이미지에서
   하나의 장부(SQLite)로 모아 아침 브리핑·확인 질문·진행 추적·검색을 제공한다. Claire 전용 Discord 채널에서
@@ -8,14 +8,15 @@ description: >-
   "Q-0007 15시" 같은 질문 답변, "끝냈어"·"완료" 같은 완료 보고, 이미지 업로드, "등록/일정/할일" 접두어 메시지,
   12:00·18:00 "미등록 일정 확인", 번호·승인 버튼 클릭(`Clicked "…"`), "전체 목록"·"할 일 전부"·"보고 다시",
   "기한 지남 전체 보기"·"진행 확인 전체 보기"·"지난 일정 보기", "처리 불필요"·"내 할 일 아님"·"보류"·"답변 대기"·"답 왔어"·
-  "계속 대기", "IROS 2026 → 문서" 같은 Tasks 문서 위치 답이 오면 반드시 이 스킬을 쓴다.
+  "계속 대기", "IROS 2026 → 문서" 같은 Tasks 문서 위치 답, "메모: …"·"이거 메모해줘"·"메모 보여줘"·"NAS 관련 메모 찾아줘"·
+  "해결된 메모도 보여줘"·"그 메모 해결됐어"·"이 메모를 할 일로 등록해줘"·`MEM-0001` 메모 버튼이 오면 반드시 이 스킬을 쓴다.
   수집·해석·브리핑·아침 보고(필요한 만큼만)·업무 현황(전체, 요청 시)·진행 확인·대기 재확인·질문 답변·완료(원문 Tasks 체크·
-  Daily 완료 기록)·진행·되돌리기·검색과 Calendar·Obsidian 반영(주제 문서 Tasks), 보고 전달 기록까지 동작한다.
+  Daily 완료 기록)·진행·되돌리기·검색과 Calendar·Obsidian 반영(주제 문서 Tasks), 보고 전달 기록, 업무와 분리된 메모함까지 동작한다.
 ---
 
-# Claire 통합 일정·업무 관리 (v0.7.1 — 아침 보고 간소화·대기 재확인·Tasks 주제 문서)
+# Claire 통합 일정·업무 관리 (v0.8.0 — 메모함: 업무와 분리된 기록)
 
-정본 설계: 프로젝트의 `PRD.md` v1.9. 이 문서는 판단 계층(Claire)이 지켜야 할 규칙과 절차만 적는다.
+정본 설계: 프로젝트의 `PRD.md` v2.1. 이 문서는 판단 계층(Claire)이 지켜야 할 규칙과 절차만 적는다.
 **스킬 파일은 고치지 않는다.** 규칙을 바꿔야 하면 교수님께 제안만 하고, 변경은 저장소 → 릴리스 → `claire-update`로 들어온다(§8).
 
 ## 0. 원칙 (PRD §1.3)
@@ -38,6 +39,9 @@ description: >-
    (`claire_buttons report`)는 오늘 · 기한 지남 한 쪽 · 진행 확인 최대 두 쪽 · 확인·상태 한 쪽이다. 도구가 상세(버튼)로 보일 업무를
    고르고 나머지는 키워드와 번호로 줄인다 — 줄인 업무도 상태·마감·추적은 그대로이고, "전체 보기"·"전체 목록"으로 모두 볼 수 있다.
    지난 일정은 기본 보고에서 빼되 시간이 지났다고 완료로 보지 않는다.
+10. **메모는 업무가 아니다 (0.8.0, 이슈 2026-10-11).** 교수님이 명시적으로 메모를 청하면(`메모:`, "메모해줘") `claire_memo`로만 저장한다.
+   문장에 날짜·행동이 있어도 일정·할 일·달력·알림을 만들지 않고, 기한 없는 할 일로 돌려 저장하지 않는다. 메모는 아침 보고·업무 현황·
+   진행 확인·Daily 완료에 나오지 않고 요청할 때만 보여 준다. Clio 글감과 다르다 — 글감으로 분류하거나 Clio 로 넘기지 않는다(§4.3).
 
 ## 1. 명령 요약
 
@@ -96,9 +100,23 @@ $S/claire_buttons agenda                           # 업무 현황 = "전체 목
 $S/claire_buttons agenda --view overdue|progress|past|waiting|done|questions   # "전체 보기" 버튼: 구역 하나 전체
 $S/claire_buttons resend [--id N]                  # 전송 실패·확인 없는 쪽만 다시
 $S/claire_check channel-target [--write]           # cron 턴에 보낼 채널(discord.send_to)
+
+# 메모함 (0.8.0, §4.3) — 업무와 분리. 대상: --memo MEM-0001 | --source-message <원래 메시지 id> | --find "문구"(후보 1건일 때만)
+$S/claire_memo add --text "<원문 그대로>" --message-id <id> --channel <id> [--part N] [--title "짧은 제목"] [--topic NAS] [--url <원문 링크>] [--captured-at ISO] [--related CLR-…|MEM-…]
+$S/claire_memo list [--status open|reference|resolved|not_needed|closed|all] [--q "NAS"] [--offset N]   # 보낼 때는 claire_buttons memos
+$S/claire_memo show <대상> [--format text]         # 원문·출처·연결·Obsidian 반영·이력
+$S/claire_memo status <대상> --to resolved|not_needed|reference|open [--reason "교수님이 말한 사유"] --message-id <지시 메시지 id>
+$S/claire_memo edit <대상> [--text "새 내용"] [--title …] [--topic …] --message-id <id>     # 처음 기록은 보관
+$S/claire_memo link <대상> --item CLR-0031 | --other MEM-0002 [--remove]   # 관련 업무·메모 (상태는 서로 안 바뀜)
+$S/claire_memo to-task <대상> [--title …] [--due-at …] [--kind task|deadline|reply|prep] --message-id <id>   # 명시 요청 때만
+$S/claire_memo sync --pending | --memo MEM-0001 [--overwrite]   # Obsidian 메모함 반영 재시도 (--overwrite 는 교수님이 원할 때만)
+$S/claire_memo export [--format md|json]           # 메모 내보내기
+$S/claire_buttons memos [--status …] [--q …] [--offset N]   # 메모 목록 메시지 (MEM 번호 버튼, 넘치면 "메모 더 보기 N")
+$S/claire_buttons actions --memo MEM-0001 [--detail]        # 메모 카드 (해결됨·불필요·참고 보관·다시 열기·상세·할 일로 등록)
 ```
 
 번호는 짧게 써도 된다: 도구는 `31`·`0031`·`clr31`을 `CLR-0031`로, `q7`을 `Q-0007`로 읽는다(버튼 만료 뒤 모바일 입력용).
+메모 번호는 `MEM-0001`이다. `claire_memo`·`actions --memo`는 `mem1`·`메모 1`·`1`을 `MEM-0001`로 읽는다(숫자만이면 메모 번호 — 업무 명령의 숫자와 다르다).
 단 `claire_apply --confirm/--cancel`에서 숫자만 쓰면 outbox id 이므로 항목은 `CLR-0031`·`clr31`로 넘긴다.
 
 ## 2. 06:00 정기 점검 절차 (PRD §8.1) — 순서 자체가 요구사항이다
@@ -314,13 +332,20 @@ OpenClaw cron(`claire-checkin`, `0 12,18 * * *`)이 "미등록 일정 확인을 
 | "이 항목 어디서 왔어?" | `claire_search trace --item CLR` / `history --item CLR` |
 | "김 교수 답 왔어", "보류 풀어" | `claire_store resume --item CLR` |
 | "이 발신자는 앞으로 제외해줘" | `claire_store ignore-sender --address a@b.c` (도메인이면 `--domain b.c`). 다음 수집부터 적용 |
-| **"사용법 알려줘", "어떻게 써?", "도움말", "뭘 할 수 있어?"** | `references/usage-guide.md`를 읽어 **§0 한눈에 보기 표를 먼저** 보내고, "더 자세히", "브리핑 부분", "완료 처리는?"처럼 요청하면 해당 절(§1~§10)을 원문 그대로 보낸다. 한 메시지가 길면 절 단위로 나눠 보낸다. 내용을 지어내지 않는다 |
+| **"사용법 알려줘", "어떻게 써?", "도움말", "뭘 할 수 있어?"** | `references/usage-guide.md`를 읽어 **§0 한눈에 보기 표를 먼저** 보내고, "더 자세히", "브리핑 부분", "완료 처리는?"처럼 요청하면 해당 절(§1~§11, 메모함은 §10)을 원문 그대로 보낸다. 한 메시지가 길면 절 단위로 나눠 보낸다. 내용을 지어내지 않는다 |
 | 승인 대기에 대한 `등록`, `CLR-0045 등록`, `45 47 등록`, `다 등록` | `claire_apply --confirm CLR-0045[,CLR-0047]` (또는 `all`) → 바로 `claire_apply` 실행 → 결과 보고. "달력에 넣지 마" → `--cancel` (기록은 남고 "표시 안 함"으로 보인다. 업무는 계속 추적) |
 | "승인 대기 뭐 있어?", "등록할 거 보여줘" | `claire_buttons approvals` 메시지 (지난 일정 포함이 필요하면 `--include-past`) |
 | "캘린더에 넣어줘" (이미 항목이 있는 일정·마감) | `claire_apply --request CLR --only calendar` → `claire_apply`. `nothing_to_request`면 이유(이미 등록됨 / 시각 없음)를 전하고, 시각이 없으면 묻는다 |
 | "버튼 다시", "목록 다시 보여줘" (버튼 만료) | 방금 보던 조회를 다시 실행해 새 버튼으로 보낸다(오늘 남은 일·승인 대기 등). 버튼은 24시간 뒤 만료된다 |
 | "지금 전체 점검", "메일만 다시" | §2 절차 (`on_demand` / `source_only` + `claire_sync gmail`) |
 | "오늘 남은 일", "이번 주 마감", "기한 지난 것" | `claire_search today/week/overdue`. 결과에 "데이터 기준 시각: `data_as_of`"를 붙인다. 항목 줄마다 번호 버튼(§5) |
+| `메모: …`, "이거 메모해줘", "메모로 남겨줘" (명시적인 메모 요청) | §4.3. `claire_memo add --text "<원문 그대로>" --message-id <id> --channel <id>` → 결과 `message` 그대로(번호 블록 ```MEM-0001``` 를 붙여 `claire_buttons build`). 일정·할 일을 만들지 않는다 |
+| "메모 보여줘" / "해결된 메모도 보여줘" / "메모 전체 보여줘" / "NAS 관련 메모 찾아줘" | `claire_buttons memos` / `--status closed` / `--status all` / `--q "NAS"` → messages[] 를 보낸다(전달 기록 없음). 버튼 `메모 더 보기 81 …`·`닫힌 메모 보기`·`참고 보관 메모 보기`·`메모 전체 보기`·`열린 메모 보기`도 같은 명령(`--offset 80`, 라벨의 보기·검색어 유지) |
+| `Clicked "MEM-0001".`, `mem1`, `메모 1` | `claire_buttons actions --memo MEM-0001` 카드를 보낸다. DB 무변경 |
+| `Clicked "MEM-0001 해결됨".` / `"… 불필요"` / `"… 참고 보관"` / `"… 다시 열기"`, "그 메모 해결됐어", "이건 이제 필요 없어", "참고용으로 보관해줘", "다시 열어줘" | `claire_memo status --memo MEM-0001 --to resolved` / `not_needed` / `reference` / `open` `--message-id <지시 메시지>` (+ 교수님이 말한 사유만 `--reason`). 번호가 없으면 답장 대상 메시지의 `MEM-` 번호(1건일 때), 메모 원래 메시지에 답장했으면 `--source-message <그 id>`. 후보가 여럿이면(`ambiguous_memo`) 후보를 보여 드리고 묻는다 |
+| `Clicked "MEM-0001 상세".` | `claire_buttons actions --memo MEM-0001 --detail` |
+| "그 메모 내용 수정해줘: …", "주제는 NAS로" | `claire_memo edit --memo MEM-0001 --text "…"` / `--topic NAS` |
+| `Clicked "MEM-0001 할 일로 등록".`, "이 메모를 할 일로 등록해줘" | `claire_memo to-task --memo MEM-0001 [--title "…"] [--due-at …] --message-id <id>` — 날짜·알림은 교수님이 말한 것만. 결과의 새 `CLR-` 번호를 블록으로 붙여 전한다. 메모는 그대로 열림(할 일 연결됨) |
 | 그 외 자연어 | 평소 대화. DB 무변경 |
 
 ### 4.1 답변 매칭 규칙 (§7.3)
@@ -345,6 +370,35 @@ OpenClaw cron(`claire-checkin`, `0 12,18 * * *`)이 "미등록 일정 확인을 
 - 재확인일 전에는 묻지 않는다. 재확인일부터는 아침 보고의 진행 확인(또는 기한 지남)에 "재확인일·김 교수"로 매일 올라오고, 카드 버튼은
   대기면 `답 왔어`·`계속 대기`, 보류면 `재개`·`계속 보류`다. 답이 없어도 완료하거나 영구히 숨기지 않는다.
 - 대기 상대(`waiting_on`)와 기다리는 내용(`--about`)을 남긴다. 계속 대기는 상대·내용을 그대로 두고 다음 확인일만 새로 잡는다.
+
+### 4.3 메모함 (0.8.0, 이슈 2026-10-11)
+
+메모는 생활·업무에서 잊지 않으려는 단편적인 지식·생각·질문·중요하지 않은 할 일이다. 일정·할 일과 **입력 채널과 찾기는 같고, 데이터와
+자동화는 따로다.**
+
+- **언제 메모인가:** 교수님이 명시적으로 청할 때만 — `메모:` 접두어, "메모해줘", "메모로 남겨". 일반 대화·질문을 자동으로 저장하지 않는다.
+  메모 요청과 할 일 지시가 한 문장에서 충돌하거나 무엇을 남길지 애매하면 그 부분만 짧게 묻는다.
+- **명시적 메모 요청이 우선이다.** "메모: 내일 시간 되면 X 알아볼 것"처럼 날짜·행동 표현이 있어도 메모로 저장하고 일정·할 일·알림을
+  만들지 않는다. 마감·우선순위·재확인일을 묻지 않는다.
+- **원문 그대로 저장:** `--text`에 교수님 문장 그대로(접두어 포함 가능). 요약만 남기지 않는다 — 짧은 제목은 `--title`로 따로(없으면
+  도구가 첫 줄 앞부분). 주제가 분명하면 `--topic`. `--message-id`·`--channel`은 반드시 — 같은 메시지를 다시 처리해도 중복이 생기지 않는다.
+  한 메시지에 메모가 여럿이면 `--part 1`, `--part 2`…로 나눠 저장한다. 비슷한 내용의 다른 메시지를 임의로 합치지 않는다.
+- **메모와 할 일을 함께 청하면** 각각 저장한다: 할 일은 평소대로(`ingest-discord` → `propose`), 메모는 `claire_memo add`, 그다음
+  `claire_memo link --memo MEM --item CLR`. 같은 문장을 의미 없이 업무로 또 만들지 않는다.
+- **결과 전달:** 도구 `message`를 그대로 — 저장 결과와 Obsidian 반영 결과가 따로 적혀 있다("저장했지만 Obsidian 반영은 실패, 자동 재시도",
+  "Obsidian 에서 고친 블록이라 덮어쓰지 않음"). `ok: true` 전에는 저장했다고 말하지 않는다. 번호 블록(```MEM-0001```)을 붙인다.
+- **상태:** 해결됨(resolved)·불필요(not_needed)·참고 보관(reference)·다시 열기(open). 삭제가 아니다(이력·원문 보관). 사유는 교수님이
+  말했을 때만 `--reason` — 지어내거나 사유를 받으려고 막지 않는다. 지식·생각은 해결 대상이 아니다 — "참고용"이면 reference.
+- **대상 고르기:** 번호(버튼·`mem1`) → 답장 대상 메시지의 `MEM-` 번호 → 메모 원래 메시지에 답장했으면 `--source-message`. 여러 후보면
+  후보를 보여 드리고 고르게 한다. 최근 메모를 임의로 바꾸지 않는다.
+- **할 일로:** "이 메모를 할 일로 등록해줘"처럼 명확할 때만 `to-task`. 기존 업무 생성 절차로 만들어지고(중요도·Tasks 자리 그대로)
+  메모와 연결된다. 메모를 지우거나 해결로 바꾸지 않는다. 다시 요청해도 이미 만든 업무를 돌려준다. 업무 완료와 메모 해결은 서로 바꾸지 않는다.
+  기존 일정·할 일을 중요도가 낮다고 메모로 옮기지 않는다.
+- **보여 주기:** 요청할 때만(`claire_buttons memos`). 아침 보고·업무 현황·12/18시 확인·진행 확인에 메모를 넣지 않고 매일 독촉하지 않는다.
+  "전체 목록"(업무)과 "메모 전체"는 다르다. 메모 해결은 업무 완료 수나 Daily `완료한 일`에 들어가지 않는다.
+- **Obsidian:** 메모 전용 노트(`01 Inbox/Claire 메모함.md`, 설정 `memo.note`)에 메모 블록으로 적힌다(체크박스 아님 — Tasks 로 다시
+  수집되지 않는다). Obsidian 에서 고친 내용은 Claire 로 돌아오지 않는다(0.8.0). 고친 블록은 덮어쓰지 않고 보류로 알린다 — 교수님이
+  고친 내용을 Discord 로 말하면 `edit`, Claire 내용으로 되돌리라 하면 `sync --memo … --overwrite`. 블록 밖 글은 건드리지 않는다.
 
 ## 5. 응답 규칙
 
@@ -474,6 +528,9 @@ OpenClaw cron(`claire-checkin`, `0 12,18 * * *`)이 "미등록 일정 확인을 
 - 교수님이 정한 중요도·확인 주기·다음 확인일을 바꾸는 것. 예전 "등록 안 함" 기록을 업무 취소로 해석하는 것.
 - 자동 마감 표시끼리 겹친 것을 일정 충돌로 알리는 것.
 - 근거(원문·지시·승인된 템플릿) 없이 준비 자료 작성 같은 의무를 만들어 내는 것. 불필요 업무를 일괄 취소하는 것.
+- 메모를 기한 없는 할 일로 저장하는 것, 메모 문장의 날짜로 일정·알림을 만드는 것, 메모를 아침 보고·진행 확인에 넣거나 독촉하는 것.
+  명시 요청 없이 대화를 메모로 저장하거나 메모를 할 일로 바꾸는 것. 메모 해결 사유를 지어내는 것. 메모를 Clio 글감으로 넘기는 것.
+  Obsidian 메모함 노트를 직접 고치는 것(쓰기는 `claire_memo`·`claire_apply`만).
 
 ## 7. 참고 문서
 

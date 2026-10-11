@@ -61,7 +61,25 @@ def cmd_md(args, cfg):
         project = (r.get("project") or "").replace("|", "\\|")    # f-string 안 역슬래시는 3.12 부터만 허용
         lines.append(f"| {r['ref']} | {r['kind']} | {r['status']} | {title} | {when[:16]} | {project} |")
     atomic_write_text(out_dir / "claire-items.md", "\n".join(lines) + "\n")
-    return {"out": str(out_dir), "files": ["claire-items.md"], "items": len(rows)}
+    files = ["claire-items.md"]
+    # 0.8.0: 메모함 (업무와 따로). 되돌리기(이전 버전 설치) 뒤에도 메모를 읽을 수 있게 백업마다 남긴다.
+    memos = [dict(r) for r in conn.execute("SELECT * FROM memo ORDER BY id")] if conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='memo'").fetchone() else []
+    if memos:
+        ko = {"open": "열림", "reference": "참고 보관", "resolved": "해결됨", "not_needed": "불필요"}
+        ml = ["# Claire 메모함", "", f"내보낸 시각: {ts} · 메모 {len(memos)}건", ""]
+        for m in memos:
+            ml += [f"## {m['ref']} · {m['title']}", f"- 상태: {ko.get(m['status'], m['status'])} · 기록 {m['recorded_at'][:16]}"
+                   + (f" · 주제 {m['topic']}" if m["topic"] else "")
+                   + (f" · 정리 사유: {m['status_reason']}" if m["status_reason"] else ""),
+                   f"- 출처: {m['source_platform']} {m['source_message_id'] or ''}".rstrip(), ""]
+            ml += [f"> {l}" if l.strip() else ">" for l in m["body"].split("\n")]
+            if m["body"] != m["original_text"]:
+                ml += ["", "처음 기록:"] + [f"> {l}" if l.strip() else ">" for l in m["original_text"].split("\n")]
+            ml.append("")
+        atomic_write_text(out_dir / "claire-memos.md", "\n".join(ml) + "\n")
+        files.append("claire-memos.md")
+    return {"out": str(out_dir), "files": files, "items": len(rows), "memos": len(memos)}
 
 
 def build_parser():

@@ -20,6 +20,8 @@ op
   calendar.update      교수님 지시로 시각 변경 → Calendar patch → 항목 미러링
   obsidian.daily_done  완료한 날 Daily `## 완료한 일` 에 한 줄 (0.5.0. 완료 취소·완료일 정정이면 옮기거나 지운다)
   discord.notice       Claire 가 채널에 전달할 문구 (실행은 하지 않고 to_deliver 로 돌려준다)
+  obsidian.memo        메모함 노트의 메모 블록을 메모 내용에 맞춘다 (0.8.0, 업무 아님 — item_id 없음). 교수님이 Obsidian 에서
+                       블록을 고쳤으면 덮어쓰지 않고 바로 failed(재시도 없음, claire_memo sync --overwrite 로만)
 
 실패는 지수 백오프(1·5·15·60·240분)로 최대 5회 재시도 뒤 failed. 볼트 파일이 읽은 뒤 바뀌면 쓰지 않고 다음으로 미룬다 (TC19).
 쓰기 토큰이 없으면 calendar.* 은 시도 횟수를 늘리지 않고 건너뛴다.
@@ -39,12 +41,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "connectors"))
 from claire_core import (  # noqa: E402
     ClaireError, connect, get_item, log_activity, now_dt, now_iso, parse_iso, reindex_item, run_cli, tx,
 )
+import claire_memos  # noqa: E402
 import claire_ops as ops  # noqa: E402
 import google_api  # noqa: E402
 import obsidian_tasks  # noqa: E402
 
 OPS = ("obsidian.assign_id", "obsidian.check_task", "obsidian.add_task", "obsidian.move_task", "obsidian.daily_done",
-       "calendar.create", "calendar.update", "discord.notice", "discord.brief")
+       "calendar.create", "calendar.update", "discord.notice", "discord.brief", "obsidian.memo")
 ONLY = {"calendar": ("calendar.create", "calendar.update"), "tasks": ("obsidian.add_task",)}
 
 
@@ -310,7 +313,7 @@ class _Skip(Exception):
 HANDLERS = {"obsidian.assign_id": op_assign_id, "obsidian.check_task": op_check_task, "obsidian.add_task": op_add_task,
             "obsidian.move_task": op_move_task,
             "obsidian.daily_done": op_daily_done, "calendar.create": op_calendar_create,
-            "calendar.update": op_calendar_update}
+            "calendar.update": op_calendar_update, claire_memos.OP: claire_memos.op_memo}
 
 
 # --------------------------------------------------------------------------
@@ -375,8 +378,11 @@ def cmd_run(args, cfg):
         except Exception as e:  # noqa: BLE001
             msg = e.message if isinstance(e, ClaireError) else f"{type(e).__name__}: {e}"
             attempts = row["attempts"] + 1
+            code = e.code if isinstance(e, ClaireError) else None
             with tx(conn):
-                if attempts >= max_attempts:
+                if row["op"] == claire_memos.OP:
+                    claire_memos.mark_failed(conn, payload["memo"], code or "error", msg)
+                if attempts >= max_attempts or code in claire_memos.NO_RETRY:
                     conn.execute("UPDATE outbox SET status='failed', attempts=?, last_error=?, done_at=? WHERE id=?",
                                  (attempts, msg[:500], now_s, row["id"]))
                     failed.append({"outbox_id": row["id"], "op": row["op"], "item_ref": ref, "error": msg, "attempts": attempts})
@@ -418,6 +424,8 @@ def _describe(op: str, p: dict) -> str:
         return f"🆔 부여: {p.get('external_key')}"
     if op == "obsidian.daily_done":
         return f"Daily {p.get('day')} 완료 기록: {p.get('title')}" if p.get("day") else f"Daily 완료 기록 삭제: {p.get('ref')}"
+    if op == claire_memos.OP:
+        return f"메모함 반영: {p.get('memo')}"
     return op
 
 

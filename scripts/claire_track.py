@@ -1274,16 +1274,19 @@ def exposure_gaps(conn, cfg, now: datetime) -> list[dict]:
 
 
 def health(conn, cfg, now: datetime, exclude_kind_today: str | None = None) -> dict:
+    # 0.8.0: 메모함 반영(obsidian.memo)은 업무 반영이 아니다 — 업무 실패 목록에 섞지 않고 memo_sync 로 건수만
     failed_ops = [{"item_ref": r["ref"], "title": r["title"], "op": r["op"], "error": r["last_error"]}
                   for r in conn.execute("SELECT o.op, o.last_error, i.ref, i.title FROM outbox o LEFT JOIN item i "
-                                        "ON i.id=o.item_id WHERE o.status='failed' ORDER BY o.id")]
+                                        "ON i.id=o.item_id WHERE o.status='failed' AND o.op <> 'obsidian.memo' ORDER BY o.id")]
     retrying = [{"item_ref": r["ref"], "title": r["title"], "op": r["op"], "attempts": r["attempts"]}
                 for r in conn.execute("SELECT o.op, o.attempts, i.ref, i.title FROM outbox o LEFT JOIN item i "
-                                      "ON i.id=o.item_id WHERE o.status='pending' AND o.attempts > 0 ORDER BY o.id")]
+                                      "ON i.id=o.item_id WHERE o.status='pending' AND o.attempts > 0 "
+                                      "AND o.op <> 'obsidian.memo' ORDER BY o.id")]
     unreviewed = [r["ref"] for r in conn.execute(
         "SELECT ref FROM item WHERE deleted_at IS NULL AND (priority_source='unreviewed' OR priority_source IS NULL) "
         "AND status IN (%s) ORDER BY id" % ",".join("?" * len(OPEN_STATUSES)), OPEN_STATUSES)]
-    return {"failed_ops": failed_ops, "retrying_ops": retrying,
+    import claire_memos
+    return {"failed_ops": failed_ops, "retrying_ops": retrying, "memo_sync": claire_memos.sync_issues(conn),
             "delivery": delivery_issues(conn, cfg, now, exclude_kind_today=exclude_kind_today),
             "exposure_gaps": exposure_gaps(conn, cfg, now), "importance_unreviewed": unreviewed}
 
@@ -1314,6 +1317,10 @@ def health_text(h: dict) -> str | None:
     if late:
         lines.append(f"  진행 확인 늦음 {len(late)}건 ({', '.join(g['ref'] for g in late[:5])}"
                      + (f" 외 {len(late) - 5}건" if len(late) > 5 else "") + ") — 차례대로 보고에 올립니다")
+    ms = h.get("memo_sync") or {}
+    if ms.get("failed") or ms.get("conflict"):
+        lines.append(f"  메모함 Obsidian 반영 실패 {len(ms.get('failed', []))}건·보류 {len(ms.get('conflict', []))}건 "
+                     "(메모는 저장됨, 업무 아님 — claire_memo sync --pending)")
     if h["importance_unreviewed"]:
         lines.append(f"  중요도 검토 필요 {len(h['importance_unreviewed'])}건 (직접 요청/단체 요청 분류 전 — Claire 가 확인 중)")
     if not lines:

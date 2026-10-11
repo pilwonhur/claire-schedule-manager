@@ -179,6 +179,13 @@ def run_integrity(conn, cfg=None) -> dict:
         "relation.to": "SELECT COUNT(*) c FROM relation r LEFT JOIN item i ON i.id=r.to_item_id WHERE i.id IS NULL",
         "activity_log.item": "SELECT COUNT(*) c FROM activity_log a WHERE a.item_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM item i WHERE i.id=a.item_id)",
     }
+    if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='memo'").fetchone():     # 0.8.0 메모함
+        orphan_sql.update({
+            "memo_log.memo": "SELECT COUNT(*) c FROM memo_log l LEFT JOIN memo m ON m.id=l.memo_id WHERE m.id IS NULL",
+            "memo_link.task": "SELECT COUNT(*) c FROM memo_link l WHERE l.kind='task' AND NOT EXISTS (SELECT 1 FROM item i WHERE i.id=l.target_id)",
+            "memo_link.memo": "SELECT COUNT(*) c FROM memo_link l WHERE NOT EXISTS (SELECT 1 FROM memo m WHERE m.id=l.memo_id) "
+                              "OR (l.kind='memo' AND NOT EXISTS (SELECT 1 FROM memo m WHERE m.id=l.target_id))",
+        })
     for name, sql in orphan_sql.items():
         n = conn.execute(sql).fetchone()["c"]
         if n:
@@ -199,10 +206,14 @@ def run_integrity(conn, cfg=None) -> dict:
         "(SELECT 1 FROM question q WHERE q.item_id=i.id AND q.status='open')"):
         add("needs_info_without_question", f"{r['ref']} 는 needs_info 인데 열린 질문이 없습니다")
 
-    # outbox 실패 잔량
-    n = conn.execute("SELECT COUNT(*) c FROM outbox WHERE status='failed'").fetchone()["c"]
+    # outbox 실패 잔량 (0.8.0: 메모함 반영은 따로 센다 — 업무 반영 실패와 섞지 않는다)
+    n = conn.execute("SELECT COUNT(*) c FROM outbox WHERE status='failed' AND op <> 'obsidian.memo'").fetchone()["c"]
     if n:
         add("outbox_failed", f"outbox 실패 {n}건")
+    n = conn.execute("SELECT COUNT(*) c FROM outbox WHERE status='failed' AND op = 'obsidian.memo'").fetchone()["c"]
+    if n:
+        add("memo_sync_failed", f"메모함 Obsidian 반영 실패·보류 {n}건 (메모는 저장됨 — claire_memo sync --pending, "
+                                "Obsidian 에서 고친 블록이면 --memo … --overwrite)")
 
     # 보고 전송 실패 잔량 (0.6.0) — 재전송하면 사라진다
     n = conn.execute("SELECT COUNT(*) c FROM delivery WHERE status='failed'").fetchone()["c"]
@@ -227,7 +238,10 @@ def run_integrity(conn, cfg=None) -> dict:
             add("attachment_hash", f"첨부 해시 불일치: {r['stored_path']}")
 
     # ref 중복·공백
-    for table, label in (("item", "항목"), ("question", "질문")):
+    ref_tables = [("item", "항목"), ("question", "질문")]
+    if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='memo'").fetchone():
+        ref_tables.append(("memo", "메모"))
+    for table, label in ref_tables:
         refs = [r["ref"] for r in conn.execute(f"SELECT ref FROM {table}")]
         if len(refs) != len(set(refs)):
             add("ref_duplicate", f"{label} 번호가 중복되었습니다")
