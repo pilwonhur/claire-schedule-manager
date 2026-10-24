@@ -4200,6 +4200,44 @@ class InstallTest(unittest.TestCase):
         self.assertTrue((self.tmp / "home" / ".claire-schedule-manager" / "skill-prev" / "scripts" / "claire_core.py").exists())
         self.assertFalse((self.tmp / "data" / "skill-prev").exists())
 
+    def test_install_swaps_files_so_running_scripts_keep_old_copy(self):
+        """0.9.1: install.sh 는 파일을 제자리에 덮어쓰지 않고 바꿔 끼운다 — 실행 중인 get.sh 는 옛 내용을 끝까지 읽는다."""
+        a = self.repo_copy(self.tmp / "a")
+        self.run_sh("bash", str(a / "install.sh"))
+        inst = self.tmp / "skill" / "get.sh"
+        old = inst.read_bytes()
+        b = self.repo_copy(self.tmp / "b", "9.9.9")
+        (b / "get.sh").write_bytes(b"#!/usr/bin/env bash\n# changed in 9.9.9\n" + (b / "get.sh").read_bytes()[len(b"#!/usr/bin/env bash\n"):])
+        with open(inst, "rb") as running:                 # claire-update 가 지금 읽고 있는 get.sh
+            self.run_sh("bash", str(b / "install.sh"))
+            self.assertEqual(running.read(), old)         # 열린 사본은 그대로
+        self.assertIn(b"# changed in 9.9.9", inst.read_bytes())
+        self.assertTrue(os.access(self.tmp / "skill" / "scripts" / "claire_relocate", os.X_OK))
+        self.assertEqual(list((self.tmp / "skill").rglob(".*.claire-new-*")), [])
+
+    def test_claire_update_exits_cleanly_when_get_sh_changes(self):
+        """0.9.0 업데이트 때 'get.sh: syntax error' — 새 get.sh 가 달라도 claire-update 는 깔끔하게 끝난다."""
+        origin = self.repo_copy(self.tmp / "origin")
+        g = lambda *a: self.run_sh("git", *a, cwd=origin)   # noqa: E731
+        g("init", "-q", "-b", "main"); g("add", "-A"); g("commit", "-qm", "base")
+        cur = claire_core.CLAIRE_VERSION
+        g("tag", f"v{cur}")
+        self.env["CLAIRE_REPO_URL"] = str(origin)
+        self.run_sh("bash", str(origin / "get.sh"), "--skip-tests")
+        core = origin / "scripts" / "claire_core.py"
+        core.write_text(core.read_text(encoding="utf-8").replace(f'CLAIRE_VERSION = "{cur}"', 'CLAIRE_VERSION = "99.0.0"'),
+                        encoding="utf-8")
+        (origin / "VERSION").write_text("99.0.0\n", encoding="utf-8")
+        gs = origin / "get.sh"                            # 다음 버전의 get.sh 는 길이·줄 위치가 다르다
+        gs.write_text(gs.read_text(encoding="utf-8").replace("set -euo pipefail\n", "set -euo pipefail\n" + "# pad\n" * 40, 1),
+                      encoding="utf-8")
+        g("commit", "-qam", "next"); g("tag", "v99.0.0")
+        p = self.run_sh(str(self.tmp / "bin" / "claire-update"), "--skip-tests")
+        self.assertEqual(p.returncode, 0)
+        self.assertNotIn("syntax error", p.stderr)
+        self.assertEqual(p.stdout.count("업데이트 완료"), 1, p.stdout[-1500:])
+        self.assertIn("# pad", (self.tmp / "skill" / "get.sh").read_text(encoding="utf-8"))
+
     def test_get_sh_installs_latest_tag_pins_and_checks(self):
         origin = self.repo_copy(self.tmp / "origin")
         g = lambda *a: self.run_sh("git", *a, cwd=origin)   # noqa: E731

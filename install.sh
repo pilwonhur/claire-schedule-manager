@@ -112,7 +112,7 @@ fi
 
 mkdir -p "$SKILL_DIR"
 python3 - "$SRC" "$SKILL_DIR" "${PAYLOAD[@]}" <<'PY'
-import filecmp, shutil, sys
+import filecmp, os, shutil, sys
 from pathlib import Path
 
 src, dst, *payload = sys.argv[1:]
@@ -143,7 +143,16 @@ for rel in sorted(want):
     else:
         added += 1
     d.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(s, d)
+    # 제자리에 덮어쓰지 않고 새 파일로 바꿔 끼운다(같은 폴더 임시 파일 → os.replace).
+    # 지금 실행 중인 스크립트(claire-update 가 돌리는 get.sh, 예약 실행 중인 도구)는 옛 파일을 끝까지 읽는다.
+    # 제자리에 쓰면 bash 가 바뀐 파일의 중간부터 이어 읽어 엉뚱한 줄을 실행할 수 있다(0.9.0 업데이트 때 syntax error 로 드러남).
+    tmp = d.with_name(f".{d.name}.claire-new-{os.getpid()}")
+    try:
+        shutil.copy2(s, tmp)
+        os.replace(tmp, d)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
 removed = 0
 for rel in sorted(have - want):
     (dst / rel).unlink()

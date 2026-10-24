@@ -147,4 +147,6 @@ fi
 # 4) 설치
 GIT_TAG_ARG=""
 [ "$MODE" = "main" ] || GIT_TAG_ARG="$TARGET"
-CLAIRE_INSTALLER="get.sh $TARGET" CLAIRE_GIT_TAG="$GIT_TAG_ARG" bash "$SRC_DIR/install.sh"
+# install.sh 가 이 파일(get.sh)도 새 버전으로 바꾼다. bash 는 스크립트를 읽어 가며 실행하므로
+# 설치 뒤 이 파일에서 더 읽지 않도록 같은 줄에서 끝낸다.
+CLAIRE_INSTALLER="get.sh $TARGET" CLAIRE_GIT_TAG="$GIT_TAG_ARG" bash "$SRC_DIR/install.sh"; exit $?
