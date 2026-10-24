@@ -4057,6 +4057,42 @@ class V090LocationTest(unittest.TestCase):
             if (self.tmp / "casedir").exists():                              # 대소문자 무시 파일 시스템
                 self.assertTrue(claire_paths.same_path(cased, self.tmp / "casedir"))
 
+    def test_location_checks_never_read_live_db_file(self):
+        """같은 프로세스가 SQLite 연결을 쥔 채 장부 파일을 open/close 하면 POSIX 잠금이 풀려 다른 프로세스가 WAL 을 지울 수 있다
+        (일부 SQLite 빌드에서 쓴 기록 유실 — CI 의 python.org 빌드에서 재현). 위치 판단은 살아 있는 장부를 일반 파일로 읽지 않는다."""
+        self.make_legacy()
+        db = self.legacy / "claire.db"
+        self.assertGreaterEqual(db.stat().st_size, 4096)
+        import builtins
+        real_open = builtins.open
+
+        def guarded_open(f, *a, **k):
+            if str(f).endswith("claire.db"):
+                raise AssertionError(f"장부 파일을 일반 파일로 열었음: {f}")
+            return real_open(f, *a, **k)
+        with patched_home(self.env):
+            import claire_paths
+            with mock.patch("builtins.open", guarded_open):
+                self.assertFalse(claire_paths.is_tombstone(db))
+                self.assertTrue(claire_paths.has_db(self.legacy))
+                self.assertEqual(claire_paths.resolve().path, self.legacy)
+            # 표지 문구는 크기 기준 안에 든다 (긴 경로 포함)
+            self.assertLess(len(claire_paths.tombstone_text("/" + "x" * 1024, "20261025T000000", "t").encode()),
+                            claire_paths.TOMBSTONE_MAX_BYTES)
+            # 실제 동작: 연결을 쥔 채 위치 판단 → 다른 프로세스가 열고 닫음 → 이어 쓴 기록이 사라지지 않는다
+            conn = claire_core.connect()
+            try:
+                conn.execute("INSERT INTO meta(key,value) VALUES('probe1','1')")
+                claire_paths.clear_cache(); claire_paths.resolve(); claire_paths.has_db(self.legacy)
+                self.sh("claire_check", "integrity")
+                conn.execute("INSERT INTO meta(key,value) VALUES('probe2','2')")
+                code = ("import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); "
+                        "print(c.execute(\"SELECT COUNT(*) FROM meta WHERE key LIKE 'probe%'\").fetchone()[0])")
+                out = subprocess.run([sys.executable, "-c", code, str(db)], capture_output=True, text=True, check=True).stdout
+                self.assertEqual(out.strip(), "2")
+            finally:
+                conn.close()
+
     # -- registry · 백업 보존 · 가림 -----------------------------------------
     def test_registry_update_is_scoped_and_locked(self):
         import claire_relocation as R

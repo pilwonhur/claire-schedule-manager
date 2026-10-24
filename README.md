@@ -44,7 +44,7 @@ scripts/              결정론적 도구 (Python 3.11+, 표준 라이브러리�
   claire_export       json | md
 connectors/           Google OAuth·REST(읽기/쓰기 토큰 분리), Obsidian Tasks 파서·원자적 쓰기, Obsidian 메모함 블록, Discord 첨부
 references/           브리핑 형식, 제안 JSON 규격, 스키마, 진단, 복구 정책, 활용 시나리오(usage-guide.md)
-tests/                156개 테스트 (Google API 는 기록된 fixture 로 대체, 설치·업그레이드 경로 포함)
+tests/                157개 테스트 (Google API 는 기록된 fixture 로 대체, 설치·업그레이드 경로 포함)
 docs/manual.md        사용 안내
 VERSION               배포 버전 (claire_core.CLAIRE_VERSION·SKILL.md·CHANGELOG 와 같아야 한다 — 테스트·CI 가 검사)
 get.sh                설치·업그레이드 (GitHub 릴리스 태그) · install.sh 실제 설치 · release.sh 릴리스(관리자)

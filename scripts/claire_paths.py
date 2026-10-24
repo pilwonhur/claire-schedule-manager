@@ -24,6 +24,7 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+import stat
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -167,10 +168,23 @@ def write_json_atomic(path: Path, data: dict, mode: int = 0o600) -> None:
     os.replace(tmp, path)
 
 
+TOMBSTONE_MAX_BYTES = 4096
+
+
 def is_tombstone(db: Path) -> bool:
+    """claire.db 자리에 놓인 은퇴 표지(작은 텍스트 파일)인가.
+    살아 있는 장부는 일반 파일 읽기로 열지 않는다: SQLite 연결을 쥔 프로세스가 같은 파일을 open/close 하면
+    그 프로세스의 POSIX 잠금이 모두 풀리고, 다른 프로세스가 자기를 마지막 연결로 보고 WAL 을 지워 기록이 사라질 수 있다.
+    비어 있지 않은 Claire 장부는 한 페이지(4096바이트) 이상이고 표지는 그보다 훨씬 작으므로, 크기를 먼저 보고 작은 파일만 읽는다."""
+    try:
+        st = os.stat(db)
+    except OSError:
+        return False
+    if not stat.S_ISREG(st.st_mode) or not 0 < st.st_size < TOMBSTONE_MAX_BYTES:
+        return False
     try:
         with open(db, "rb") as fh:
-            head = fh.read(len(TOMBSTONE_MAGIC))
+            head = fh.read(len(TOMBSTONE_MAGIC.encode()))
     except OSError:
         return False
     return head == TOMBSTONE_MAGIC.encode()
