@@ -7,16 +7,20 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
 import shutil
 import sqlite3
+import stat
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 import warnings
+from contextlib import closing, contextmanager
 from pathlib import Path
 
 warnings.simplefilter("ignore", ResourceWarning)
@@ -26,6 +30,14 @@ SCRIPTS = ROOT / "scripts"
 CONNECTORS = ROOT / "connectors"
 sys.path.insert(0, str(SCRIPTS))
 sys.path.insert(0, str(CONNECTORS))
+
+# 0.9.0: 테스트는 실제 홈(데이터 위치 기록·백업 루트 ~/SecretaryBackups·OpenClaw 예약)을 절대 건드리지 않는다.
+# 홈을 임시 폴더로 바꾸고, 실제 openclaw 를 부르지 않게 한다. 위치 시험은 테스트마다 자기 홈을 따로 만든다.
+_TEST_HOME = Path(tempfile.mkdtemp(prefix="claire-home-"))
+os.environ["HOME"] = str(_TEST_HOME)
+for _k in ("CLAIRE_HOME", "CLAIRE_BACKUP_ROOT", "CLAIRE_DATA_DIR", "CLAIRE_RELOCATION_ID", "CLAIRE_SKILL_DIR"):
+    os.environ.pop(_k, None)
+os.environ["CLAIRE_OPENCLAW_BIN"] = ""
 
 import claire_core  # noqa: E402
 import obsidian_tasks  # noqa: E402
@@ -40,6 +52,7 @@ class BaseTest(unittest.TestCase):
         self.vault = Path(tempfile.mkdtemp(prefix="claire-vault-"))
         self.inbound = Path(tempfile.mkdtemp(prefix="claire-inbound-"))
         (self.data / "config.json").write_text(json.dumps({
+            "backup_root": str(self.data / "backups"),
             "backup_mirror": str(self.mirror),
             "gmail": {"accounts": ["prof@example.com"],
                       "user_addresses": ["prof@example.com", "prof@univ.example"],
@@ -141,7 +154,7 @@ class ClaireTest(BaseTest):
         a = self.init()
         self.assertTrue(a["created"])
         self.assertEqual(a["schema_version"], claire_core.SCHEMA_VERSION)
-        for sub in ("secrets", "raw", "attachments", "exports", "backups", "logs"):
+        for sub in ("secrets", "raw", "attachments", "exports", "logs"):
             self.assertTrue((self.data / sub).is_dir(), sub)
         self.assertEqual((self.data / "secrets").stat().st_mode & 0o777, 0o700)
         b = self.init()
@@ -3301,12 +3314,810 @@ class V080Test(FixtureBase):
         return p
 
 
+def claire_paths_is_tombstone(p) -> bool:
+    import claire_paths
+    return claire_paths.is_tombstone(Path(p))
+
+
+@contextmanager
+def patched_home(env):
+    """테스트 프로세스 안에서 claire_relocation 함수를 부를 때 임시 홈을 쓰게 한다."""
+    import claire_paths
+    keys = ("HOME", "CLAIRE_DATA_DIR", "CLAIRE_OPENCLAW_BIN", "CLAIRE_HOME", "CLAIRE_BACKUP_ROOT", "CLAIRE_RELOCATION_ID")
+    saved = {k: os.environ.get(k) for k in keys}
+    try:
+        for k in keys:
+            if env.get(k) is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = env[k]
+        claire_paths.clear_cache()
+        yield
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        claire_paths.clear_cache()
+
+
+FAKE_OPENCLAW = r'''#!/usr/bin/env python3
+"""테스트용 openclaw: cron list/disable/enable 만 흉내 낸다. 호출을 기록한다 (실제 예약은 건드리지 않는다)."""
+import json, os, sys
+here = os.path.dirname(os.path.abspath(__file__))
+state, log = os.path.join(here, "cron.json"), os.path.join(here, "openclaw.log")
+with open(log, "a", encoding="utf-8") as fh:
+    fh.write(" ".join(sys.argv[1:]) + "\n")
+jobs = json.load(open(state, encoding="utf-8"))
+args = sys.argv[1:]
+call = " ".join(args[1:3])
+if os.environ.get("FAKE_OC_KILL_PARENT") == call:          # 호출한 이전 작업을 강제 종료 (중간에 죽은 상황)
+    os.kill(os.getppid(), 9)
+    sys.exit(1)
+if os.environ.get("FAKE_OC_FAIL") in (call, args[1] if len(args) > 1 else None):
+    print("simulated failure", file=sys.stderr)
+    sys.exit(1)
+if args[:2] == ["cron", "list"]:
+    agent = args[args.index("--agent") + 1] if "--agent" in args else None
+    out = [j for j in jobs if agent is None or j.get("agentId") == agent]
+    print(json.dumps({"jobs": out, "total": len(out), "offset": 0, "limit": 200, "hasMore": False}))
+elif args[:2] in (["cron", "disable"], ["cron", "enable"]):
+    for j in jobs:
+        if j["id"] == args[2]:
+            j["enabled"] = args[1] == "enable"
+    json.dump(jobs, open(state, "w", encoding="utf-8"))
+    print("ok")
+else:
+    sys.exit(2)
+'''
+
+SECRET_VALUE = "tok-SECRET-VALUE-0b5f"
+
+
+class V090LocationTest(unittest.TestCase):
+    """0.9.0: 데이터 위치 해석·이전·되돌리기 (이슈 2026-10-24 SEC-2026-005).
+    테스트마다 임시 홈을 만든다. 실제 홈·예약·registry 는 건드리지 않는다 (가짜 openclaw)."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="claire-v090-"))
+        self.home = self.tmp / "home"
+        self.home.mkdir()
+        self.legacy = self.home / "ClaireData"
+        self.new = self.home / "SecretaryData" / "services" / "schedule"
+        self.backups = self.home / "SecretaryBackups" / "schedule"
+        self.app = self.home / ".claire-schedule-manager"
+        self.oc = self.tmp / "oc"
+        self.oc.mkdir()
+        (self.oc / "openclaw").write_text(FAKE_OPENCLAW, encoding="utf-8")
+        os.chmod(self.oc / "openclaw", 0o755)
+        self.set_jobs()
+        self.env = {k: v for k, v in os.environ.items()
+                    if k not in ("CLAIRE_DATA_DIR", "CLAIRE_NOW", "CLAIRE_BACKUP_ROOT", "CLAIRE_HOME",
+                                 "CLAIRE_RELOCATION_ID", "CLAIRE_RELOCATE_TEST_CRASH_AFTER")}
+        self.env.update(HOME=str(self.home), CLAIRE_OPENCLAW_BIN=str(self.oc / "openclaw"),
+                        CLAIRE_OPENCLAW_WORKSPACE=str(self.tmp / "no-ws"))
+
+    def tearDown(self):
+        for p in self.tmp.rglob("*"):
+            try:
+                if p.is_dir() and not p.is_symlink():
+                    os.chmod(p, 0o700)
+            except OSError:
+                pass
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    # -- 헬퍼 ------------------------------------------------------------
+    def set_jobs(self, due_in_min=360):
+        now_ms = int(__import__("time").time() * 1000)
+        jobs = [{"id": "job-daily", "name": "Claire 일일 점검", "agentId": "claire", "declarationKey": "claire-daily-check",
+                 "enabled": True, "nextRunAtMs": now_ms + due_in_min * 60_000, "payload": {"message": "일일 점검"}},
+                {"id": "job-checkin", "name": "Claire 미등록 일정 확인", "agentId": "claire", "declarationKey": "claire-checkin",
+                 "enabled": True, "nextRunAtMs": now_ms + 9 * 3600_000},
+                {"id": "job-review", "name": "skill-collection-review-claire", "agentId": "claire",
+                 "declarationKey": "skill-collection-review:claire", "enabled": True, "nextRunAtMs": now_ms + 60_000},
+                {"id": "job-victoria", "name": "victoria-health-morning", "agentId": "victoria",
+                 "declarationKey": "victoria-health-morning", "enabled": True, "nextRunAtMs": now_ms + 60_000}]
+        (self.oc / "cron.json").write_text(json.dumps(jobs), encoding="utf-8")
+        (self.oc / "openclaw.log").write_text("", encoding="utf-8")
+
+    def oc_calls(self):
+        return [l for l in (self.oc / "openclaw.log").read_text(encoding="utf-8").splitlines() if l]
+
+    def jobs(self):
+        return {j["id"]: j for j in json.loads((self.oc / "cron.json").read_text(encoding="utf-8"))}
+
+    def proc(self, script, *args, env=None, **extra):
+        e = dict(env or self.env)
+        e.update({k: str(v) for k, v in extra.items()})
+        return subprocess.run([sys.executable, str(SCRIPTS / script), *[str(a) for a in args]],
+                              capture_output=True, text=True, env=e, timeout=600)
+
+    def sh(self, script, *args, ok=True, env=None, **extra):
+        p = self.proc(script, *args, env=env, **extra)
+        try:
+            out = json.loads(p.stdout)
+        except ValueError:
+            self.fail(f"{script} {args}: JSON 아님\nstdout={p.stdout[-2000:]}\nstderr={p.stderr[-2000:]}")
+        if ok:
+            self.assertTrue(out.get("ok"), f"{script} {args} 실패: {json.dumps(out, ensure_ascii=False)[:3000]}")
+        else:
+            self.assertFalse(out.get("ok"), f"{script} {args} 가 실패해야 함: {json.dumps(out, ensure_ascii=False)[:1500]}")
+        out["_stdout"] = p.stdout
+        return out
+
+    def make_legacy(self, wal=False, keep_pointer=True):
+        """0.8.x 기존 설치(~/ClaireData)를 흉내 낸 합성 데이터: 업무·질문·원문·첨부·메모·실패 outbox 1건·인증정보."""
+        L = self.legacy
+        (L / "secrets").mkdir(parents=True)
+        os.chmod(L / "secrets", 0o700)
+        for name, val in (("token.json", SECRET_VALUE), ("gmail-prof.json", SECRET_VALUE + "-2")):
+            (L / "secrets" / name).write_text(json.dumps({"refresh_token": val}), encoding="utf-8")
+            os.chmod(L / "secrets" / name, 0o600)
+        for d in ("vault", "inbound", "mirror"):
+            (self.tmp / d).mkdir(exist_ok=True)
+        (L / "config.json").write_text(json.dumps({
+            "obsidian": {"vault": str(self.tmp / "vault")}, "discord": {"inbound_media_dir": str(self.tmp / "inbound")},
+            "backup_mirror": str(self.tmp / "mirror"), "google": {"oauth_client_file": str(self.tmp / "client.json")},
+            "gmail": {"accounts": ["prof@example.com"]}}), encoding="utf-8")
+        self.sh("claire_check", "init")
+        img = self.tmp / "inbound" / "k.png"
+        img.write_bytes(b"\x89PNG synthetic attachment")
+        a = self.sh("claire_sync", "ingest-discord", "--message-id", "d1", "--attachment", img, "--text", "회의 자료",
+                    "--captured-at", "2026-10-20T09:00:00+09:00", "--channel-id", "c1")
+        self.att_path = L / a["attachments"][0]["stored_path"]
+        self.sh("claire_memo", "add", "--text", "NAS 교체 메모", "--no-sync", "--message-id", "m1")
+        with closing(sqlite3.connect(L / "claire.db")) as c:
+            c.execute("INSERT INTO item(ref,title,kind,status,created_at,updated_at) VALUES('CLR-0001','합성 업무','task','todo',"
+                      "'2026-10-20T09:00:00+09:00','2026-10-20T09:00:00+09:00')")
+            c.execute("INSERT INTO question(ref,item_id,field,question,status,created_at) VALUES('Q-0001',1,'due_at','언제?','open',"
+                      "'2026-10-20T09:00:00+09:00')")
+            c.execute("INSERT INTO outbox(op,payload,dedupe_key,attempts,last_error,status,created_at) VALUES"
+                      "('obsidian.check_task','{}','fx-failed-1',3,'fixture','failed','2026-10-20T09:00:00+09:00')")
+            c.commit()
+        claire_core_rebuild = [sys.executable, "-c",
+                               "import sys,sqlite3; sys.path.insert(0, sys.argv[1]); import claire_core as c; "
+                               "k=sqlite3.connect(sys.argv[2]); k.row_factory=sqlite3.Row; c.rebuild_fts(k); k.commit(); k.close()",
+                               str(SCRIPTS), str(L / "claire.db")]
+        subprocess.run(claire_core_rebuild, check=True, env=self.env)
+        if not keep_pointer:
+            (self.app / "data-location.json").unlink()
+        if wal:
+            # 중간에 죽은 writer: WAL 에만 있고 장부 파일에 아직 합쳐지지 않은 기록
+            code = ("import sqlite3,os,sys; c=sqlite3.connect(sys.argv[1]); c.execute('PRAGMA journal_mode=WAL'); "
+                    "c.execute(\"INSERT INTO meta(key,value) VALUES('wal_only_probe','WAL-ONLY')\"); c.commit(); os._exit(0)")
+            subprocess.run([sys.executable, "-c", code, str(L / "claire.db")], check=True)
+            self.assertGreater((L / "claire.db-wal").stat().st_size, 0)
+            with closing(sqlite3.connect(f"file:{L / 'claire.db'}?immutable=1", uri=True)) as c:
+                self.assertIsNone(c.execute("SELECT value FROM meta WHERE key='wal_only_probe'").fetchone())
+
+    def tree_state(self, root, skip=()):
+        out = {}
+        for p in sorted(Path(root).rglob("*")):
+            if p.is_file() and p.name not in skip:
+                out[str(p.relative_to(root))] = (p.stat().st_mtime_ns, hashlib.sha256(p.read_bytes()).hexdigest())
+        return out
+
+    def fingerprint(self, db):
+        import claire_data
+        with closing(sqlite3.connect(f"file:{db}?mode=ro", uri=True)) as c:
+            return claire_data.data_fingerprint(c)
+
+    def assert_secret_absent(self, *texts_or_dirs):
+        for t in texts_or_dirs:
+            if isinstance(t, Path):
+                for p in t.rglob("*"):
+                    if p.is_file():
+                        self.assertNotIn(SECRET_VALUE.encode(), p.read_bytes(), f"인증정보 값이 {p} 에 있음")
+                        self.assertNotIn("secrets", p.relative_to(t).parts, f"백업에 secrets: {p}")
+            else:
+                self.assertNotIn(SECRET_VALUE, t)
+                self.assertNotIn("gmail-prof.json", t)
+
+    # -- 위치 해석 --------------------------------------------------------
+    def test_resolution_fresh_existing_override_conflict_missing(self):
+        # 신규 설치: 새 기본 위치, 위치 기록을 남긴다. 옛 위치는 만들지 않는다
+        w = self.sh("claire_relocate", "where")
+        self.assertEqual((w["source"], w["data_dir"]), ("default", str(self.new)))
+        self.assertFalse(self.new.exists())
+        i = self.sh("claire_check", "init")
+        self.assertTrue(i["created"]); self.assertTrue(i["location"]["pointer_written"])
+        self.assertEqual(i["db"], str(self.new / "claire.db"))
+        self.assertEqual(self.sh("claire_relocate", "where")["source"], "pointer")
+        self.assertFalse(self.legacy.exists())
+        self.assertEqual(self.sh("claire_check", "integrity")["db"], str(self.new / "claire.db"))
+        # 기존 설치(위치 기록 없음, 0.8.x): ~/ClaireData 를 그대로 쓴다. 새 기본 위치에 빈 장부를 만들지 않는다
+        shutil.rmtree(self.app); shutil.rmtree(self.home / "SecretaryData")
+        self.sh("claire_check", "init", CLAIRE_DATA_DIR=self.legacy)
+        self.assertFalse((self.app / "data-location.json").exists())       # 환경변수 실행은 위치 기록을 남기지 않는다
+        w = self.sh("claire_relocate", "where")
+        self.assertEqual((w["source"], w["data_dir"]), ("legacy", str(self.legacy)))
+        self.assertEqual(self.sh("claire_check", "integrity")["db"], str(self.legacy / "claire.db"))
+        i = self.sh("claire_check", "init")
+        self.assertFalse(i["created"]); self.assertTrue(i["location"]["pointer_written"])
+        self.assertFalse(self.new.exists())
+        # 명시 override: 이 프로세스만. 정본(예약 실행이 쓰는 곳)을 함께 보여 준다
+        iso = self.tmp / "isolated"
+        self.sh("claire_check", "init", CLAIRE_DATA_DIR=iso)
+        w = self.sh("claire_relocate", "where", CLAIRE_DATA_DIR=iso)
+        self.assertEqual(w["source"], "env"); self.assertEqual(w["canonical"]["data_dir"], str(self.legacy))
+        self.assertEqual([x["code"] for x in w["warnings"]], ["env_override"])
+        self.assertEqual(self.sh("claire_check", "integrity", CLAIRE_DATA_DIR=iso)["db"], str(iso / "claire.db"))
+        # 두 위치 모두 장부 + 위치 기록 없음 → 추측하지 않는다 (아무것도 만들지 않는다)
+        self.sh("claire_check", "init", CLAIRE_DATA_DIR=self.new)
+        (self.app / "data-location.json").unlink()
+        w = self.sh("claire_relocate", "where")
+        self.assertEqual([b["code"] for b in w["blockers"]], ["data_conflict"])
+        self.assertEqual(self.sh("claire_check", "integrity", ok=False)["error"]["code"], "data_conflict")
+        self.assertEqual(self.sh("claire_check", "init", ok=False)["error"]["code"], "data_conflict")
+        self.assertFalse((self.app / "data-location.json").exists())
+        # 위치 기록 대상이 없으면(디스크 분리 등) 빈 장부를 새로 만들지 않는다
+        gone = self.tmp / "gone"
+        (self.app / "data-location.json").write_text(json.dumps({"format": 1, "data_dir": str(gone), "root_id": None}),
+                                                     encoding="utf-8")
+        self.assertEqual(self.sh("claire_check", "init", ok=False)["error"]["code"], "pointer_target_missing")
+        self.assertEqual(self.sh("claire_memo", "list", ok=False)["error"]["code"], "pointer_target_missing")
+        self.assertFalse((gone / "claire.db").exists())
+
+    # -- dry-run ----------------------------------------------------------
+    def test_plan_is_dry_run_and_reports_everything(self):
+        self.make_legacy(wal=True)
+        reg = self.home / "SecretaryData" / "registry.json"
+        reg.parent.mkdir(parents=True)
+        reg.write_text(json.dumps({"operational_roots": {"meetings": "/x"}, "cutovers": {}}), encoding="utf-8")
+        (self.home / ".zshrc").write_text(f"export CLAIRE_DATA_DIR={self.legacy}\n", encoding="utf-8")
+        before = self.tree_state(self.home, skip=("claire.db-shm",))
+        jobs_before = self.jobs()
+        p = self.sh("claire_relocate", "plan")
+        t = self.proc("claire_relocate", "plan", "--format", "text").stdout
+        self.assertEqual(self.tree_state(self.home, skip=("claire.db-shm",)), before)   # 장부·WAL·설정·위치 기록 그대로
+        self.assertEqual(self.jobs(), jobs_before)
+        self.assertTrue(all(c.startswith("cron list") for c in self.oc_calls()), self.oc_calls())
+        for d in (self.new, self.backups, self.app / "relocations", self.app / "relocation.lock"):
+            self.assertFalse(d.exists(), d)
+        self.assertTrue(p["ready"], p["blockers"]); self.assertFalse(p["changes_made"])
+        self.assertEqual(p["source"]["path"], str(self.legacy)); self.assertEqual(p["target"]["path"], str(self.new))
+        self.assertGreater(p["source"]["wal_bytes"], 0)
+        self.assertEqual(p["source"]["rows"]["item"], 1); self.assertEqual(p["source"]["failed_outbox"], 1)
+        self.assertEqual(p["source"]["integrity"]["storage_problems"], [])
+        self.assertEqual([x["check"] for x in p["source"]["integrity"]["operational_state"]], ["outbox_failed"])
+        self.assertIn("operational_state", [w["code"] for w in p["warnings"]])
+        self.assertEqual(sorted(j["key"] for j in p["writers"]["schedules"]["jobs"]), ["claire-checkin", "claire-daily-check"])
+        self.assertEqual(p["writers"]["open_handles"]["pids"], [])
+        self.assertEqual({c["path"] for c in p["inputs"]["copy"]}, {"attachments", "config.json", "raw"})
+        self.assertEqual(p["inputs"]["secrets"]["files"], 2)
+        self.assertTrue(p["space"]["ok"]); self.assertTrue(p["permissions"]["target_parent_writable"])
+        self.assertIn("restore", p["backup"]); self.assertIn("after_switch_with_writes", p["recovery"])
+        self.assertEqual(p["registry"]["current"]["operational_root"], None)
+        self.assertTrue(any(l["where"] == "shell" for l in p["links_to_review"]))
+        self.assertIn("migrate --confirm", p["next"])
+        self.assertIn("중단 범위", t); self.assertIn(str(self.new), t)
+        self.assert_secret_absent(p["_stdout"], t)
+
+    # -- 이전 전체 (WAL 미반영 fixture) ------------------------------------
+    def test_migrate_wal_fixture_end_to_end(self):
+        self.make_legacy(wal=True)
+        reg = self.home / "SecretaryData" / "registry.json"
+        reg.parent.mkdir(parents=True)
+        others = {"operational_roots": {"meetings": "/m"}, "planned_roots": {"schedule": "~/SecretaryData/services/schedule"},
+                  "cutovers": {"meetings": {"state": "migrated", "to": "/m"}}, "note": "다른 시스템 값"}
+        reg.write_text(json.dumps(others, ensure_ascii=False), encoding="utf-8"); os.chmod(reg, 0o640)
+        files_before = {str(p.relative_to(self.legacy)): hashlib.sha256(p.read_bytes()).hexdigest()
+                        for sub in ("attachments", "raw") for p in (self.legacy / sub).rglob("*") if p.is_file()}
+        self.assertTrue(files_before)
+        r = self.sh("claire_relocate", "migrate", "--confirm", "--pause-schedules")
+        rid = r["relocation_id"]
+        self.assertEqual((r["state"], r["phase"]), ("done", "done"))
+        v = r["verification"]
+        self.assertEqual(v["integrity_check"], "ok"); self.assertTrue(v["fingerprint_matches_source"])
+        self.assertTrue(v["files_hash_match"]); self.assertEqual(v["pre_existing_problems"], ["outbox_failed: outbox 실패 1건"])
+        self.assertTrue(r["post_verification"]["old_location_blocked"])
+        # 새 장부: WAL 에만 있던 기록까지, 번호·건수 그대로
+        db = self.new / "claire.db"
+        with closing(sqlite3.connect(f"file:{db}?mode=ro", uri=True)) as c:
+            self.assertEqual(c.execute("PRAGMA integrity_check").fetchone()[0], "ok")
+            self.assertEqual(c.execute("SELECT value FROM meta WHERE key='wal_only_probe'").fetchone()[0], "WAL-ONLY")
+            self.assertEqual(c.execute("SELECT ref FROM item").fetchall(), [("CLR-0001",)])
+            self.assertEqual(c.execute("SELECT status, attempts FROM outbox WHERE dedupe_key='fx-failed-1'").fetchone(), ("failed", 3))
+        j = json.loads((self.app / "relocations" / f"{rid}.json").read_text(encoding="utf-8"))
+        self.assertEqual(self.fingerprint(db)["refs"], j["source_fingerprint"]["refs"])
+        for rel, h in files_before.items():
+            self.assertEqual(hashlib.sha256((self.new / rel).read_bytes()).hexdigest(), h, rel)
+        # 옛 위치: 지우지 않고 은퇴 (옛 코드·옛 경로 override 는 장부를 열지 못한다)
+        kept = self.legacy / f"claire.db.relocated-{rid}"
+        self.assertTrue(kept.exists())
+        self.assertEqual(self.fingerprint(kept)["sha256"], j["source_fingerprint"]["sha256"])
+        for rel in files_before:
+            self.assertTrue((self.legacy / rel).exists())
+        with self.assertRaises(sqlite3.DatabaseError):
+            with closing(sqlite3.connect(self.legacy / "claire.db")) as c:      # 0.8.x 코드가 하는 일
+                c.execute("SELECT * FROM sqlite_master").fetchall()
+        self.assertEqual(self.sh("claire_check", "integrity", ok=False, CLAIRE_DATA_DIR=self.legacy)["error"]["code"],
+                         "data_dir_retired")
+        # 예약 실행(환경변수 없음)과 수동 실행이 같은 새 장부를 쓴다
+        self.assertEqual(self.sh("claire_relocate", "where")["data_dir"], str(self.new))
+        integ = self.sh("claire_check", "integrity")
+        self.assertEqual(integ["db"], str(db)); self.assertTrue(integ["storage_ok"])
+        self.assertEqual(self.sh("claire_check", "integrity", CLAIRE_DATA_DIR=self.new)["db"], str(db))
+        # 인증정보: 보호 복사(700/600, 같은 내용), 출력·기록·백업에 값 없음
+        self.assertEqual(stat.S_IMODE((self.new / "secrets").stat().st_mode), 0o700)
+        for f in ("token.json", "gmail-prof.json"):
+            self.assertEqual(stat.S_IMODE((self.new / "secrets" / f).stat().st_mode), 0o600)
+            self.assertEqual((self.new / "secrets" / f).read_bytes(), (self.legacy / "secrets" / f).read_bytes())
+        bdir = Path(r["backup"])
+        self.assertEqual(bdir.parent, self.backups)
+        self.assert_secret_absent(r["_stdout"], (self.app / "relocations" / f"{rid}.json").read_text(encoding="utf-8"), bdir)
+        self.assertEqual(json.loads((bdir / "manifest.json").read_text(encoding="utf-8"))["kind"], "relocation")
+        # 예약: claire-* 만 멈췄다가 다시 켬 (다른 Claire 예약·다른 에이전트 예약은 손대지 않음)
+        calls = self.oc_calls()
+        self.assertEqual([c for c in calls if not c.startswith("cron list")],
+                         ["cron disable job-daily", "cron disable job-checkin", "cron enable job-daily", "cron enable job-checkin"])
+        self.assertTrue(all(j["enabled"] for j in self.jobs().values()))
+        # registry: schedule 항목만, 권한 유지
+        after = json.loads(reg.read_text(encoding="utf-8"))
+        self.assertEqual(after["operational_roots"], {"meetings": "/m", "schedule": str(self.new)})
+        self.assertEqual(after["cutovers"]["meetings"], others["cutovers"]["meetings"])
+        self.assertEqual(after["cutovers"]["schedule"]["relocation_id"], rid)
+        self.assertEqual((after["planned_roots"], after["note"]), (others["planned_roots"], others["note"]))
+        self.assertEqual(stat.S_IMODE(reg.stat().st_mode), 0o640)
+        # 새 위치에서 조회·저장·첨부 열람 (실제 메시지·메일·캘린더 없음, outbox 실행 없음)
+        self.sh("claire_memo", "add", "--text", "이전 후 메모", "--no-sync", "--message-id", "m2")
+        self.assertEqual(len(self.sh("claire_memo", "list", "--status", "all")["memos"]), 2)
+        pend = self.sh("claire_sync", "pending", "--platform", "discord")
+        att = Path(pend["groups"][0]["events"][0]["attachments"][0]["path"])
+        self.assertTrue(att.is_relative_to(self.new) and att.exists())
+        with closing(sqlite3.connect(f"file:{db}?mode=ro", uri=True)) as c:
+            self.assertEqual(c.execute("SELECT status, attempts FROM outbox WHERE dedupe_key='fx-failed-1'").fetchone(), ("failed", 3))
+        # 새 백업 루트에 백업 → 격리 복원 (인증정보 없음)
+        b = self.sh("claire_check", "backup", "--no-mirror")
+        self.assertEqual(Path(b["backup_dir"]).parent, self.backups)
+        self.assertEqual(b["manifest"]["kind"], "claire-backup")
+        self.assert_secret_absent(Path(b["backup_dir"]))
+        rs = self.sh("claire_check", "restore", "--from", b["backup_dir"], "--to", self.tmp / "restored")
+        self.assertTrue(rs["storage_ok"]); self.assertTrue(rs["manifest_match"]); self.assertFalse(rs["secrets_included"])
+        self.assertEqual(len(self.sh("claire_memo", "list", "--status", "all", CLAIRE_DATA_DIR=self.tmp / "restored")["memos"]), 2)
+        self.assertEqual(self.sh("claire_check", "restore", "--from", b["backup_dir"], "--to", self.new, ok=False)["error"]["code"],
+                         "restore_target_live")
+        # doctor 가 위치·이전 상태를 보여 준다
+        doc = {c["name"]: c for c in self.sh("claire_check", "doctor", "--offline", CLAIRE_OPENCLAW_BIN="")["checks"]}
+        self.assertEqual(doc["data_location"]["status"], "ok"); self.assertEqual(doc["relocation"]["status"], "ok")
+        # 같은 명령을 다시 실행해도 중복 이전·덮어쓰기 없음
+        again = self.sh("claire_relocate", "migrate", "--confirm", ok=False)
+        self.assertIn("same_location", [x["code"] for x in again["error"]["blockers"]])
+
+    # -- 막아야 하는 상태 ---------------------------------------------------
+    def test_migrate_refuses_unsafe_states_without_changes(self):
+        self.make_legacy()
+        ptr = (self.app / "data-location.json").read_text(encoding="utf-8")
+
+        def blocked(*args, code, env=None, **extra):
+            target_before = sorted(x.name for x in self.new.iterdir()) if self.new.exists() else None
+            out = self.sh("claire_relocate", "migrate", "--confirm", *args, ok=False, env=env, **extra)
+            self.assertEqual(out["error"]["code"], "relocation_blocked")
+            self.assertIn(code, [b["code"] for b in out["error"]["blockers"]], out["error"]["blockers"])
+            self.assertEqual(sorted(x.name for x in self.new.iterdir()) if self.new.exists() else None, target_before)
+            self.assertFalse(self.backups.exists() and any(self.backups.iterdir()))
+            self.assertFalse((self.app / "relocation.lock").exists())
+            self.assertEqual((self.app / "data-location.json").read_text(encoding="utf-8"), ptr)
+            self.assertFalse(claire_paths_is_tombstone(self.legacy / "claire.db"))
+            return out
+
+        # 첨부 누락 · 해시 불일치
+        data = self.att_path.read_bytes()
+        self.att_path.unlink()
+        blocked(code="source_problems")
+        self.att_path.write_bytes(b"tampered")
+        blocked(code="source_problems")
+        self.att_path.write_bytes(data)
+        # 대상 충돌 (내용이 있는 폴더는 덮어쓰지 않는다)
+        self.new.mkdir(parents=True)
+        (self.new / "notes.txt").write_text("x", encoding="utf-8")
+        blocked(code="target_not_empty")
+        (self.new / "notes.txt").unlink()
+        # 권한 부족
+        os.chmod(self.new.parent, 0o500)
+        try:
+            out = self.sh("claire_relocate", "plan", "--to", self.new.parent / "sched2")
+            self.assertIn("target_not_writable", [b["code"] for b in out["blockers"]])
+        finally:
+            os.chmod(self.new.parent, 0o700)
+        # 통제되지 않은 writer (다른 프로세스가 장부를 열고 있음)
+        holder = sqlite3.connect(self.legacy / "claire.db")
+        holder.execute("SELECT COUNT(*) FROM item").fetchone()
+        try:
+            blocked(code="uncontrolled_writer")
+        finally:
+            holder.close()
+        # 곧 실행될 예약 (멈추지 않으면 시작하지 않는다)
+        self.set_jobs(due_in_min=5)
+        blocked(code="schedule_due_soon")
+        self.set_jobs()
+        # 정본이 아닌 override 로는 이전하지 않는다 (사전 사본·시험 사본을 원본으로 쓰지 않는다)
+        iso = self.tmp / "staging-copy"
+        shutil.copytree(self.legacy, iso)
+        blocked(code="env_override", CLAIRE_DATA_DIR=iso)
+        # 공간 부족
+        with patched_home(self.env):
+            import claire_relocation as R
+            orig = R.disk_free
+            R.disk_free = lambda p: 1024
+            try:
+                cfg = claire_core.load_config()
+                plan = R.build_plan(cfg, R.default_options(cfg))
+            finally:
+                R.disk_free = orig
+        self.assertIn("no_space", [b["code"] for b in plan["blockers"]])
+        # 알고 옮기기 (--accept-source-problems): 문제를 그대로 기록하고 옮긴다
+        self.att_path.unlink()
+        r = self.sh("claire_relocate", "migrate", "--confirm", "--accept-source-problems")
+        self.assertEqual(r["state"], "done")
+        self.assertIn("attachment_missing", " ".join(r["verification"]["pre_existing_problems"]))
+
+    # -- 중단·재실행·동시 실행 ----------------------------------------------
+    def test_interrupted_resume_abort_corruption_and_lock(self):
+        self.make_legacy()
+        fp0 = self.fingerprint(self.legacy / "claire.db")["sha256"]
+        p = self.proc("claire_relocate", "migrate", "--confirm", "--pause-schedules", CLAIRE_RELOCATE_TEST_CRASH_AFTER="staged")
+        self.assertEqual(p.returncode, 75, p.stdout + p.stderr)
+        st = self.sh("claire_relocate", "status")
+        rid = st["lock"]["id"]
+        self.assertFalse(st["lock_live"]); self.assertIn(f"claire_relocate resume --id {rid}", st["next"])
+        # 중단 상태: Claire 도구는 장부를 열지 않고, 새 이전도 시작하지 않는다
+        self.assertEqual(self.sh("claire_check", "integrity", ok=False)["error"]["code"], "maintenance")
+        self.assertEqual(self.sh("claire_memo", "list", ok=False)["error"]["code"], "maintenance")
+        self.assertIn("maintenance", [b["code"] for b in self.sh("claire_relocate", "migrate", "--confirm", ok=False)["error"]["blockers"]])
+        self.assertEqual(self.jobs()["job-daily"]["enabled"], False)          # 멈춘 예약은 그대로 (끝날 때 켠다)
+        r = self.sh("claire_relocate", "resume", "--id", rid)
+        self.assertEqual(r["state"], "done")
+        self.assertTrue(all(j["enabled"] for j in self.jobs().values()))
+        self.assertEqual(self.sh("claire_check", "integrity")["db"], str(self.new / "claire.db"))
+        self.assertEqual(self.fingerprint(self.new / "claire.db")["refs"], self.fingerprint(self.legacy / f"claire.db.relocated-{rid}")["refs"])
+
+        # 전환 뒤(위치 기록까지 바꾼 뒤) 중단 → abort: 원래 위치로 완전히 되돌린다
+        shutil.rmtree(self.tmp / "home"); self.home.mkdir(); self.set_jobs()
+        self.make_legacy()
+        reg = self.home / "SecretaryData" / "registry.json"; reg.parent.mkdir(parents=True, exist_ok=True)
+        reg.write_text(json.dumps({"operational_roots": {"schedule": "~/ClaireData"}}), encoding="utf-8")
+        fp0 = self.fingerprint(self.legacy / "claire.db")["sha256"]
+        p = self.proc("claire_relocate", "migrate", "--confirm", "--pause-schedules", CLAIRE_RELOCATE_TEST_CRASH_AFTER="configured")
+        self.assertEqual(p.returncode, 75, p.stdout + p.stderr)
+        rid = self.sh("claire_relocate", "status")["lock"]["id"]
+        self.assertEqual(json.loads(reg.read_text(encoding="utf-8"))["operational_roots"]["schedule"], str(self.new))
+        self.assertEqual(self.sh("claire_check", "integrity", ok=False)["error"]["code"], "maintenance")
+        a = self.sh("claire_relocate", "abort", "--id", rid)
+        self.assertEqual(a["state"], "aborted"); self.assertTrue(a["undo"]["source_verified"])
+        self.assertEqual(self.sh("claire_relocate", "where")["data_dir"], str(self.legacy))
+        self.assertEqual(self.fingerprint(self.legacy / "claire.db")["sha256"], fp0)
+        self.assertFalse(self.new.exists()); self.assertFalse(list(self.new.parent.glob(".schedule.staging-*")))
+        self.assertEqual(json.loads(reg.read_text(encoding="utf-8"))["operational_roots"]["schedule"], "~/ClaireData")
+        self.assertTrue(all(j["enabled"] for j in self.jobs().values()))
+        self.assertTrue(self.sh("claire_check", "integrity")["storage_ok"])
+
+        # 임시 사본 손상 → 검증에서 걸러 전환하지 않는다 (원본으로 계속)
+        p = self.proc("claire_relocate", "migrate", "--confirm", CLAIRE_RELOCATE_TEST_CRASH_AFTER="staged")
+        self.assertEqual(p.returncode, 75)
+        rid = self.sh("claire_relocate", "status")["lock"]["id"]
+        staging = next(self.new.parent.glob(f".schedule.staging-{rid}"))
+        f = next(x for x in (staging / "attachments").rglob("*") if x.is_file())
+        f.write_bytes(f.read_bytes() + b"corrupt")
+        bad = self.sh("claire_relocate", "resume", "--id", rid, ok=False)
+        self.assertEqual(bad["error"]["code"], "relocation_failed")
+        self.assertIn("해시", bad["error"]["message"])
+        self.assertFalse(staging.exists()); self.assertFalse((self.app / "relocation.lock").exists())
+        self.assertEqual(self.sh("claire_relocate", "status", "--id", rid)["current"]["state"], "failed_clean")
+        self.assertEqual(self.sh("claire_check", "integrity")["db"], str(self.legacy / "claire.db"))
+        self.assertEqual(self.fingerprint(self.legacy / "claire.db")["sha256"], fp0)
+        self.assertEqual(self.sh("claire_relocate", "resume", "--id", rid, ok=False)["error"]["code"], "relocation_closed")
+
+        # 동시 실행: 다른 이전 작업이 잠금을 쥐고 있으면 시작하지 않는다
+        with patched_home(self.env):
+            import claire_paths
+            lk = claire_paths.RelocationLock().acquire({"id": "other-run", "kind": "migrate"})
+            try:
+                out = self.sh("claire_relocate", "migrate", "--confirm", ok=False)
+                self.assertEqual(out["error"]["code"], "relocation_running")
+            finally:
+                lk.release()
+        self.assertEqual(self.sh("claire_relocate", "where")["data_dir"], str(self.legacy))
+
+    # -- 되돌리기 ---------------------------------------------------------
+    def test_rollback_without_and_with_new_records(self):
+        self.make_legacy()
+        fp0 = self.fingerprint(self.legacy / "claire.db")["sha256"]
+        m = self.sh("claire_relocate", "migrate", "--confirm")
+        # 전환 뒤 새 기록 없음(토큰만 갱신) → 옛 장부로 되돌림 (토큰은 새 것으로, 옛 것은 .before-<id>)
+        (self.new / "secrets" / "token.json").write_text(json.dumps({"refresh_token": "refreshed"}), encoding="utf-8")
+        plan = self.sh("claire_relocate", "rollback")
+        self.assertEqual(plan["mode"], "revert"); self.assertFalse(plan["writes_since_switch"]["writes"])
+        self.assertTrue((self.new / "claire.db").exists() and not claire_paths_is_tombstone(self.new / "claire.db"))  # 계획은 바꾸지 않음
+        rb = self.sh("claire_relocate", "rollback", "--confirm")
+        self.assertEqual((rb["mode"], rb["state"]), ("revert", "done"))
+        self.assertEqual(self.sh("claire_relocate", "where")["data_dir"], str(self.legacy))
+        self.assertEqual(self.fingerprint(self.legacy / "claire.db")["sha256"], fp0)
+        self.assertTrue(claire_paths_is_tombstone(self.new / "claire.db"))
+        self.assertTrue(list(self.new.glob("claire.db.rolled-back-*")))
+        self.assertIn("refreshed", (self.legacy / "secrets" / "token.json").read_text(encoding="utf-8"))
+        self.assertTrue(list((self.legacy / "secrets").glob("token.json.before-*")))
+        self.assertEqual(self.sh("claire_relocate", "rollback", "--id", m["relocation_id"], ok=False)["error"]["code"],
+                         "already_rolled_back")
+        # 다시 옮긴 뒤 새 기록(메모·첨부)이 생기면: 옛 장부로 단순 복귀하지 않고, 새 데이터를 먼저 백업하고 옮긴다
+        self.assertIn("target_retired", [b["code"] for b in self.sh("claire_relocate", "plan")["blockers"]])
+        m2 = self.sh("claire_relocate", "migrate", "--confirm", "--replace-retired")
+        self.assertTrue(Path(m2["moved_aside"]).name.startswith("schedule.retired-"))
+        self.sh("claire_memo", "add", "--text", "전환 뒤 메모", "--no-sync", "--message-id", "m9")
+        img = self.tmp / "inbound" / "after.png"; img.write_bytes(b"\x89PNG after switch")
+        self.sh("claire_sync", "ingest-discord", "--message-id", "d9", "--attachment", img)
+        plan = self.sh("claire_relocate", "rollback")
+        self.assertEqual(plan["mode"], "carry-forward"); self.assertTrue(plan["changes"]["superset"])
+        self.assertGreaterEqual(plan["changes"]["tables"]["memo"]["added"], 1)
+        rb = self.sh("claire_relocate", "rollback", "--confirm")
+        self.assertEqual((rb["mode"], rb["state"]), ("carry-forward", "done"))
+        self.assertEqual(Path(rb["backup"]).parent, self.backups)               # 새 데이터 먼저 백업
+        self.assertEqual(self.sh("claire_relocate", "where")["data_dir"], str(self.legacy))
+        texts = [x["title"] for x in self.sh("claire_memo", "list", "--status", "all")["memos"]]
+        self.assertIn("전환 뒤 메모", " ".join(texts))
+        self.assertTrue(self.sh("claire_check", "integrity")["storage_ok"])
+        aside = list(self.home.glob("ClaireData.retired-*"))
+        self.assertEqual(len(aside), 1)                                           # 옛 위치 폴더는 지우지 않고 비켜 둠
+        self.assertTrue(list(aside[0].glob("claire.db.relocated-*")))
+        self.assertTrue(claire_paths_is_tombstone(self.new / "claire.db"))
+        # 사라지면 안 되는 행이 사라졌으면 되돌리지 않는다
+        m3 = self.sh("claire_relocate", "migrate", "--confirm", "--replace-retired")
+        with closing(sqlite3.connect(self.new / "claire.db")) as c:
+            c.execute("DELETE FROM question"); c.commit()
+        plan = self.sh("claire_relocate", "rollback", "--id", m3["relocation_id"])
+        self.assertIn("rows_missing", [b["code"] for b in plan["blockers"]]); self.assertIsNone(plan["next"])
+        self.assertEqual(self.sh("claire_relocate", "rollback", "--id", m3["relocation_id"], "--confirm", ok=False)["error"]["code"],
+                         "rollback_blocked")
+
+    # -- 리뷰 반영: 실패·되돌리기가 기록을 잃거나 잠긴 채 남지 않는다 --------------
+    def memo_count(self, root):
+        with closing(sqlite3.connect(f"file:{Path(root) / 'claire.db'}?mode=ro", uri=True)) as c:
+            return c.execute("SELECT COUNT(*) FROM memo").fetchone()[0]
+
+    def test_abort_after_switch_with_new_records_never_deletes_them(self):
+        self.make_legacy()
+        p = self.proc("claire_relocate", "migrate", "--confirm", "--pause-schedules", CLAIRE_RELOCATE_TEST_CRASH_AFTER="configured")
+        self.assertEqual(p.returncode, 75, p.stdout + p.stderr)
+        rid = self.sh("claire_relocate", "status")["lock"]["id"]
+        # 중단된 동안 새 위치에 기록이 생김 (같은 이전 id 로 연 도구 — 통제 밖 쓰기 흉내)
+        self.sh("claire_memo", "add", "--text", "전환 직후 메모", "--no-sync", "--message-id", "m-after", CLAIRE_RELOCATION_ID=rid)
+        self.assertEqual(self.memo_count(self.new), 2)
+        a = self.sh("claire_relocate", "abort", "--id", rid, ok=False)
+        self.assertEqual(a["error"]["code"], "target_changed")
+        self.assertIn("--keep-changed-target", a["error"]["fix"])
+        # 아무것도 바꾸지 않았다: 새 위치·위치 기록·은퇴 표지·잠금 그대로
+        self.assertEqual(self.memo_count(self.new), 2)
+        self.assertEqual(json.loads((self.app / "data-location.json").read_text(encoding="utf-8"))["data_dir"], str(self.new))
+        self.assertTrue(claire_paths_is_tombstone(self.legacy / "claire.db"))
+        st = self.sh("claire_relocate", "status")
+        self.assertEqual(st["current"]["state"], "needs_decision")
+        self.assertTrue(any("--keep-changed-target" in n for n in st["next"]))
+        # resume: 새 기록을 포함해 이전을 마친다 (옮긴 행은 모두 남아 있으므로)
+        r = self.sh("claire_relocate", "resume", "--id", rid)
+        self.assertEqual(r["state"], "done")
+        self.assertGreaterEqual(r["writes_after_switch"]["tables"]["memo"]["added"], 1)
+        self.assertEqual(self.sh("claire_check", "integrity")["db"], str(self.new / "claire.db"))
+        self.assertIn("전환 직후 메모", json.dumps(self.sh("claire_memo", "list", "--status", "all"), ensure_ascii=False))
+        self.assertTrue(all(j["enabled"] for j in self.jobs().values()))
+
+        # 같은 상황에서 원래 위치로 돌아가기를 고르면: 새 위치를 지우지 않고 비켜 둔다
+        shutil.rmtree(self.home); self.home.mkdir(); self.set_jobs()
+        self.make_legacy()
+        fp0 = self.fingerprint(self.legacy / "claire.db")["sha256"]
+        p = self.proc("claire_relocate", "migrate", "--confirm", "--pause-schedules", CLAIRE_RELOCATE_TEST_CRASH_AFTER="configured")
+        self.assertEqual(p.returncode, 75, p.stdout + p.stderr)
+        rid = self.sh("claire_relocate", "status")["lock"]["id"]
+        self.sh("claire_memo", "add", "--text", "비켜 둘 메모", "--no-sync", "--message-id", "m-keep", CLAIRE_RELOCATION_ID=rid)
+        a = self.sh("claire_relocate", "abort", "--id", rid, "--keep-changed-target")
+        self.assertEqual(a["state"], "aborted")
+        kept = Path(a["undo"]["changed_target_kept"])
+        self.assertEqual(kept, self.new.parent / f".schedule.undone-{rid}")
+        self.assertEqual(self.memo_count(kept), 2)
+        self.assertFalse(self.new.exists())
+        self.assertEqual(self.sh("claire_relocate", "where")["data_dir"], str(self.legacy))
+        self.assertEqual(self.fingerprint(self.legacy / "claire.db")["sha256"], fp0)
+        self.assertTrue(all(j["enabled"] for j in self.jobs().values()))
+        self.assertFalse((self.app / "relocation.lock").exists())
+
+    def test_source_changed_mid_migration_fails_cleanly_and_unlocked(self):
+        self.make_legacy()
+        p = self.proc("claire_relocate", "migrate", "--confirm", "--pause-schedules", CLAIRE_RELOCATE_TEST_CRASH_AFTER="verified")
+        self.assertEqual(p.returncode, 75, p.stdout + p.stderr)
+        rid = self.sh("claire_relocate", "status")["lock"]["id"]
+        self.sh("claire_memo", "add", "--text", "원본에 늦게 쓴 메모", "--no-sync", "--message-id", "m-late", CLAIRE_RELOCATION_ID=rid)
+        bad = self.sh("claire_relocate", "resume", "--id", rid, ok=False)
+        self.assertEqual(bad["error"]["code"], "relocation_failed")
+        self.assertIn("바뀌었습니다", bad["error"]["message"])
+        self.assertFalse(bad["error"]["undo"]["source_verified"]); self.assertIn("source_note", bad["error"]["undo"])
+        self.assertFalse((self.app / "relocation.lock").exists())
+        self.assertEqual(self.sh("claire_relocate", "status", "--id", rid)["current"]["state"], "failed_clean")
+        self.assertEqual(self.sh("claire_check", "integrity")["db"], str(self.legacy / "claire.db"))
+        self.assertEqual(self.memo_count(self.legacy), 2)                 # 늦게 쓴 기록은 원본에 그대로
+        self.assertFalse(self.new.exists()); self.assertFalse(list(self.new.parent.glob(".schedule.staging-*")))
+        self.assertTrue(all(j["enabled"] for j in self.jobs().values()))
+        for cmd in ("resume", "abort"):
+            self.assertEqual(self.sh("claire_relocate", cmd, "--id", rid, ok=False)["error"]["code"], "relocation_closed")
+
+    def test_schedule_enable_failure_after_switch_is_only_a_warning(self):
+        self.make_legacy()
+        r = self.sh("claire_relocate", "migrate", "--confirm", "--pause-schedules", FAKE_OC_FAIL="enable")
+        self.assertEqual(r["state"], "done")
+        w = next(x for x in r["warnings"] if x["code"] == "schedule_resume_failed")
+        self.assertIn("openclaw cron enable job-daily", w["commands"])
+        self.assertFalse(self.jobs()["job-daily"]["enabled"])                # 켜지 못한 예약은 명령으로 남김
+        self.assertEqual(self.sh("claire_check", "integrity")["db"], str(self.new / "claire.db"))
+        self.assertFalse((self.app / "relocation.lock").exists())
+        self.assertTrue(claire_paths_is_tombstone(self.legacy / "claire.db"))
+        doc = self.sh("claire_check", "doctor")
+        row = next(c for c in doc["checks"] if c["name"] == "relocation")
+        self.assertEqual(row["status"], "warn"); self.assertIn("openclaw cron enable", row["fix"])
+
+    def test_killed_while_pausing_keeps_list_and_undoing_only_aborts(self):
+        self.make_legacy()
+        p = self.proc("claire_relocate", "migrate", "--confirm", "--pause-schedules", FAKE_OC_KILL_PARENT="disable job-checkin")
+        self.assertEqual(p.returncode, -9, p.stdout + p.stderr)
+        rid = self.sh("claire_relocate", "status")["lock"]["id"]
+        j = json.loads((self.app / "relocations" / f"{rid}.json").read_text(encoding="utf-8"))
+        self.assertEqual(j["schedules"]["paused"], ["job-daily", "job-checkin"])   # 멈추기 전에 기록했다
+        self.assertFalse(self.jobs()["job-daily"]["enabled"])
+        r = self.sh("claire_relocate", "resume", "--id", rid)
+        self.assertEqual(r["state"], "done")
+        self.assertTrue(all(j["enabled"] for j in self.jobs().values()))      # 앞서 멈춘 것까지 다시 켬
+        self.assertIn("disable job-checkin", " ".join(self.oc_calls()))
+
+        # 되돌리던 중 멈춘 작업은 resume 하지 않고 abort 로만 잇는다
+        shutil.rmtree(self.home); self.home.mkdir(); self.set_jobs()
+        self.make_legacy()
+        p = self.proc("claire_relocate", "migrate", "--confirm", CLAIRE_RELOCATE_TEST_CRASH_AFTER="staged")
+        self.assertEqual(p.returncode, 75)
+        rid = self.sh("claire_relocate", "status")["lock"]["id"]
+        jp = self.app / "relocations" / f"{rid}.json"
+        j = json.loads(jp.read_text(encoding="utf-8")); j["state"] = "undoing"; jp.write_text(json.dumps(j), encoding="utf-8")
+        self.assertEqual(self.sh("claire_relocate", "resume", "--id", rid, ok=False)["error"]["code"], "relocation_undoing")
+        self.assertEqual(self.sh("claire_relocate", "abort", "--id", rid)["state"], "aborted")
+        self.assertEqual(self.sh("claire_check", "integrity")["db"], str(self.legacy / "claire.db"))
+
+    def test_lost_pointer_follows_retired_marker_or_refuses_empty_db(self):
+        self.make_legacy()
+        custom = self.home / "Data" / "sched"
+        self.sh("claire_relocate", "migrate", "--confirm", "--to", custom)
+        (self.app / "data-location.json").unlink()
+        w = self.sh("claire_relocate", "where")
+        self.assertEqual((w["data_dir"], w["source"]), (str(custom), "moved"))
+        self.assertIn("pointer_missing", [x["code"] for x in w["warnings"]])
+        i = self.sh("claire_check", "init")
+        self.assertTrue(i["location"]["pointer_written"]); self.assertFalse(i["created"])
+        self.assertEqual(json.loads((self.app / "data-location.json").read_text(encoding="utf-8"))["data_dir"], str(custom))
+        self.assertFalse(self.new.exists())                                   # 기본 위치에 빈 장부를 만들지 않았다
+        # 새 위치가 사라짐(디스크 분리 흉내) + 위치 기록 없음 → 빈 장부를 만들지 않고 멈춘다
+        os.rename(custom, self.tmp / "unplugged")
+        (self.app / "data-location.json").unlink()
+        w = self.sh("claire_relocate", "where")
+        self.assertIn("pointer_missing_relocated", [b["code"] for b in w["blockers"]])
+        self.assertEqual(self.sh("claire_check", "init", ok=False)["error"]["code"], "pointer_missing_relocated")
+        self.assertEqual(self.sh("claire_memo", "list", ok=False)["error"]["code"], "pointer_missing_relocated")
+        self.assertFalse((self.new / "claire.db").exists())
+
+    def test_abort_restores_moved_aside_folder_when_switch_did_not_finish(self):
+        self.make_legacy()
+        self.sh("claire_relocate", "migrate", "--confirm")
+        self.sh("claire_relocate", "rollback", "--confirm")                  # 새 위치는 은퇴한 폴더가 됨
+        before = self.tree_state(self.new)
+        p = self.proc("claire_relocate", "migrate", "--confirm", "--replace-retired", CLAIRE_RELOCATE_TEST_CRASH_AFTER="switched")
+        self.assertEqual(p.returncode, 75, p.stdout + p.stderr)
+        rid = self.sh("claire_relocate", "status")["lock"]["id"]
+        aside = self.new.with_name(f"schedule.retired-{rid}")
+        self.assertTrue(aside.exists())
+        # 은퇴 폴더를 비켜 둔 뒤 새 폴더를 들여놓기 전에 멈춘 상태를 흉내
+        os.rename(self.new, self.new.parent / f".schedule.staging-{rid}")
+        a = self.sh("claire_relocate", "abort", "--id", rid)
+        self.assertEqual(a["state"], "aborted"); self.assertIn("aside_restored", a["undo"])
+        self.assertFalse(aside.exists())
+        self.assertEqual(self.tree_state(self.new), before)                  # 비켜 둔 폴더가 그대로 돌아옴
+        self.assertFalse(list(self.new.parent.glob(".schedule.staging-*")))
+        self.assertEqual(self.sh("claire_check", "integrity")["db"], str(self.legacy / "claire.db"))
+
+    def test_secret_copy_errors_hide_names_and_lock_rechecks_identity(self):
+        import claire_relocation as R
+        src = self.tmp / "sec"; src.mkdir()
+        f = src / "gmail-prof@example.com.json"
+        f.write_text(SECRET_VALUE, encoding="utf-8"); os.chmod(f, 0)
+        try:
+            with self.assertRaises(claire_core.ClaireError) as cm:
+                R.copy_secrets(src, self.tmp / "dst")
+        finally:
+            os.chmod(f, 0o600)
+        self.assertEqual(cm.exception.code, "secrets_copy_failed")
+        for leak in ("gmail-prof", str(self.tmp), SECRET_VALUE):
+            self.assertNotIn(leak, cm.exception.message)
+        self.assertEqual(R.copy_secrets(src, self.tmp / "dst"), 1)
+        # 잠금: 여는 사이 다른 작업이 파일을 지우고 새로 만들면, 지워진 파일이 아니라 지금 파일을 잡는다
+        with patched_home(self.env):
+            import claire_paths
+            claire_paths.app_home().mkdir(parents=True, exist_ok=True)
+            real_open, raced = os.open, []
+
+            def racy_open(path, flags, mode=0o777):
+                fd = real_open(path, flags, mode)
+                if not raced and str(path) == str(claire_paths.lock_path()):
+                    raced.append(1)
+                    os.unlink(path)
+                    os.close(real_open(path, os.O_CREAT | os.O_WRONLY, 0o600))
+                return fd
+            with mock.patch("os.open", racy_open):
+                lk = claire_paths.RelocationLock().acquire({"id": "r1", "kind": "migrate"})
+            try:
+                self.assertEqual(raced, [1])
+                self.assertEqual(claire_paths.read_lock()["id"], "r1")
+                self.assertTrue(claire_paths.lock_is_live())
+            finally:
+                lk.release()
+            cased = self.tmp / "CaseDir"; cased.mkdir()
+            if (self.tmp / "casedir").exists():                              # 대소문자 무시 파일 시스템
+                self.assertTrue(claire_paths.same_path(cased, self.tmp / "casedir"))
+
+    # -- registry · 백업 보존 · 가림 -----------------------------------------
+    def test_registry_update_is_scoped_and_locked(self):
+        import claire_relocation as R
+        reg = self.tmp / "registry.json"
+        base = {"operational_roots": {"meetings": "/m", "schedule": "/old"}, "cutovers": {"meetings": {"x": 1}}, "z": [1, 2]}
+        reg.write_text(json.dumps(base), encoding="utf-8"); os.chmod(reg, 0o644)
+        res = R.update_registry(reg, "/new", {"state": "migrated"})
+        d = json.loads(reg.read_text(encoding="utf-8"))
+        self.assertTrue(res["updated"]); self.assertEqual(res["before"]["operational_root"], "/old")
+        self.assertEqual(d["operational_roots"], {"meetings": "/m", "schedule": "/new"})
+        self.assertEqual((d["cutovers"]["meetings"], d["z"]), ({"x": 1}, [1, 2]))
+        self.assertEqual(stat.S_IMODE(reg.stat().st_mode), 0o644)
+        import fcntl
+        with open(reg.with_name(".registry.json.lock"), "a+") as fh:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+            with self.assertRaises(claire_core.ClaireError) as cm:
+                R.update_registry(reg, "/x", None, timeout=0.5)
+            self.assertEqual(cm.exception.code, "registry_busy")
+        self.assertFalse(R.update_registry(self.tmp / "none.json", "/x", None)["updated"])
+
+    def test_backup_root_prune_scope_and_redaction_restore(self):
+        self.make_legacy()
+        foreign = self.backups / "20261024T224649" / "data"           # 다른 작업이 둔 사전 사본 (manifest 없음)
+        foreign.mkdir(parents=True); (foreign / "claire.db").write_bytes(b"x")
+        reloc = self.backups / "20200101T000000"; reloc.mkdir()
+        (reloc / "manifest.json").write_text(json.dumps({"kind": "relocation"}), encoding="utf-8")
+        b1 = self.sh("claire_check", "backup", "--no-mirror")
+        self.assertEqual(Path(b1["backup_dir"]).parent, self.backups)
+        self.assertEqual(b1["manifest"]["kind"], "claire-backup")
+        self.assert_secret_absent(Path(b1["backup_dir"]))
+        ev = self.sh("claire_sync", "pending", "--platform", "discord")["groups"][0]["events"][0]
+        sid = ev["source_event_id"]
+        self.sh("claire_store", "redact", "--source-event", sid, "--confirm")
+        cfgp = self.legacy / "config.json"
+        cfg = json.loads(cfgp.read_text(encoding="utf-8")); cfg["backup_retention"] = {"daily": 1, "weekly": 0, "monthly": 0}
+        cfgp.write_text(json.dumps(cfg), encoding="utf-8")
+        import time as _t; _t.sleep(1.1)
+        b2 = self.sh("claire_check", "backup", "--no-mirror")
+        self.assertTrue((foreign / "claire.db").exists()); self.assertTrue(reloc.exists())   # 정기 백업만 정리
+        self.assertFalse(Path(b1["backup_dir"]).exists())
+        man = json.loads((self.backups / "redaction_manifest.json").read_text(encoding="utf-8"))
+        self.assertIn(sid, [e["id"] for e in man["entries"] if e["kind"] == "source_event"])
+        # 가림 전 사본(b1 과 같은 상태)을 복원해도 지운 원문·첨부가 돌아오지 않는다
+        old = self.tmp / "old-backup"
+        shutil.copytree(Path(b2["backup_dir"]), old)
+        with closing(sqlite3.connect(old / "claire.db")) as c:
+            c.execute("UPDATE source_event SET redacted_at=NULL, excerpt='되살아난 원문' WHERE id=?", (sid,))
+            c.execute("UPDATE attachment SET redacted_at=NULL WHERE source_event_id=?", (sid,)); c.commit()
+        rs = self.sh("claire_check", "restore", "--from", old, "--to", self.tmp / "r2")
+        self.assertIn({"kind": "source_event", "id": sid}, rs["redactions_reapplied"])
+        with closing(sqlite3.connect(self.tmp / "r2" / "claire.db")) as c:
+            self.assertEqual(c.execute("SELECT excerpt FROM source_event WHERE id=?", (sid,)).fetchone()[0], "[redacted]")
+
+
 class InstallTest(unittest.TestCase):
     """0.5.0: install.sh(설치 기록·claire-update·업그레이드 전 DB 사본)와 get.sh(릴리스 태그 설치·고정·확인)."""
 
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp(prefix="claire-inst-"))
-        self.env = dict(os.environ, CLAIRE_SKILL_DIR=str(self.tmp / "skill"), CLAIRE_DATA_DIR=str(self.tmp / "data"),
+        self.env = dict(os.environ, HOME=str(self.tmp / "home"), CLAIRE_BACKUP_ROOT=str(self.tmp / "backups"),
+                        CLAIRE_SKILL_DIR=str(self.tmp / "skill"), CLAIRE_DATA_DIR=str(self.tmp / "data"),
                         CLAIRE_BIN_DIR=str(self.tmp / "bin"), CLAIRE_OPENCLAW_WORKSPACE=str(self.tmp / "no-openclaw"),
                         CLAIRE_SRC_DIR=str(self.tmp / "src"), GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@example.com",
                         GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@example.com", GIT_CONFIG_GLOBAL="/dev/null")
@@ -3343,13 +4154,15 @@ class InstallTest(unittest.TestCase):
         self.assertTrue((self.tmp / "skill" / "get.sh").exists()); self.assertTrue((self.tmp / "data" / "claire.db").exists())
         # 같은 버전 재적용 → 사본 없음, 새 버전 → 스키마 변환 전 DB 사본
         self.run_sh("bash", str(a / "install.sh"))
-        self.assertFalse(list((self.tmp / "data" / "backups").glob("pre-upgrade-*")))
+        self.assertFalse(list((self.tmp / "backups").glob("pre-upgrade-*")))
+        self.assertFalse((self.tmp / "data" / "backups").exists())          # 0.9.0: 데이터 폴더 안에 백업을 두지 않는다
         b = self.repo_copy(self.tmp / "b", "9.9.9")
         out = self.run_sh("bash", str(b / "install.sh")).stdout
         self.assertIn(f"{claire_core.CLAIRE_VERSION} → 9.9.9", out)
-        pre = list((self.tmp / "data" / "backups").glob(f"pre-upgrade-{claire_core.CLAIRE_VERSION}-to-9.9.9-*"))
+        pre = list((self.tmp / "backups").glob(f"pre-upgrade-{claire_core.CLAIRE_VERSION}-to-9.9.9-*"))
         self.assertEqual(len(pre), 1); self.assertTrue((pre[0] / "claire.db").exists())
-        self.assertTrue((self.tmp / "data" / "skill-prev" / "scripts" / "claire_core.py").exists())
+        self.assertTrue((self.tmp / "home" / ".claire-schedule-manager" / "skill-prev" / "scripts" / "claire_core.py").exists())
+        self.assertFalse((self.tmp / "data" / "skill-prev").exists())
 
     def test_get_sh_installs_latest_tag_pins_and_checks(self):
         origin = self.repo_copy(self.tmp / "origin")
@@ -3379,6 +4192,133 @@ class InstallTest(unittest.TestCase):
         self.assertIn("태그 v7.7.7 이 없습니다", self.run_sh("bash", str(origin / "get.sh"), "--version", "7.7.7", ok=False).stdout)
         (self.tmp / "src" / "README.md").write_text("x", encoding="utf-8")
         self.assertIn("손으로 고친 파일", self.run_sh("bash", str(origin / "get.sh"), "--skip-tests", ok=False).stdout)
+
+    # -- 0.9.0 데이터 위치 ---------------------------------------------------
+    def no_env_data(self):
+        self.env.pop("CLAIRE_DATA_DIR", None)
+        self.env.pop("CLAIRE_BACKUP_ROOT", None)
+        self.env["CLAIRE_OPENCLAW_BIN"] = ""
+        return self.tmp / "home"
+
+    def test_install_fresh_existing_and_conflict_locations(self):
+        home = self.no_env_data()
+        a = self.repo_copy(self.tmp / "a")
+        out = self.run_sh("bash", str(a / "install.sh")).stdout
+        new, legacy = home / "SecretaryData" / "services" / "schedule", home / "ClaireData"
+        self.assertTrue((new / "claire.db").exists()); self.assertFalse(legacy.exists())
+        self.assertIn("새 기본 위치", out)
+        ptr = json.loads((home / ".claire-schedule-manager" / "data-location.json").read_text(encoding="utf-8"))
+        self.assertEqual(ptr["data_dir"], str(new))
+        # 기존 설치(0.8.x: ~/ClaireData, 위치 기록 없음)는 그대로 쓰고 새 위치에 빈 장부를 만들지 않는다
+        shutil.rmtree(home); home.mkdir()
+        e = dict(self.env, CLAIRE_DATA_DIR=str(legacy))
+        subprocess.run([sys.executable, str(SCRIPTS / "claire_check"), "init"], env=e, capture_output=True, check=True)
+        out = self.run_sh("bash", str(a / "install.sh")).stdout
+        self.assertIn("기존 설치 위치", out); self.assertIn("claire_relocate plan", out)
+        self.assertFalse(new.exists())
+        self.assertEqual(json.loads((home / ".claire-schedule-manager" / "data-location.json").read_text(encoding="utf-8"))["data_dir"],
+                         str(legacy))
+        # 두 위치에 장부 + 위치 기록 없음 → 아무것도 바꾸지 않고 멈춘다
+        subprocess.run([sys.executable, str(SCRIPTS / "claire_check"), "init"], env=dict(self.env, CLAIRE_DATA_DIR=str(new)),
+                       capture_output=True, check=True)
+        (home / ".claire-schedule-manager" / "data-location.json").unlink()
+        info_before = (self.tmp / "skill" / "INSTALL_INFO.json").read_text(encoding="utf-8")
+        b = self.repo_copy(self.tmp / "b", "9.9.9")
+        p = self.run_sh("bash", str(b / "install.sh"), ok=False)
+        self.assertNotEqual(p.returncode, 0); self.assertIn("data_conflict", p.stdout)
+        self.assertEqual((self.tmp / "skill" / "INSTALL_INFO.json").read_text(encoding="utf-8"), info_before)
+        self.assertFalse((home / ".claire-schedule-manager" / "data-location.json").exists())
+
+    def test_update_after_relocation_keeps_new_location(self):
+        home = self.no_env_data()
+        legacy, new = home / "ClaireData", home / "SecretaryData" / "services" / "schedule"
+        subprocess.run([sys.executable, str(SCRIPTS / "claire_check"), "init"], env=dict(self.env, CLAIRE_DATA_DIR=str(legacy)),
+                       capture_output=True, check=True)
+        a = self.repo_copy(self.tmp / "a")
+        self.run_sh("bash", str(a / "install.sh"))
+        skill = self.tmp / "skill" / "scripts"
+        mig = json.loads(self.run_sh(sys.executable, str(skill / "claire_relocate"), "migrate", "--confirm").stdout)
+        self.assertEqual(mig["state"], "done")
+        memo = self.run_sh(sys.executable, str(skill / "claire_memo"), "add", "--text", "이전 후", "--no-sync")
+        b = self.repo_copy(self.tmp / "b", "9.9.9")
+        out = self.run_sh("bash", str(b / "install.sh")).stdout
+        self.assertIn(str(new), out); self.assertIn("위치 기록", out)
+        pre = list((home / "SecretaryBackups" / "schedule").glob("pre-upgrade-*-to-9.9.9-*"))
+        self.assertEqual(len(pre), 1)
+        with closing(sqlite3.connect(f"file:{pre[0] / 'claire.db'}?mode=ro", uri=True)) as c:
+            self.assertEqual(c.execute("SELECT COUNT(*) FROM memo").fetchone()[0], 1)   # 새 위치의 장부를 백업
+        self.assertTrue(claire_paths_is_tombstone(legacy / "claire.db"))                 # 옛 위치는 은퇴 그대로
+        self.assertEqual(len(list((home / ".claire-schedule-manager" / "relocations").glob("*.files.json"))), 1)  # 중복 이전 없음
+        w = json.loads(self.run_sh(sys.executable, str(skill / "claire_relocate"), "where").stdout)
+        self.assertEqual((w["data_dir"], w["source"]), (str(new), "pointer"))
+        self.assertIn("이전 후", memo.stdout)
+
+    def test_install_code_only_during_interrupted_relocation(self):
+        home = self.no_env_data()
+        legacy = home / "ClaireData"
+        subprocess.run([sys.executable, str(SCRIPTS / "claire_check"), "init"], env=dict(self.env, CLAIRE_DATA_DIR=str(legacy)),
+                       capture_output=True, check=True)
+        self.run_sh("bash", str(self.repo_copy(self.tmp / "a") / "install.sh"))
+        app = home / ".claire-schedule-manager"
+        (app / "relocation.lock").write_text(json.dumps({"id": "20261025T000000", "kind": "migrate", "source": str(legacy),
+                                                         "target": str(home / "SecretaryData" / "services" / "schedule")}),
+                                             encoding="utf-8")
+        b = self.repo_copy(self.tmp / "b", "9.9.9")
+        p = self.run_sh("bash", str(b / "install.sh"), ok=False)
+        self.assertNotEqual(p.returncode, 0); self.assertIn("CLAIRE_INSTALL_CODE_ONLY=1", p.stdout)
+        core = self.tmp / "skill" / "scripts" / "claire_core.py"
+        self.assertNotIn('"9.9.9"', core.read_text(encoding="utf-8"))
+        snap = {str(x): x.stat().st_mtime_ns for x in legacy.rglob("*")}
+        ptr = (app / "data-location.json").read_text(encoding="utf-8")
+        self.env["CLAIRE_INSTALL_CODE_ONLY"] = "1"
+        out = self.run_sh("bash", str(b / "install.sh")).stdout
+        self.assertIn("프로그램 파일만", out); self.assertIn("claire_relocate status", out)
+        self.assertIn('CLAIRE_VERSION = "9.9.9"', core.read_text(encoding="utf-8"))
+        self.assertEqual({str(x): x.stat().st_mtime_ns for x in legacy.rglob("*")}, snap)   # 장부·설정 그대로
+        self.assertEqual((app / "data-location.json").read_text(encoding="utf-8"), ptr)
+        self.assertFalse(list((home / "SecretaryBackups" / "schedule").glob("pre-upgrade-*-to-9.9.9-*")))
+        self.assertTrue((app / "relocation.lock").exists())
+
+    def test_get_sh_downgrade_guard_checks_blocked_state(self):
+        home = self.no_env_data()
+        legacy = home / "ClaireData"
+        subprocess.run([sys.executable, str(SCRIPTS / "claire_check"), "init"], env=dict(self.env, CLAIRE_DATA_DIR=str(legacy)),
+                       capture_output=True, check=True)
+        origin = self.repo_copy(self.tmp / "origin")
+        g = lambda *a: self.run_sh("git", *a, cwd=origin)   # noqa: E731
+        g("init", "-q", "-b", "main"); g("add", "-A"); g("commit", "-qm", "base")
+        g("tag", f"v{claire_core.CLAIRE_VERSION}")
+        self.env["CLAIRE_REPO_URL"] = str(origin)
+        self.run_sh("bash", str(origin / "get.sh"), "--skip-tests")
+        g("rm", "-q", "scripts/claire_paths.py"); g("commit", "-qm", "old"); g("tag", "v0.8.9")
+        # 데이터가 ~/ClaireData 에 있어도, 이전 작업이 중단된 상태면 내리지 않는다
+        app = home / ".claire-schedule-manager"
+        (app / "relocation.lock").write_text(json.dumps({"id": "x1", "kind": "migrate", "source": str(legacy)}), encoding="utf-8")
+        p = self.run_sh("bash", str(origin / "get.sh"), "--version", "0.8.9", "--skip-tests", ok=False)
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn("내리지 않습니다", p.stdout); self.assertIn("막힌 상태", p.stdout)
+        # 막힌 이유가 없고 같은 폴더면 검사를 통과한다 (이 가짜 옛 버전은 그 뒤 설치 단계에서 멈춘다)
+        (app / "relocation.lock").unlink()
+        p = self.run_sh("bash", str(origin / "get.sh"), "--version", "0.8.9", "--skip-tests", ok=False)
+        self.assertNotIn("내리지 않습니다", p.stdout)
+
+    def test_get_sh_refuses_downgrade_below_090_while_data_moved(self):
+        home = self.no_env_data()
+        origin = self.repo_copy(self.tmp / "origin")
+        g = lambda *a: self.run_sh("git", *a, cwd=origin)   # noqa: E731
+        g("init", "-q", "-b", "main"); g("add", "-A"); g("commit", "-qm", "base")
+        cur = claire_core.CLAIRE_VERSION
+        g("tag", f"v{cur}")
+        self.env["CLAIRE_REPO_URL"] = str(origin)
+        self.run_sh("bash", str(origin / "get.sh"), "--skip-tests")
+        self.assertTrue((home / "SecretaryData" / "services" / "schedule" / "claire.db").exists())
+        # 0.9.0 이전 버전(위치 기록을 모르는 코드)을 흉내: claire_paths.py 가 없는 태그
+        g("rm", "-q", "scripts/claire_paths.py"); g("commit", "-qm", "old"); g("tag", "v0.8.9")
+        p = self.run_sh("bash", str(origin / "get.sh"), "--version", "0.8.9", "--skip-tests", ok=False)
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn("내리지 않습니다", p.stdout)
+        self.assertIn(f'CLAIRE_VERSION = "{cur}"', (self.tmp / "skill" / "scripts" / "claire_core.py").read_text(encoding="utf-8"))
+        self.assertFalse((home / "ClaireData").exists())
 
 
 if __name__ == "__main__":

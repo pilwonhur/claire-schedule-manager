@@ -3,6 +3,73 @@
 형식은 [Keep a Changelog](https://keepachangelog.com/ko/1.1.0/)를 따르고 버전은 SemVer다.
 데이터 형식 버전(`SCHEMA_VERSION`)은 따로 관리한다.
 
+## [0.9.0] — 2026-10-25
+
+개발 이슈 2026-10-24 "SecretaryData 경로 지원 및 안전한 데이터 이전"(SEC-2026-005). **스키마 변경 없음(v5).**
+이 버전을 설치해도 데이터는 옮겨지지 않는다 — 기존 설치는 `~/ClaireData`를 그대로 쓰고, 옮기는 것은 `claire_relocate`로만 한다.
+절차·복구는 `references/data-location.md`.
+
+### 데이터 위치 해석 (`scripts/claire_paths.py`)
+- 모든 CLI·예약 실행(OpenClaw cron)·install/update 가 한 규칙을 쓴다: `CLAIRE_DATA_DIR`(그 프로세스만) > 위치 기록
+  `~/.claire-schedule-manager/data-location.json` > 기존 `~/ClaireData`(설치가 있으면) > 새 기본 `~/SecretaryData/services/schedule`.
+  홈은 사용자별로 해석한다.
+- 기본값 변경 때문에 빈 장부를 만들거나 옛 장부를 버리지 않는다. 0.9.0 으로 처음 `init`하면 지금 위치를 기록한다.
+- 장부를 열지 않고 멈추는 상태(모든 도구 `ok: false`): 이전 작업 중·중단(`maintenance`), 은퇴한 위치(`data_dir_retired`), 위치 기록 없이
+  두 위치 모두 장부(`data_conflict`), 위치 기록 대상 없음(`pointer_target_missing` — 빈 장부를 새로 만들지 않음), 기록 손상·루트 불일치,
+  위치 기록을 잃었는데 정본을 못 찾음(`pointer_missing_relocated` — 이전 흔적이 있으면 기본 위치에 빈 장부를 만들지 않음).
+- 위치 기록을 잃어도 옛 위치의 은퇴 표지를 따라(같은 이전 id 로 들어온 살아 있는 장부일 때만) 정본을 찾고, `init`이 위치 기록을 다시 남긴다.
+- 데이터 루트 표지 `claire-root.json`(root_id·상태). `claire_relocate where`로 위치·근거·백업 루트·막힌 이유를 본다.
+
+### 이전·되돌리기 (`claire_relocate`: where · plan · migrate · status · resume · abort · rollback)
+- `plan`(dry-run): 실제 경로·근거, 장부·WAL·표별 건수, 복사 대상·크기, 인증정보 개수(값 없음), 장부를 연 프로세스·진행 중 실행·Claire 예약,
+  중단 범위, 백업·복원 방법, 공간·권한, 절대 경로 참조, 과거 기록 속 옛 경로, 확인할 사용자 파일·문서(셸 설정·LaunchAgents·OpenClaw 설정·
+  워크스페이스·예약 문구·Obsidian 노트 — 줄 번호만), registry 현재 값. 장부·설정·예약을 바꾸지 않는다.
+- `migrate --confirm`: 잠금 → (선택) Claire 예약 3개만 정지 → 통제되지 않은 writer·진행 중 실행 확인 → SQLite 백업 API 로 최신 장부
+  (WAL 포함)를 백업 루트 `<id>/`에 → 대상 옆 임시 폴더에 장부·파일·인증정보(700/600 보호 복사) → 무결성·전체 지문·번호·파일 해시·첨부 해시·
+  무결성 결과 대조 → 원본 불변 재확인 후 옛 장부를 `claire.db.relocated-<id>`로 이름만 바꾸고 은퇴 표지 → 임시 폴더를 대상으로 →
+  위치 기록·registry(`schedule` 항목만, 잠금·원자적) → 환경변수 없이 재확인 → 예약 재개. 단계마다 이전 기록에 남는다.
+- 현재 파일 참조만 고친다(데이터 폴더 안을 가리키는 `attachment.stored_path`·`source_event.raw_path`·config 값). 과거 감사 기록은 그대로.
+- 기존 운영 상태(예: outbox 실패)는 이전 성공 판정과 따로 "기존 문제"로 보고하고 그대로 옮긴다. 이전 중 outbox 를 실행하지 않는다.
+- 내용이 있는 대상·은퇴한 대상(`--replace-retired` 없이)·동기화 폴더·공간·권한 부족·곧 실행될 예약·정본이 아닌 `CLAIRE_DATA_DIR`에서는 시작하지 않는다.
+- 실패: 전환 전이면 임시 폴더만 치우고 원본으로 계속, 전환 중이면 자동으로 되돌린다. 중단(강제 종료)되면 잠금이 남아 도구가 장부를 열지 않고
+  `resume`/`abort`로 이어 가거나 되돌린다. 동시 실행은 잠금에서 멈춘다(잠금 파일이 바뀌는 순간도 다시 확인).
+- 전환 뒤 새 위치에 기록이 생겼으면 되돌리기·`abort`가 **아무것도 바꾸지 않고 멈춘다**(`needs_decision`) — 새 위치를 지우지 않는다.
+  `resume`(옮긴 행이 모두 남아 있으면 새 기록을 포함해 마침) 또는 `abort --keep-changed-target`(새 위치를 `.<이름>.undone-<id>`로 비켜 둠).
+- 새 위치 확인 뒤의 실패(예약 다시 켜기 등)는 이전을 되돌리지 않고 `done` + 경고(`openclaw cron enable <id>` 명령)로 끝낸다.
+- 되돌리던 중 멈춘 작업(`undoing`)은 `abort`로만 잇고, 끝난 작업에 `resume`·`abort`는 `relocation_closed`로 거부한다.
+  원본이 이전 중 바뀌어 실패하면 원본을 정본으로 두고 잠금을 푼다(`failed_clean` + 알림).
+- 예약은 끄기 전에 이전 기록에 적는다(중간에 죽어도 다시 켤 목록이 남는다). 비켜 둔 은퇴 폴더는 전환이 덜 끝났어도 되돌린다.
+- 인증정보 복사 오류 메시지에 파일 이름·경로를 넣지 않는다(오류 종류·errno 만). 복사 개수를 대조한다.
+- `rollback`: 전환 뒤 새 기록이 없으면 옛 장부로 되돌리고(지문 확인, 갱신된 토큰은 옮기고 옛 것은 `.before-<id>`), 새 기록이 있으면 변화를 검증해
+  (사라진 행이 있으면 거부) 새 데이터를 먼저 백업한 뒤 전체를 옛 경로로 옮긴다(옛 폴더는 `.retired-<id>`로 비켜 둠). 옛 원본은 자동 삭제하지 않는다.
+
+### 백업 루트·복원 (`claire_check`)
+- 백업은 데이터 폴더 밖 백업 루트(`--out` > `CLAIRE_BACKUP_ROOT` > config `backup_root` > `~/SecretaryBackups/schedule`). 옛 `~/ClaireData/backups/`는 그대로 둔다.
+- 보존 정책은 Claire 정기 백업(manifest `kind: claire-backup`)에만 적용한다 — 이전 백업·업그레이드 전 사본·다른 작업의 사전 백업은 지우지 않는다.
+- manifest 에 데이터 위치·전체 지문·번호·파일 해시(`SHA256SUMS`)·`storage_ok`·기존 운영 문제. 인증정보 제외를 명시한다.
+- 가림 목록(`redaction_manifest.json`)은 백업 루트·각 백업·미러에서 합집합으로만 늘어난다. 새 `restore --from --to <빈 폴더>`가 격리 복원하며
+  가림을 다시 적용한다(지운 개인정보를 옛 백업으로 되살리지 않는다). `restore-test`는 파일 해시·다시 가릴 항목 수도 본다.
+- `integrity`·무결성 검사는 임의 데이터 루트를 볼 수 있다(`claire_data.run_integrity(root=)`).
+- `doctor`: `data_location`·`location_record`·`legacy_copy`·`backup_root`·`relocation` 항목. `version`에 데이터 위치·근거.
+
+### 설치·업데이트
+- `install.sh`가 같은 규칙으로 위치를 정하고, 막힌 이유가 있으면 아무것도 바꾸기 전에 멈춘다. `init`에 `CLAIRE_DATA_DIR`를 강제하지 않는다.
+- 직전 스킬 사본은 `~/.claire-schedule-manager/skill-prev`, 업그레이드 전 DB 사본은 백업 루트 `pre-upgrade-*`(읽기 전용 백업 API, 600).
+- 중단된 이전을 고친 코드로 잇거나 되돌려야 할 때만 `CLAIRE_INSTALL_CODE_ONLY=1`로 프로그램 파일만 설치한다(장부·설정·위치 기록·백업은 그대로).
+- `get.sh`: 지금 정본(예약 실행 기준·`CLAIRE_DATA_DIR`)이 정확히 `~/ClaireData`(또는 `CLAIRE_DATA_DIR`)이고 막힌 이유가 없고 그 장부가 은퇴 표지가
+  아닐 때만 0.9.0 이전 버전으로 내린다. 검사를 건너뛰어도 옛 위치의 은퇴 표지가 옛 코드를 멈춘다(옛 장부를 자동으로 열지 않음).
+- CI: `CLAIRE_DATA_DIR` 없는 신규 설치가 새 기본 위치·위치 기록을 쓰는지 확인.
+
+### 테스트 (156개)
+- 신규·기존·명시 override·두 위치 충돌·위치 기록 대상 없음, dry-run 무변경(장부·WAL·설정·예약·위치 기록), WAL 미반영 fixture 이전
+  (건수·번호·integrity_check·파일 해시·옛 코드 차단·인증정보 700/600·출력과 백업에 값 없음·예약은 claire-* 만 정지/재개·registry 는 schedule 만·
+  실패 outbox 그대로), 이전 뒤 조회·저장·첨부 열람·새 백업→격리 복원, 첨부 누락·해시 불일치·대상 충돌·권한·공간 부족·통제되지 않은 writer·
+  곧 실행될 예약·정본 아닌 override, 중단 후 resume·abort·임시 사본 손상·동시 실행, 되돌리기(새 기록 없음·있음·행 손실 거부),
+  registry 잠금, 보존 정책 범위·가림 재적용, 설치(신규·기존·충돌)·이전 뒤 update 재실행·0.9.0 이전 버전으로 내리기 거부.
+- 리뷰 반영: 전환 뒤 새 기록이 있을 때 abort 가 멈추고 resume·`--keep-changed-target`이 기록을 지키는지, 원본이 바뀌어 실패하면 잠금이 풀리는지,
+  예약 재개 실패가 경고로 끝나는지, 예약을 끄다 죽어도 목록이 남는지·`undoing`은 abort 로만, 위치 기록을 잃었을 때 은퇴 표지 따라가기·빈 장부 거부,
+  비켜 둔 폴더 복원, 인증정보 오류 문구에 이름 없음·잠금 파일 바뀜 재확인, 중단 상태의 코드 전용 설치, 내리기 검사의 막힌 상태 확인.
+
 ## [0.8.0] — 2026-10-11
 
 기능 요청 `claire-memo-integration-issue-2026-10-11.md`(독립적인 메모함 통합). **스키마 v5** — 표 추가만, 기존 표·데이터·번호는 그대로.

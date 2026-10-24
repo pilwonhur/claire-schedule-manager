@@ -32,3 +32,12 @@ jobs:
           ./install.sh
           test -x "$HOME/.local/bin/claire-update"
           python3 "$HOME/.claude/skills/claire-schedule-manager/scripts/claire_check" version
+      - name: fresh install without CLAIRE_DATA_DIR uses the new default location (0.9.0)
+        run: |
+          export HOME=$(mktemp -d)
+          unset CLAIRE_DATA_DIR
+          ./install.sh
+          test -f "$HOME/SecretaryData/services/schedule/claire.db"
+          test ! -e "$HOME/ClaireData"
+          test -f "$HOME/.claire-schedule-manager/data-location.json"
+          python3 "$HOME/.claude/skills/claire-schedule-manager/scripts/claire_relocate" where | grep -q '"source": "pointer"'

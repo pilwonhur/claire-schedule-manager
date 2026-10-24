@@ -92,11 +92,15 @@ Calendar 동기화는 시각을 순간(instant)으로 비교한다(표기만 다
 v2→v3 은 값을 바꾸지 않는다(원본 ID·상태·완료 이력·"등록 안 함" 기록 보존). 기존 활성 업무의 중요도 소급 분류는 설정(본인 주소)이
 필요해서 `claire_track.upkeep`이 한다 — 설치(`claire_check init`)·`maintain`·업무 현황 앞에서, 분류 없는 활성 업무만 골라 멱등하게
 (Discord 등록 → 높음, 메일 → 잠정값 + 검토 필요, 캘린더·Obsidian → 보통, 이미 높음은 유지).
-`install.sh`는 버전이 바뀌면 변환 전에 `backups/pre-upgrade-<이전>-to-<새>-<시각>/claire.db`를 남긴다.
+`install.sh`는 버전이 바뀌면 변환 전에 백업 루트의 `pre-upgrade-<이전>-to-<새>-<시각>/claire.db`를 남긴다.
 v1 코드는 v2 DB를 읽을 수 있다(추가 열만 있음). 완전히 되돌리려면 그 사본을 복원한다(`recovery-policy.md`).
 테스트·재현용으로 `CLAIRE_NOW` 환경변수가 현재 시각을 고정한다.
 
 ## 데이터 배치
 
-`CLAIRE_DATA_DIR`(기본 `~/ClaireData`) 아래 `claire.db`, `config.json`, `secrets/`(700, 파일 600),
-`raw/`, `attachments/`, `exports/`, `backups/`, `logs/`. Dropbox·iCloud 안에 두면 `init`과 `doctor`가 경고·실패로 표시한다.
+데이터 위치(0.9.0: `CLAIRE_DATA_DIR` > 위치 기록 `~/.claire-schedule-manager/data-location.json` > 기존 `~/ClaireData` > 새 기본
+`~/SecretaryData/services/schedule`, `references/data-location.md`) 아래 `claire.db`, `config.json`, `secrets/`(700, 파일 600),
+`raw/`, `attachments/`, `exports/`, `logs/`, `claire-root.json`(데이터 루트 표지), `relocation/`(이전 기록 사본).
+백업은 데이터 위치 밖 백업 루트(기본 `~/SecretaryBackups/schedule`)에 둔다. Dropbox·iCloud 안에 두면 `init`과 `doctor`가 경고·실패로 표시한다.
+`attachment.stored_path`·`source_event.raw_path`는 데이터 위치 기준 **상대 경로**다(위치를 옮겨도 그대로). 데이터 폴더 안을 가리키는
+절대 경로가 남아 있으면 `claire_relocate`가 이전 때 상대 경로로 고친다. `run.steps` 등 과거 기록 속 경로는 바꾸지 않는다.

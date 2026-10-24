@@ -1,6 +1,6 @@
 ---
 name: claire-schedule-manager
-version: 0.8.0
+version: 0.9.0
 description: >-
   교수님의 일정·업무를 Gmail(기관 메일 포워드 포함)·Google Calendar·Obsidian Tasks·Discord 이미지에서
   하나의 장부(SQLite)로 모아 아침 브리핑·확인 질문·진행 추적·검색을 제공한다. Claire 전용 Discord 채널에서
@@ -14,7 +14,7 @@ description: >-
   Daily 완료 기록)·진행·되돌리기·검색과 Calendar·Obsidian 반영(주제 문서 Tasks), 보고 전달 기록, 업무와 분리된 메모함까지 동작한다.
 ---
 
-# Claire 통합 일정·업무 관리 (v0.8.0 — 메모함: 업무와 분리된 기록)
+# Claire 통합 일정·업무 관리 (v0.9.0 — 데이터 위치 SecretaryData 지원·안전한 이전)
 
 정본 설계: 프로젝트의 `PRD.md` v2.1. 이 문서는 판단 계층(Claire)이 지켜야 할 규칙과 절차만 적는다.
 **스킬 파일은 고치지 않는다.** 규칙을 바꿔야 하면 교수님께 제안만 하고, 변경은 저장소 → 릴리스 → `claire-update`로 들어온다(§8).
@@ -46,6 +46,10 @@ description: >-
 ## 1. 명령 요약
 
 모든 명령은 JSON을 낸다(`--format llm|text`는 사람·LLM용 텍스트). `ok: false`면 그 자리에서 멈추고 오류를 그대로 전한다.
+**데이터 위치 오류(0.9.0)** — `error.code`가 `maintenance`(데이터 이전 중·중단), `data_dir_retired`, `data_conflict`,
+`pointer_target_missing`, `pointer_missing_relocated`, `pointer_unreadable`, `root_mismatch`이면 **다시 시도하지 않고**(정기 점검의 "한 번 고쳐 재시도"도 하지 않는다)
+`error.message`와 `error.fix`를 교수님께 그대로 전하고 그 턴을 끝낸다. 장부는 그대로 안전하다. `claire_relocate`·`CLAIRE_DATA_DIR`
+설정·파일 이동으로 직접 고치지 않는다(이전·되돌리기는 교수님이 터미널에서 한다, `references/data-location.md`).
 
 ```bash
 S=~/.claude/skills/claire-schedule-manager/scripts
@@ -510,7 +514,8 @@ OpenClaw cron(`claire-checkin`, `0 12,18 * * *`)이 "미등록 일정 확인을 
 
 ## 6. 하지 않는 것
 
-- DB 파일 직접 열기, `sqlite3` 명령, 스키마 변경, `~/ClaireData/secrets/` 읽기.
+- DB 파일 직접 열기, `sqlite3` 명령, 스키마 변경, 데이터 위치의 `secrets/` 읽기.
+- 데이터 위치 바꾸기: `claire_relocate`(migrate·rollback·resume·abort) 실행, `CLAIRE_DATA_DIR` 지정, 데이터 폴더 이동·삭제. 교수님이 터미널에서 한다.
 - Calendar·Obsidian 을 직접 쓰는 것. 쓰기는 outbox 를 거쳐 `claire_apply`만 한다. 메일 발송·초대·읽음 처리는 없다.
 - 메일·이미지에서 발견한 일정을 승인 없이 Calendar 에 넣는 것 (D5 b). 교수님 지시(`등록:`)와 답변으로 확정된 것만 자동이다.
 - 새 폴더·MOC 생성. Daily 노트는 템플릿대로 만들지만 주제 노트는 만들지 않는다 (`canonical_note`는 있는 노트만. 예외는 임시 수집 노트 하나).
@@ -538,6 +543,7 @@ OpenClaw cron(`claire-checkin`, `0 12,18 * * *`)이 "미등록 일정 확인을 
 - `references/extraction-schema.md` — 제안 JSON 규격과 검증 규칙
 - `references/briefing-format.md` — 브리핑 형식
 - `references/schema.md` — 표·상태 전이 · `references/doctor.md` — 진단 · `references/recovery-policy.md` — 백업·복구
+- `references/data-location.md` — 데이터 위치 규칙·이전·되돌리기 (0.9.0)
 - `CHANGELOG.md`
 
 ## 8. 버전·업데이트
@@ -545,3 +551,4 @@ OpenClaw cron(`claire-checkin`, `0 12,18 * * *`)이 "미등록 일정 확인을 
 - 설치 버전: `claire_check version` (`--remote`면 GitHub 최신 릴리스와 비교). "버전 뭐야?", "업데이트 있어?"에 이 결과로 답한다.
 - 업데이트는 교수님이 터미널에서 `claire-update`(최신 릴리스) / `claire-update --version v0.4.5`(되돌리기)로 한다. Claire가 실행하지 않는다.
 - 업데이트 뒤 OpenClaw 설정·cron 변경이 필요하면 `claire_check doctor`가 알려 준다(0.5.0: `cron_checkin`, 0.6.0: `send_to`).
+- "데이터 어디 있어?"에는 `claire_relocate where`(읽기 전용)의 `data_dir`·`source_label`로 답한다. 옮기거나 되돌리는 명령은 알려만 드린다.

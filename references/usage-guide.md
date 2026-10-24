@@ -358,7 +358,8 @@
 
 ## 11. 데이터와 백업
 
-- 장부는 `~/ClaireData/claire.db`, 원문은 `~/ClaireData/raw/`, 이미지는 `~/ClaireData/attachments/`.
+- 장부·원문·이미지는 데이터 위치(`claire_relocate where` — 기존 설치는 `~/ClaireData`, 신규·이전 뒤는 `~/SecretaryData/services/schedule`)의
+  `claire.db`·`raw/`·`attachments/`. 백업은 `~/SecretaryBackups/schedule/` (0.9.0, `references/data-location.md`).
 - 매일 점검 끝에 백업하고 `~/Dropbox/ClaireBackup/`에 복사한다. 인증 토큰은 백업에 넣지 않는다.
 - 진단: `claire_check doctor --format text` (터미널). 복구 시험: `claire_check restore-test --from <백업 폴더>`.
 - 메모는 같은 장부의 별도 표에 있다. 백업 폴더의 `markdown/claire-memos.md`로도 읽을 수 있고, `claire_memo export`로 따로 내보낼 수 있다.

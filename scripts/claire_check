@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """claire_check — 초기화·무결성·백업·복구·연결 진단 (PRD §10, §11, §13 1단계).
 
-  init                      데이터 디렉터리·스키마·config.json 생성 (멱등)
+  init                      데이터 디렉터리·스키마·config.json 생성 (멱등). 0.9.0: 데이터 루트 표지·위치 기록
   integrity [--strict]      무결성 검사 (§10)
-  backup [--out] [--no-mirror]
-  restore-test --from <backup dir 또는 db 파일>   건수·해시 대조 (TC20)
+  backup [--out] [--no-mirror]                    백업 루트(기본 ~/SecretaryBackups/schedule)에 <시각>/ 백업
+  restore-test --from <backup dir 또는 db 파일>   건수·해시·파일 해시 대조 (TC20), 다시 가려야 할 항목 수
+  restore --from <backup dir> --to <빈 폴더>        격리 복원 (가림 재적용·검증). 운영 위치에는 복원하지 않는다
   doctor [--offline] [--format text]              §4.3 확인 사항 실측
   channel-prompt [--guild --channel]              Claire 채널 systemPrompt 패치 JSON (| openclaw config patch --stdin)
   channel-target [--channel ID] [--write]         cron 턴에서 보낼 채널(discord.send_to) 확인·설정 (0.6.0)
@@ -28,12 +29,18 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "connectors"))
 from claire_core import (  # noqa: E402
-    CLAIRE_VERSION, COUNT_TABLES, DB_NAME, DEFAULT_CONFIG, EVIDENCE_CODES, EVIDENCE_CRITERIA_RE,
+    CLAIRE_VERSION, COUNT_TABLES, DB_NAME, DEFAULT_CONFIG,
     SCHEMA_VERSION, ClaireError, atomic_write_text, connect, content_hash, data_dir, db_path,
-    hours_between, is_synced_location, now_iso, run_cli, sha256_file, table_counts, tz_of,
+    is_synced_location, now_iso, run_cli, sha256_file, table_counts, tz_of,
 )
+import claire_paths  # noqa: E402
+import claire_data  # noqa: E402
+from claire_data import run_integrity  # noqa: E402,F401  (0.9.0: claire_data 로 옮김 — 임의 데이터 루트 검사)
 
-DATA_SUBDIRS = ("secrets", "raw", "attachments", "exports", "backups", "logs")
+# 0.9.0: backups/ 는 데이터 폴더가 아니라 백업 루트(claire_paths.backup_root)에 둔다
+DATA_SUBDIRS = ("secrets", "raw", "attachments", "exports", "logs")
+SECRETS_POLICY = ("인증정보(secrets/)는 백업에 넣지 않는다. 복원 사본에는 토큰이 없으므로 google_api.py authorize 로 다시 "
+                  "발급하거나, 데이터 위치 이전(claire_relocate)의 보호 복사(700/600, 값 출력 없음)로만 옮긴다.")
 REPO_URL = "https://github.com/pilwonhur/claire-schedule-manager.git"
 INSTALL_INFO = Path(__file__).resolve().parent.parent / "INSTALL_INFO.json"    # install.sh 가 쓴다
 CHECKIN_EXPR = "0 12,18 * * *"
@@ -133,15 +140,27 @@ def _merge_config_file(path: Path) -> list[str]:
 
 
 def cmd_init(args, cfg):
-    """데이터베이스와 디렉터리를 만든다. 이미 있으면 그대로 둔다 (멱등)."""
-    d = data_dir()
-    existed = db_path().exists()
-    d.mkdir(parents=True, exist_ok=True)
+    """데이터베이스와 디렉터리를 만든다. 이미 있으면 그대로 둔다 (멱등).
+    0.9.0: 위치는 claire_paths 가 정한다. 이전 작업 중·은퇴한 위치·두 위치 충돌·위치 기록 대상 없음이면 아무것도 만들지 않는다.
+    위치 기록이 없으면(처음 설치·0.9.0 으로 처음 업데이트) 지금 위치를 기록해 예약 실행·수동 실행이 같은 장부를 쓰게 한다."""
+    try:
+        loc = claire_paths.require_usable()
+    except claire_paths.LocationError as e:
+        raise ClaireError(e.code, e.message, fix=e.fix, **e.extra) from None
+    d = loc.path
+    existed = (d / DB_NAME).exists()
+    d.mkdir(parents=True, exist_ok=True, mode=0o700)
     for sub in DATA_SUBDIRS:
         (d / sub).mkdir(parents=True, exist_ok=True)
     os.chmod(d / "secrets", 0o700)
     added = _merge_config_file(d / "config.json")
     conn = connect(create=True)
+    adopt = (loc.pointer or {}).get("root_id") if loc.source == "pointer" else None
+    marker = claire_paths.ensure_marker(d, root_id=adopt)
+    pointer_written = False
+    if loc.source in ("legacy", "default", "moved") and not loc.pointer:   # moved: 잃어버린 위치 기록을 은퇴 표지로 되살림
+        claire_paths.write_pointer(d, marker.get("root_id"), reason=f"init:{loc.source}")
+        pointer_written = True
     version = conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
     synced = is_synced_location(d)
     # 0.6.1: 설치·업그레이드 때 바로 기존 업무 중요도 소급 분류(한 번)와 자동 마감 표시 보정 (다음 06:00 을 기다리지 않는다)
@@ -153,6 +172,9 @@ def cmd_init(args, cfg):
         "data_dir": str(d), "db": str(db_path()), "created": not existed,
         "schema_version": int(version["value"]), "claire_version": CLAIRE_VERSION,
         "config_added_keys": added, "counts": table_counts(conn), "upkeep": upkeep,
+        "location": {"source": loc.source, "source_label": claire_paths.SOURCE_LABELS.get(loc.source),
+                     "root_id": marker.get("root_id"), "pointer_written": pointer_written,
+                     "warnings": loc.warnings},
         "warning": (f"데이터 디렉터리가 {synced} 동기화 폴더 안에 있습니다. §4.2 위반입니다."
                     if synced else None),
         "message": "데이터베이스를 만들었습니다." if not existed else "이미 초기화되어 있습니다. 변경 없음.",
@@ -163,119 +185,11 @@ def cmd_init(args, cfg):
 # integrity (§10)
 # --------------------------------------------------------------------------
 
-def run_integrity(conn, cfg=None) -> dict:
-    problems = []
-
-    def add(kind, detail):
-        problems.append({"check": kind, "detail": detail})
-
-    orphan_sql = {
-        "item_source.item": "SELECT COUNT(*) c FROM item_source s LEFT JOIN item i ON i.id=s.item_id WHERE i.id IS NULL",
-        "item_source.source_event": "SELECT COUNT(*) c FROM item_source s LEFT JOIN source_event e ON e.id=s.source_event_id WHERE e.id IS NULL",
-        "link.item": "SELECT COUNT(*) c FROM link l LEFT JOIN item i ON i.id=l.item_id WHERE i.id IS NULL",
-        "attachment.source_event": "SELECT COUNT(*) c FROM attachment a LEFT JOIN source_event e ON e.id=a.source_event_id WHERE e.id IS NULL",
-        "question.item": "SELECT COUNT(*) c FROM question q WHERE q.item_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM item i WHERE i.id=q.item_id)",
-        "relation.from": "SELECT COUNT(*) c FROM relation r LEFT JOIN item i ON i.id=r.from_item_id WHERE i.id IS NULL",
-        "relation.to": "SELECT COUNT(*) c FROM relation r LEFT JOIN item i ON i.id=r.to_item_id WHERE i.id IS NULL",
-        "activity_log.item": "SELECT COUNT(*) c FROM activity_log a WHERE a.item_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM item i WHERE i.id=a.item_id)",
-    }
-    if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='memo'").fetchone():     # 0.8.0 메모함
-        orphan_sql.update({
-            "memo_log.memo": "SELECT COUNT(*) c FROM memo_log l LEFT JOIN memo m ON m.id=l.memo_id WHERE m.id IS NULL",
-            "memo_link.task": "SELECT COUNT(*) c FROM memo_link l WHERE l.kind='task' AND NOT EXISTS (SELECT 1 FROM item i WHERE i.id=l.target_id)",
-            "memo_link.memo": "SELECT COUNT(*) c FROM memo_link l WHERE NOT EXISTS (SELECT 1 FROM memo m WHERE m.id=l.memo_id) "
-                              "OR (l.kind='memo' AND NOT EXISTS (SELECT 1 FROM memo m WHERE m.id=l.target_id))",
-        })
-    for name, sql in orphan_sql.items():
-        n = conn.execute(sql).fetchone()["c"]
-        if n:
-            add("orphan", f"{name} 고아 레코드 {n}건")
-
-    # done 항목의 근거 누락 (G5)
-    for r in conn.execute("SELECT id, ref FROM item WHERE status='done'"):
-        ev = conn.execute(
-            "SELECT reason FROM activity_log WHERE item_id=? AND action='complete' AND undone_at IS NULL "
-            "ORDER BY id DESC LIMIT 1", (r["id"],)).fetchone()
-        code = ev["reason"] if ev else None
-        if not code or not (code in EVIDENCE_CODES or EVIDENCE_CRITERIA_RE.match(code)):
-            add("done_without_evidence", f"{r['ref']} 가 근거 코드 없이 done 입니다")
-
-    # needs_info 인데 열린 질문이 없음
-    for r in conn.execute(
-        "SELECT i.ref FROM item i WHERE i.status='needs_info' AND NOT EXISTS "
-        "(SELECT 1 FROM question q WHERE q.item_id=i.id AND q.status='open')"):
-        add("needs_info_without_question", f"{r['ref']} 는 needs_info 인데 열린 질문이 없습니다")
-
-    # outbox 실패 잔량 (0.8.0: 메모함 반영은 따로 센다 — 업무 반영 실패와 섞지 않는다)
-    n = conn.execute("SELECT COUNT(*) c FROM outbox WHERE status='failed' AND op <> 'obsidian.memo'").fetchone()["c"]
-    if n:
-        add("outbox_failed", f"outbox 실패 {n}건")
-    n = conn.execute("SELECT COUNT(*) c FROM outbox WHERE status='failed' AND op = 'obsidian.memo'").fetchone()["c"]
-    if n:
-        add("memo_sync_failed", f"메모함 Obsidian 반영 실패·보류 {n}건 (메모는 저장됨 — claire_memo sync --pending, "
-                                "Obsidian 에서 고친 블록이면 --memo … --overwrite)")
-
-    # 보고 전송 실패 잔량 (0.6.0) — 재전송하면 사라진다
-    n = conn.execute("SELECT COUNT(*) c FROM delivery WHERE status='failed'").fetchone()["c"]
-    if n:
-        add("delivery_failed", f"보고 전송 실패 {n}쪽 (claire_buttons resend)")
-
-    # sync_state 오래된 커서 (마지막 성공이 48시간 이전)
-    if cfg:
-        now_s = now_iso(cfg)
-        for r in conn.execute("SELECT * FROM sync_state"):
-            if r["last_success_at"] and hours_between(r["last_success_at"], now_s) > 48:
-                add("sync_stale", f"{r['platform']}/{r['account']} 마지막 성공 {r['last_success_at']}")
-            if r["full_sync_needed"]:
-                add("sync_full_needed", f"{r['platform']}/{r['account']} 전체 재동기화 필요")
-
-    # 첨부 sha256
-    for r in conn.execute("SELECT * FROM attachment WHERE redacted_at IS NULL"):
-        p = data_dir() / r["stored_path"]
-        if not p.exists():
-            add("attachment_missing", f"첨부 파일 없음: {r['stored_path']}")
-        elif sha256_file(p) != r["sha256"]:
-            add("attachment_hash", f"첨부 해시 불일치: {r['stored_path']}")
-
-    # ref 중복·공백
-    ref_tables = [("item", "항목"), ("question", "질문")]
-    if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='memo'").fetchone():
-        ref_tables.append(("memo", "메모"))
-    for table, label in ref_tables:
-        refs = [r["ref"] for r in conn.execute(f"SELECT ref FROM {table}")]
-        if len(refs) != len(set(refs)):
-            add("ref_duplicate", f"{label} 번호가 중복되었습니다")
-        nums = sorted(int(x.rsplit("-", 1)[1]) for x in refs if "-" in x)
-        if nums:
-            missing = sorted(set(range(1, nums[-1] + 1)) - set(nums))
-            if missing:
-                add("ref_gap", f"{label} 번호 공백 {len(missing)}건: {missing[:10]}")
-
-    # FTS 재생성 필요 여부
-    n_items = conn.execute("SELECT COUNT(*) c FROM item WHERE deleted_at IS NULL").fetchone()["c"]
-    try:
-        n_fts = conn.execute("SELECT COUNT(*) c FROM search_fts").fetchone()["c"]
-        if n_fts != n_items:
-            add("fts_stale", f"검색 색인 {n_fts}건 ≠ 항목 {n_items}건. rebuild 가 필요합니다")
-    except sqlite3.OperationalError as e:
-        add("fts_error", str(e))
-
-    # 실행 잠금 누수
-    n = conn.execute("SELECT COUNT(*) c FROM run WHERE status='running'").fetchone()["c"]
-    if n > 1:
-        add("run_lock", f"running 상태의 실행이 {n}건입니다")
-
-    pragma = conn.execute("PRAGMA integrity_check").fetchone()[0]
-    if pragma != "ok":
-        add("sqlite", pragma)
-
-    return {"healthy": not problems, "problem_count": len(problems), "problems": problems,
-            "counts": table_counts(conn), "claire_version": CLAIRE_VERSION}
-
-
 def cmd_integrity(args, cfg):
     conn = connect(create=False)
     result = run_integrity(conn, cfg)
+    result["data_dir"] = str(data_dir())
+    result["db"] = str(db_path())
     if not result["healthy"] and args.strict:
         raise ClaireError("integrity_failed", f"무결성 문제 {result['problem_count']}건",
                           problems=result["problems"])
@@ -300,7 +214,7 @@ def _copy_tree(src: Path, dst: Path) -> int:
         return 0
     n = 0
     for p in src.rglob("*"):
-        if p.is_file() and ".incoming" not in p.parts:
+        if p.is_file() and ".incoming" not in p.parts and p.name != ".DS_Store":
             rel = p.relative_to(src)
             out = dst / rel
             out.parent.mkdir(parents=True, exist_ok=True)
@@ -313,8 +227,10 @@ def _copy_tree(src: Path, dst: Path) -> int:
 
 
 def _prune(backup_root: Path, cfg) -> list[str]:
-    dirs = sorted([d for d in backup_root.iterdir() if d.is_dir() and d.name[0].isdigit()],
-                  reverse=True)
+    """보존 정책(일 7·주 4·월 12)은 Claire 정기 백업에만 적용한다 (0.9.0). 이전용 백업, 업그레이드 전 사본,
+    다른 시스템이 같은 루트에 둔 사본(예: 사전 백업 20261024T224649)은 지우지 않는다."""
+    dirs = sorted([d for d in backup_root.iterdir() if d.is_dir() and d.name[0].isdigit()
+                   and claire_data.is_prunable_backup(d)], reverse=True)
     keep, seen_w, seen_m = set(), set(), set()
     ret = cfg["backup_retention"]
     for i, d in enumerate(dirs):
@@ -339,27 +255,27 @@ def _prune(backup_root: Path, cfg) -> list[str]:
     return removed
 
 
-def _redaction_manifest(conn, backup_root: Path, ts: str) -> int:
-    path = backup_root / "redaction_manifest.json"
-    items = [{"kind": "source_event", "id": r["id"], "redacted_at": r["redacted_at"],
-              "fingerprint": r["fingerprint"]}
-             for r in conn.execute("SELECT id, redacted_at, fingerprint FROM source_event "
-                                   "WHERE redacted_at IS NOT NULL")]
-    items += [{"kind": "attachment", "id": r["id"], "redacted_at": r["redacted_at"], "sha256": r["sha256"]}
-              for r in conn.execute("SELECT id, redacted_at, sha256 FROM attachment "
-                                    "WHERE redacted_at IS NOT NULL")]
-    atomic_write_text(path, json.dumps({"updated_at": ts, "entries": items},
-                                       ensure_ascii=False, indent=2))
-    return len(items)
+def _backup_dest(root: Path, stamp: str) -> Path:
+    """같은 초에 두 번 백업해도 섞이지 않게 (<시각>, <시각>-2, …)."""
+    dest, n = root / stamp, 1
+    while dest.exists():
+        n += 1
+        dest = root / f"{stamp}-{n}"
+    return dest
+
+
+def _hash_tree(base: Path, rels) -> dict:
+    return {rel: sha256_file(base / rel) for rel in rels}
 
 
 def cmd_backup(args, cfg):
     conn = connect(create=False)
     ts = now_iso(cfg)
     stamp = datetime.fromisoformat(ts).strftime("%Y%m%dT%H%M%S")
-    root = Path(args.out).expanduser() if args.out else data_dir() / "backups"
-    dest = root / stamp
-    dest.mkdir(parents=True, exist_ok=True)
+    root = claire_paths.backup_root(cfg.get("backup_root"), args.out)
+    root.mkdir(parents=True, exist_ok=True)
+    dest = _backup_dest(root, stamp)
+    dest.mkdir(mode=0o700)
 
     _snapshot(conn, dest / DB_NAME)
     here = Path(__file__).resolve().parent
@@ -371,21 +287,35 @@ def cmd_backup(args, cfg):
                     "--out", str(dest / "markdown")], check=True, capture_output=True, env=env)
     n_att = _copy_tree(data_dir() / "attachments", dest / "attachments")
     n_raw = _copy_tree(data_dir() / "raw", dest / "raw")
-    n_red = _redaction_manifest(conn, root, ts)
+    # 가림 목록은 합집합으로만 늘린다 (옛 백업으로 되돌려도 지운 개인정보를 다시 들이지 않게, 0.9.0)
+    entries = claire_data.redaction_entries(conn)
+    n_red = claire_data.merge_redaction_manifest(root / claire_data.REDACTION_MANIFEST, entries, ts)
+    shutil.copy2(root / claire_data.REDACTION_MANIFEST, dest / claire_data.REDACTION_MANIFEST)
     # config 사본 (비밀값 없음). secrets/ 는 복사하지 않는다.
     cfg_path = data_dir() / "config.json"
     if cfg_path.exists():
         shutil.copy2(cfg_path, dest / "config.json")
+    rels = [p.relative_to(dest).as_posix() for sub in ("attachments", "raw") for p in (dest / sub).rglob("*") if p.is_file()]
+    if (dest / "config.json").exists():
+        rels.append("config.json")
+    claire_data.write_sha256sums(dest, _hash_tree(dest, rels))
 
     snap = _open(dest / DB_NAME)
-    verify = run_integrity(snap)
+    verify = run_integrity(snap, root=dest)
     counts = table_counts(snap)
     chash = content_hash(snap)
+    fp = claire_data.data_fingerprint(snap)
     snap.close()
-    manifest = {"created_at": ts, "claire_version": CLAIRE_VERSION, "schema_version": SCHEMA_VERSION,
-                "counts": counts, "content_hash": chash, "attachments": n_att, "raw_files": n_raw,
-                "db_sha256": sha256_file(dest / DB_NAME), "snapshot_healthy": verify["healthy"],
-                "excludes": ["secrets/"]}
+    marker = claire_paths.read_marker(data_dir()) or {}
+    manifest = {"kind": "claire-backup", "created_at": ts, "claire_version": CLAIRE_VERSION, "schema_version": SCHEMA_VERSION,
+                "data_dir": str(data_dir()), "data_root_id": marker.get("root_id"),
+                "counts": counts, "content_hash": chash, "fingerprint": fp["sha256"], "refs": fp["refs"],
+                "attachments": n_att, "raw_files": n_raw, "file_hashes": len(rels),
+                "db_sha256": sha256_file(dest / DB_NAME),
+                # snapshot_healthy 는 운영 상태(예: outbox 실패 1건)까지 포함한다. 장부·파일 자체는 storage_ok 로 본다 (0.9.0)
+                "snapshot_healthy": verify["healthy"], "storage_ok": verify["storage_ok"],
+                "operational_problems": verify["operational_problems"],
+                "excludes": ["secrets/", "backups/", "skill-prev/"], "secrets_policy": SECRETS_POLICY}
     atomic_write_text(dest / "manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2))
 
     removed = _prune(root, cfg)
@@ -394,17 +324,50 @@ def cmd_backup(args, cfg):
         mirror = Path(cfg["backup_mirror"]).expanduser()
         try:
             mirror.mkdir(parents=True, exist_ok=True)
-            mdest = mirror / stamp
+            mdest = mirror / dest.name
             if mdest.exists():
                 shutil.rmtree(mdest)
             shutil.copytree(dest, mdest)
-            shutil.copy2(root / "redaction_manifest.json", mirror / "redaction_manifest.json")
+            claire_data.merge_redaction_manifest(mirror / claire_data.REDACTION_MANIFEST, entries, ts)
             _prune(mirror, cfg)
             mirrored = str(mdest)
         except OSError as e:
             mirrored = f"실패: {e}"
-    return {"backup_dir": str(dest), "manifest": manifest, "pruned": removed, "mirror": mirrored,
-            "redaction_entries": n_red}
+    return {"backup_dir": str(dest), "backup_root": str(root), "manifest": manifest, "pruned": removed,
+            "mirror": mirrored, "redaction_entries": n_red}
+
+
+def _redaction_sources(src: Path, cfg) -> list:
+    """복원 때 다시 적용할 가림 목록: 백업 안 사본, 백업이 있던 루트, 지금 백업 루트, 미러 (합집합)."""
+    paths = []
+    if src.is_dir():
+        paths += [src / claire_data.REDACTION_MANIFEST, src.parent / claire_data.REDACTION_MANIFEST]
+    paths.append(claire_paths.backup_root(cfg.get("backup_root")) / claire_data.REDACTION_MANIFEST)
+    if cfg.get("backup_mirror"):
+        paths.append(Path(cfg["backup_mirror"]).expanduser() / claire_data.REDACTION_MANIFEST)
+    entries = claire_data.read_redaction_files(*paths)
+    try:                                   # 지금 장부에 있는 가림도 (목록 파일이 없던 시절의 가림)
+        if db_path().exists() and not claire_paths.resolve().blockers:
+            live = claire_data.open_ro(db_path())
+            seen = {(e.get("kind"), e.get("id")) for e in entries}
+            entries += [e for e in claire_data.redaction_entries(live) if (e["kind"], e["id"]) not in seen]
+            live.close()
+    except sqlite3.Error:
+        pass
+    return entries
+
+
+def _verify_backup_files(src: Path) -> dict:
+    sums = claire_data.read_sha256sums(src) if src.is_dir() else {}
+    missing, bad = [], []
+    for rel, h in sums.items():
+        p = src / rel
+        if not p.exists():
+            missing.append(rel)
+        elif sha256_file(p) != h:
+            bad.append(rel)
+    return {"listed": len(sums), "missing": missing, "hash_mismatch": bad,
+            "ok": (not missing and not bad) if sums else None}
 
 
 def cmd_restore_test(args, cfg):
@@ -425,10 +388,11 @@ def cmd_restore_test(args, cfg):
     src_conn.close()
     r_counts = table_counts(restored)
     r_hash = content_hash(restored)
-    integ = run_integrity(restored)
+    integ = run_integrity(restored, root=src if src.is_dir() else src.parent)
+    pending = claire_data.pending_redactions(restored, _redaction_sources(src, cfg))
 
     live = {}
-    if db_path().exists():
+    if db_path().exists() and not claire_paths.resolve().blockers:
         lconn = connect(create=False)
         live = {"counts": table_counts(lconn), "content_hash": content_hash(lconn)}
     diff = {t: {"live": live["counts"][t], "restored": r_counts[t]}
@@ -438,13 +402,73 @@ def cmd_restore_test(args, cfg):
         manifest_match = (manifest.get("counts") == r_counts and manifest.get("content_hash") == r_hash)
     return {
         "source": str(db_file), "restored_counts": r_counts, "restored_content_hash": r_hash,
-        "restored_healthy": integ["healthy"], "restored_problems": integ["problems"],
-        "manifest_match": manifest_match,
+        "restored_healthy": integ["healthy"], "restored_storage_ok": integ["storage_ok"],
+        "restored_problems": integ["problems"],
+        "manifest_match": manifest_match, "files": _verify_backup_files(src),
+        "redactions_to_reapply": len(pending),
         "live_match": (not diff and live.get("content_hash") == r_hash) if live else None,
         "live_diff": diff, "secrets_included": bool(secrets_leaked),
         "db_in_synced_folder": is_synced_location(db_path()),
-        "note": "live 차이는 백업 이후 추가된 기록일 수 있습니다. manifest_match 가 복구 성공의 기준입니다.",
+        "note": "live 차이는 백업 이후 추가된 기록일 수 있습니다. manifest_match 가 복구 성공의 기준입니다."
+                + (" 이 백업에는 그 뒤 가린 항목이 있어 복원하면 다시 가립니다(claire_check restore)." if pending else ""),
     }
+
+
+def cmd_restore(args, cfg):
+    """백업을 **새 빈 폴더**에 복원한다 (격리 사본). 운영 위치·위치 기록 대상에는 복원하지 않는다.
+    가림 목록을 다시 적용하고(지운 개인정보 재도입 방지) 무결성·건수·파일 해시를 확인한다. 인증정보는 없다."""
+    src = Path(args.from_path).expanduser()
+    db_file = src / DB_NAME if src.is_dir() else src
+    if not db_file.exists():
+        raise ClaireError("backup_missing", f"백업 DB가 없습니다: {db_file}")
+    dst = Path(args.to).expanduser()
+    canon = claire_paths.resolve(use_env=False)
+    if claire_paths.same_path(dst, canon.path) or claire_paths.same_path(dst, data_dir()):
+        raise ClaireError("restore_target_live", f"운영 데이터 위치에는 바로 복원하지 않습니다: {dst}",
+                          fix="빈 폴더에 복원해 확인한 뒤, 운영 전환은 references/recovery-policy.md 의 절차를 따르세요")
+    if dst.exists() and any(p.name != ".DS_Store" for p in dst.iterdir()):
+        raise ClaireError("restore_target_not_empty", f"복원 대상 폴더가 비어 있지 않습니다: {dst}")
+    files_check = _verify_backup_files(src)
+    if files_check["ok"] is False:
+        raise ClaireError("backup_files_bad", "백업 파일 해시가 맞지 않습니다", files=files_check)
+    dst.mkdir(parents=True, exist_ok=True, mode=0o700)
+    claire_data.sqlite_snapshot(db_file, dst / DB_NAME)
+    copied = 0
+    if src.is_dir():
+        for sub in ("attachments", "raw", "exports", "logs"):
+            for p in sorted((src / sub).rglob("*")) if (src / sub).is_dir() else []:
+                if p.is_file() and p.name != ".DS_Store":
+                    claire_data.copy_hashed(p, dst / p.relative_to(src))
+                    copied += 1
+        if (src / "config.json").exists():
+            claire_data.copy_hashed(src / "config.json", dst / "config.json")
+    for sub in DATA_SUBDIRS:
+        (dst / sub).mkdir(exist_ok=True)
+    os.chmod(dst / "secrets", 0o700)
+    conn = _open(dst / DB_NAME)
+    entries = _redaction_sources(src, cfg)
+    conn.execute("BEGIN IMMEDIATE")
+    applied = claire_data.apply_redactions(conn, dst, entries)
+    if applied:
+        from claire_core import rebuild_fts
+        rebuild_fts(conn)
+    conn.execute("COMMIT")
+    manifest = json.loads((src / "manifest.json").read_text(encoding="utf-8")) if src.is_dir() and (src / "manifest.json").exists() else None
+    claire_paths.write_marker(dst, {"format": 1, "system": claire_paths.SYSTEM, "root_id": claire_paths.new_root_id(),
+                                    "state": "active", "created_at": claire_paths.now_utc(),
+                                    "restored_from": str(src), "isolated": True})
+    integ = run_integrity(conn, cfg, root=dst)
+    counts, chash = table_counts(conn), content_hash(conn)
+    conn.close()
+    match = None
+    if manifest:
+        match = manifest.get("counts") == counts and (manifest.get("content_hash") == chash or bool(applied))
+    return {"restored_to": str(dst), "from": str(src), "files_copied": copied, "backup_files": files_check,
+            "redactions_reapplied": applied, "counts": counts, "content_hash": chash,
+            "manifest_match": match, "storage_ok": integ["storage_ok"], "problems": integ["problems"],
+            "secrets_included": False, "secrets_policy": SECRETS_POLICY,
+            "next": [f"CLAIRE_DATA_DIR={dst} {Path(__file__).resolve().parent}/claire_search find <검색어>   # 격리 사본 조회",
+                     "운영 위치로 되돌리는 절차는 references/recovery-policy.md (claire_relocate)"]}
 
 
 # --------------------------------------------------------------------------
@@ -486,8 +510,65 @@ class Doctor:
                  f"{gog} (참고용. 증분 동기화 API가 없어 커넥터는 REST 직접 호출)" if gog
                  else "gog 미설치 (없어도 됨)")
 
+    # -- 데이터 위치 (0.9.0) ----------------------------------------------------
+    def check_location(self):
+        loc = claire_paths.resolve()
+        msgs = [b["message"] for b in loc.blockers] + [w["message"] for w in loc.warnings]
+        fix = next((x.get("fix") for x in loc.blockers + loc.warnings if x.get("fix")), None)
+        self.add("data", "data_location", "fail" if loc.blockers else "warn" if loc.warnings else "ok",
+                 f"{loc.path} — {claire_paths.SOURCE_LABELS.get(loc.source)}" + (f" · {' / '.join(msgs)}" if msgs else ""),
+                 fix, source=loc.source, pointer=loc.as_dict()["pointer"])
+        if loc.source != "env":
+            if not loc.pointer and not loc.blockers:
+                self.add("data", "location_record", "warn", "위치 기록 없음 — 예약 실행은 자동 판단(기존 ~/ClaireData 우선)을 쓴다",
+                         "claire_check init (위치 기록을 남긴다)")
+            legacy = claire_paths.legacy_dir()
+            if not claire_paths.same_path(legacy, loc.path) and claire_paths.has_db(legacy):
+                m = claire_paths.read_marker(legacy) or {}
+                self.add("data", "legacy_copy", "warn",
+                         f"옛 위치 {legacy} 에 은퇴 표지 없는 장부가 남아 있음 (state={m.get('state')}). 이 장부는 쓰이지 않는다",
+                         "claire_relocate status 로 확인")
+        root = claire_paths.backup_root(self.cfg.get("backup_root"))
+        anc = root
+        while not anc.exists() and anc != anc.parent:
+            anc = anc.parent
+        synced = is_synced_location(root)
+        ok = os.access(anc, os.W_OK) and not synced
+        self.add("data", "backup_root", "ok" if ok else "fail",
+                 f"{root} ({'있음' if root.exists() else '첫 백업 때 생성'})" + (f" — {synced} 동기화 폴더 안" if synced else "")
+                 + ("" if os.access(anc, os.W_OK) else " — 쓰기 권한 없음"),
+                 None if ok else "config backup_root 또는 CLAIRE_BACKUP_ROOT 를 확인하세요")
+        lock = claire_paths.read_lock()
+        if lock:
+            live = claire_paths.lock_is_live()
+            self.add("data", "relocation", "warn" if live else "fail",
+                     f"데이터 이전 {'진행 중' if live else '중단됨'}: {lock.get('kind')} {lock.get('id')}",
+                     "claire_relocate status")
+        else:
+            jd = claire_paths.journal_dir()
+            journals = []
+            for f in (sorted(jd.glob("*.json")) if jd.is_dir() else []):
+                try:
+                    j = json.loads(f.read_text(encoding="utf-8"))
+                except (OSError, ValueError):
+                    continue
+                if isinstance(j, dict) and j.get("id") and j.get("kind"):
+                    journals.append(j)
+            if journals:
+                j = max(journals, key=lambda x: x.get("started_at") or "")
+                st = j.get("state")
+                warns = j.get("warnings") or []
+                fine = st in ("done", "aborted", "failed_clean", "not_started") and not warns
+                cmds = [c for w in warns for c in (w.get("commands") or [])]
+                self.add("data", "relocation", "ok" if fine else "warn",
+                         f"마지막 이전 {j.get('id')} ({j.get('kind')}): {st} · {(j.get('source') or {}).get('root')} → "
+                         f"{(j.get('target') or {}).get('root')}"
+                         + (" · 경고: " + "; ".join(str(w.get("message")) for w in warns[:3]) if warns else ""),
+                         None if fine else ("; ".join(cmds[:4]) if cmds else "claire_relocate status"))
+
     # -- 데이터 디렉터리 -----------------------------------------------------
     def check_data(self):
+        self.check_location()
         d = data_dir()
         synced = is_synced_location(d)
         self.add("data", "data_dir", "fail" if synced else ("ok" if d.exists() else "warn"),
@@ -683,11 +764,12 @@ class Doctor:
         self.add("openclaw", "workspace_skill", "ok" if same else ("warn" if sk.exists() else "fail"),
                  f"{sk} ({'최신' if same else '설치본과 다름' if sk.exists() else '없음'})",
                  None if same else "install.sh 를 다시 실행하세요")
-        if self.offline or not shutil.which("openclaw"):
+        oc = claire_paths.openclaw_bin()
+        if self.offline or not oc:
             self.add("openclaw", "cron_daily", "skip", "--offline 또는 openclaw 미설치")
             return
         try:
-            out = subprocess.run(["openclaw", "cron", "list", "--json"], capture_output=True, text=True, timeout=30)
+            out = subprocess.run([oc, "cron", "list", "--json"], capture_output=True, text=True, timeout=30)
             data = json.loads(out.stdout)
             jobs = data if isinstance(data, list) else data.get("jobs") or data.get("automations") or []
             job = next((j for j in jobs if j.get("agentId") == "claire" and
@@ -721,7 +803,8 @@ class Doctor:
         self.check_openclaw_buttons()
 
     def _openclaw_config_get(self, path: str):
-        out = subprocess.run(["openclaw", "config", "get", path], capture_output=True, text=True, timeout=30)
+        out = subprocess.run([claire_paths.openclaw_bin() or "openclaw", "config", "get", path],
+                             capture_output=True, text=True, timeout=30)
         try:
             return json.loads(out.stdout)
         except json.JSONDecodeError:
@@ -864,13 +947,15 @@ def cmd_version(args, cfg):
     """설치된 스킬 버전·출처. --remote 면 GitHub 최신 릴리스 태그와 비교해 업데이트 명령을 알려 준다."""
     info = json.loads(INSTALL_INFO.read_text(encoding="utf-8")) if INSTALL_INFO.exists() else None
     db_ver = None
-    if db_path().exists():
+    if db_path().exists() and not claire_paths.resolve().blockers:
         try:
             db_ver = int(connect(create=False).execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()[0])
         except Exception:  # noqa: BLE001
             db_ver = None
+    loc = claire_paths.resolve()
     out = {"version": CLAIRE_VERSION, "schema_version": SCHEMA_VERSION, "db_schema_version": db_ver,
-           "installed": info, "skill_dir": str(Path(__file__).resolve().parent.parent)}
+           "installed": info, "skill_dir": str(Path(__file__).resolve().parent.parent),
+           "data_dir": str(loc.path), "data_source": loc.source, "data_usable": not loc.blockers}
     if args.remote:
         latest = latest_remote_tag()
         out["latest"] = latest
@@ -896,13 +981,17 @@ def build_parser():
     i = sub.add_parser("integrity", help="무결성 검사 (§10)")
     i.add_argument("--strict", action="store_true")
     i.set_defaults(fn=cmd_integrity)
-    b = sub.add_parser("backup", help="백업 생성 (§10)")
-    b.add_argument("--out")
+    b = sub.add_parser("backup", help="백업 생성 (§10) — 기본 백업 루트 ~/SecretaryBackups/schedule (0.9.0)")
+    b.add_argument("--out", help="백업 루트 (이 아래 <시각>/ 을 만든다). 기본: CLAIRE_BACKUP_ROOT > config backup_root")
     b.add_argument("--no-mirror", action="store_true")
     b.set_defaults(fn=cmd_backup)
     r = sub.add_parser("restore-test", help="백업 복구 시험 (TC20)")
     r.add_argument("--from", dest="from_path", required=True)
     r.set_defaults(fn=cmd_restore_test)
+    rr = sub.add_parser("restore", help="백업을 새 빈 폴더에 격리 복원 (가림 재적용·검증, 0.9.0)")
+    rr.add_argument("--from", dest="from_path", required=True)
+    rr.add_argument("--to", required=True)
+    rr.set_defaults(fn=cmd_restore)
     d = sub.add_parser("doctor", help="연결 진단 (§4.3 확인 사항 실측)")
     d.add_argument("--offline", action="store_true", help="네트워크 호출 없이 파일·설정만 검사")
     d.add_argument("--format", choices=["json", "text"], default="json")

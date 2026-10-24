@@ -1,7 +1,7 @@
 """Google OAuth 갱신 + Gmail/Calendar REST (PRD §4.3 2순위 어댑터).
 
 표준 라이브러리만 쓴다. `gog` CLI가 저장한 OAuth 클라이언트(client_id/secret)를
-재사용하되, 토큰은 **읽기 전용 범위**로 따로 발급해 `~/ClaireData/secrets/`에 둔다 (D1).
+재사용하되, 토큰은 **읽기 전용 범위**로 따로 발급해 데이터 위치의 `secrets/`에 둔다 (D1, 0.9.0: claire_paths 가 정한 위치).
 
   - 읽기 토큰: gmail.readonly + calendar.readonly  → secrets/google-<email>-read.json
   - 쓰기 토큰: calendar.events                      → secrets/google-<email>-write.json (4단계)

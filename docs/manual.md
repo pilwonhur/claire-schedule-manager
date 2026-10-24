@@ -95,7 +95,8 @@
   ~/.claude/skills/claire-schedule-manager/scripts/claire_check doctor --format text
   ~/.claude/skills/claire-schedule-manager/scripts/claire_run status
   ```
-- 데이터는 `~/ClaireData/`(원본), 백업은 `~/Dropbox/ClaireBackup/`. 인증 토큰은 백업에 들어가지 않는다.
+- 데이터는 데이터 위치(기존 설치 `~/ClaireData/`, 신규·이전 뒤 `~/SecretaryData/services/schedule/` — `claire_relocate where`),
+  백업은 `~/SecretaryBackups/schedule/`과 미러 `~/Dropbox/ClaireBackup/`. 인증 토큰은 백업에 들어가지 않는다.
 
 ## 7. 설치·업데이트 (터미널, mac mini)
 
@@ -106,4 +107,20 @@ claire-update --check    # 새 버전이 있는지만 확인
 claire-update --version v0.4.5   # 이전 버전으로 되돌리기
 ```
 
-업데이트 전에 DB 사본을 `~/ClaireData/backups/pre-upgrade-*`에 남기고, 데이터·설정은 그대로 둔다. 업데이트 뒤 `claire_check doctor --format text`가 새로 필요한 OpenClaw 설정(0.5.0: 12·18시 확인 cron)을 알려 준다.
+업데이트 전에 DB 사본을 `~/SecretaryBackups/schedule/pre-upgrade-*`에 남기고, 데이터·설정은 그대로 둔다(0.9.0: 데이터 위치도 그대로 —
+새 위치로 옮기는 것은 아래 §7.1). 업데이트 뒤 `claire_check doctor --format text`가 새로 필요한 OpenClaw 설정(0.5.0: 12·18시 확인 cron)을 알려 준다.
+
+### 7.1 데이터 위치 옮기기 (0.9.0, 한 번)
+
+기존 `~/ClaireData`를 `~/SecretaryData/services/schedule`로 옮긴다. 업데이트만으로는 옮겨지지 않는다.
+
+```
+S=~/.claude/skills/claire-schedule-manager/scripts
+$S/claire_relocate plan --format text                     # 계획만 (아무것도 바꾸지 않음)
+$S/claire_relocate migrate --confirm --pause-schedules    # 이전 (Claire 예약 3개만 잠시 멈춤)
+$S/claire_relocate status --format text                   # 결과
+$S/claire_relocate rollback                               # 되돌리기 계획 (--confirm 으로 실행)
+```
+
+이전하는 동안 Claire 는 "데이터 이전 중"이라고 답하고 아무것도 기록하지 않는다. 옛 폴더는 지우지 않는다(몇 주 뒤 직접 정리).
+자세한 절차·실패 시 처리는 `references/data-location.md`.

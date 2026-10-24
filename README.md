@@ -44,14 +44,26 @@ scripts/              결정론적 도구 (Python 3.11+, 표준 라이브러리�
   claire_export       json | md
 connectors/           Google OAuth·REST(읽기/쓰기 토큰 분리), Obsidian Tasks 파서·원자적 쓰기, Obsidian 메모함 블록, Discord 첨부
 references/           브리핑 형식, 제안 JSON 규격, 스키마, 진단, 복구 정책, 활용 시나리오(usage-guide.md)
-tests/                136개 테스트 (Google API 는 기록된 fixture 로 대체, 설치·업그레이드 경로 포함)
+tests/                156개 테스트 (Google API 는 기록된 fixture 로 대체, 설치·업그레이드 경로 포함)
 docs/manual.md        사용 안내
 VERSION               배포 버전 (claire_core.CLAIRE_VERSION·SKILL.md·CHANGELOG 와 같아야 한다 — 테스트·CI 가 검사)
 get.sh                설치·업그레이드 (GitHub 릴리스 태그) · install.sh 실제 설치 · release.sh 릴리스(관리자)
 ```
 
-데이터는 저장소·스킬 폴더 밖 `~/ClaireData/`에 둔다 (Dropbox·iCloud 밖). 인증 토큰은 `~/ClaireData/secrets/`(600)에만 있고
+데이터는 저장소·스킬 폴더 밖 데이터 위치에 둔다 (Dropbox·iCloud 밖). 인증 토큰은 데이터 위치의 `secrets/`(600)에만 있고
 백업·내보내기에 포함되지 않는다.
+
+### 데이터 위치 (0.9.0)
+
+| 경우 | 데이터 위치 |
+|---|---|
+| 신규 설치 | `~/SecretaryData/services/schedule` |
+| 기존 설치(0.8.x 이하) | 그대로 `~/ClaireData` — 업데이트가 옮기지 않는다 |
+| 옮긴 뒤 | 위치 기록 `~/.claire-schedule-manager/data-location.json`이 가리키는 곳 |
+| 시험·격리 사본 | 환경변수 `CLAIRE_DATA_DIR` (그 프로세스만) |
+
+모든 도구·예약 실행·install/update 가 같은 규칙(`scripts/claire_paths.py`)을 쓴다. 백업은 `~/SecretaryBackups/schedule`.
+기존 위치에서 새 위치로 옮기기·되돌리기는 `claire_relocate`(plan → migrate --confirm → status / rollback) — `references/data-location.md`.
 
 ## 설치·업그레이드
 
@@ -76,10 +88,12 @@ curl -fsSL https://raw.githubusercontent.com/pilwonhur/claire-schedule-manager/m
 
 1. `~/.claire-schedule-manager/src`(Dropbox·iCloud 밖, 설치 전용 클론)에 저장소를 받거나 `fetch` 한다. 그 폴더에 손으로 고친 파일이 있으면 멈춘다.
 2. 대상 태그를 체크아웃하고 **그 버전의 테스트를 돌린다.** 실패하면 설치하지 않는다.
-3. `install.sh`를 부른다: 바뀐 파일만 `~/.claude/skills/claire-schedule-manager`에 복사, 직전 스킬을 `~/ClaireData/skill-prev`에 보관,
-   버전이 바뀌면 **스키마 변환 전 DB 사본**을 `~/ClaireData/backups/pre-upgrade-*`에 남긴 뒤 `claire_check init`(멱등 변환)·`integrity`.
+3. `install.sh`를 부른다: 먼저 데이터 위치를 확인하고(이전 작업 중·두 위치 충돌·위치 기록 대상 없음이면 아무것도 바꾸지 않고 멈춘다),
+   바뀐 파일만 `~/.claude/skills/claire-schedule-manager`에 복사, 직전 스킬을 `~/.claire-schedule-manager/skill-prev`에 보관,
+   버전이 바뀌면 **스키마 변환 전 DB 사본**을 `~/SecretaryBackups/schedule/pre-upgrade-*`에 남긴 뒤 `claire_check init`(멱등 변환, 처음이면 위치 기록)·`integrity`.
    OpenClaw 에이전트(`claire`)가 있으면 `~/.openclaw/workspace-claire/skills/`에 SKILL.md·references 를 복사한다. 설치 출처는 `INSTALL_INFO.json`.
-4. 데이터(`~/ClaireData`)와 `config.json`의 사용자 값은 건드리지 않는다(새 키만 기본값으로 채운다).
+4. 데이터와 `config.json`의 사용자 값은 건드리지 않는다(새 키만 기본값으로 채운다). 데이터 위치도 바꾸지 않는다.
+5. 0.9.0 이전 버전으로 내릴 때, 데이터가 `~/ClaireData`에 있지 않으면 멈춘다(데이터 위치를 먼저 `claire_relocate rollback`).
 
 업그레이드 뒤 `claire_check doctor --format text`가 새 버전에 필요한 OpenClaw 설정·cron을 알려 준다.
 개발 중에는 저장소에서 `./install.sh`를 직접 돌려도 된다(설치 기록에 "커밋 안 된 변경 포함"이 남는다).
@@ -98,11 +112,12 @@ git commit -am "0.5.1: …"
 
 ## 설정
 
-`~/ClaireData/config.json`에 계정·캘린더·볼트 경로를 채운다. `config.example.json`을 참고한다.
+데이터 위치의 `config.json`에 계정·캘린더·볼트 경로를 채운다. `config.example.json`을 참고한다.
 
 ```bash
-cp config.example.json ~/ClaireData/config.json     # 처음이면
-$EDITOR ~/ClaireData/config.json
+D=$(~/.claude/skills/claire-schedule-manager/scripts/claire_relocate where | python3 -c 'import json,sys; print(json.load(sys.stdin)["data_dir"])')
+cp config.example.json "$D/config.json"     # 처음이면 (claire_check init 이 기본값으로 만들어 둔다)
+$EDITOR "$D/config.json"
 ```
 
 | 키 | 의미 |

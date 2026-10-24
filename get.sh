@@ -97,6 +97,40 @@ if [ "$MODE" = "release" ] && [ -n "$CUR_VER" ] && [ "$(printf '%s\n%s\n' "$CUR_
   exit 0
 fi
 
+# 2-1) 0.9.0 이전 버전으로 내릴 때: 그 버전은 데이터 위치 기록을 모르고 CLAIRE_DATA_DIR 또는 ~/ClaireData 만 연다.
+#      지금 정본이 정확히 그 위치이고(같은 폴더), 이전 작업 중·은퇴·충돌이 아니며, 그 장부가 은퇴 표지가 아닐 때만 내린다.
+#      아니면 내리지 않는다 — 데이터 위치를 먼저 되돌린다. (이 검사를 건너뛰어도 옛 위치의 은퇴 표지 때문에 옛 코드는 멈춘다.)
+if [ ! -f "$SRC_DIR/scripts/claire_paths.py" ]; then
+  INSTALLED="${CLAIRE_SKILL_DIR:-$HOME/.claude/skills/claire-schedule-manager}"
+  if [ -f "$INSTALLED/scripts/claire_paths.py" ]; then
+    GUARD_MSG="$(python3 -B - "$INSTALLED/scripts" <<'PY'
+import os, sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+import claire_paths as P
+problems = []
+def check(loc, old: Path, who: str):
+    if loc.blockers:
+        problems.append(f"{who}: 막힌 상태 — " + " / ".join(b["message"] for b in loc.blockers))
+    elif not P.same_path(loc.path, old) or not loc.path.exists():
+        problems.append(f"{who}: 지금 데이터 {loc.path} · 그 버전이 열 위치 {old}")
+    elif not P.has_db(old):
+        problems.append(f"{who}: {old / 'claire.db'} 가 없거나 은퇴 표지입니다")
+check(P.resolve(use_env=False), P.legacy_dir(), "예약 실행")
+if os.environ.get("CLAIRE_DATA_DIR"):
+    check(P.resolve(), P.expand(os.environ["CLAIRE_DATA_DIR"]), "CLAIRE_DATA_DIR")
+print("\n".join(dict.fromkeys(problems)))
+PY
+)" || GUARD_MSG="데이터 위치를 확인하지 못했습니다"
+    if [ -n "$GUARD_MSG" ]; then
+      echo "버전 $NEW_VER 은 0.9.0 이전 버전이라 데이터 위치 기록을 모릅니다 — 내리지 않습니다."
+      printf '  %s\n' "$GUARD_MSG"
+      echo "  먼저 데이터 위치를 되돌리세요: $INSTALLED/scripts/claire_relocate status --format text → rollback (계획 확인 뒤 --confirm)"
+      exit 1
+    fi
+  fi
+fi
+
 # 3) 그 버전의 테스트 (실패하면 설치하지 않는다)
 if [ "$RUN_TESTS" = 1 ]; then
   echo "테스트 실행 중… (30초 안팎, --skip-tests 로 생략)"

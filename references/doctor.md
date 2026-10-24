@@ -8,7 +8,12 @@
 | env | python | 3.11+ | Python 업그레이드 |
 | env | sqlite_fts5 | FTS5 사용 가능 | Homebrew python3 사용 |
 | env | gog_cli | 참고용 (없어도 warn) | — |
-| data | data_dir | 존재하고 Dropbox·iCloud 밖 | `CLAIRE_DATA_DIR` 이동 |
+| data | data_location | 위치를 정할 수 있고 막힌 이유 없음 (0.9.0: 근거 = 환경변수·위치 기록·기존 위치·은퇴 표지 따라감·새 기본 — 따라갔으면 warn, `claire_check init` 으로 위치 기록을 다시 남김) | `claire_relocate status` (`references/data-location.md`) |
+| data | location_record | 위치 기록 있음 (없으면 warn) | `claire_check init` |
+| data | legacy_copy | 옛 `~/ClaireData`에 은퇴 표지 없는 장부가 남아 있지 않음 (있으면 warn) | `claire_relocate status` |
+| data | backup_root | 백업 루트에 쓸 수 있고 동기화 폴더 밖 | config `backup_root` / `CLAIRE_BACKUP_ROOT` |
+| data | relocation | 진행 중·중단된 이전 없음, 마지막 이전 done/aborted/failed_clean 이고 경고 없음 (예약 재개 실패 등 경고가 있으면 warn — fix 에 `openclaw cron enable <id>`) | `claire_relocate status` → `resume`/`abort` (또는 fix 의 명령) |
+| data | data_dir | 존재하고 Dropbox·iCloud 밖 | 데이터 위치 이전 (`claire_relocate`) |
 | data | database | 스키마 있고 무결성 이상 없음 | `claire_check init` / `integrity` |
 | data | dir:secrets | 700, 파일 600 | `chmod` |
 | data | config, backup_mirror | 존재 | `claire_check init` |

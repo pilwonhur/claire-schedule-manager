@@ -21,13 +21,16 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import claire_paths  # noqa: E402  (0.9.0 데이터 위치 해석 — 모든 CLI·예약 실행·설치가 같은 규칙)
+
 # --------------------------------------------------------------------------
 # 버전
 # --------------------------------------------------------------------------
 #
 # 스킬 전체의 배포 버전 (SemVer). 동작이나 문서가 바뀌면 반드시 올리고
 # CHANGELOG.md에 항목을 남긴다. tests/test_claire.py가 둘의 일치를 검사한다.
-CLAIRE_VERSION = "0.8.0"
+CLAIRE_VERSION = "0.9.0"
 
 # 데이터 파일 형식의 버전. 스키마가 바뀌면 올리고 MIGRATIONS 에 기존 DB 변환을 적는다.
 # v2 (0.5.0): item.due_precision·window_auto·attendance·daily_logged_on, outbox.selected_at, checkin 표.
@@ -41,18 +44,22 @@ SCHEMA_VERSION = 5
 # 설정 (PRD §12, §15)
 # --------------------------------------------------------------------------
 #
-# 값은 ~/ClaireData/config.json 에서 덮어쓴다. 계정·캘린더·볼트 경로 같은 개인값은 저장소에 두지 않고
-# config.json 에만 둔다. 채워야 할 키는 config.example.json 을 본다.
+# 값은 <데이터 위치>/config.json 에서 덮어쓴다 (데이터 위치는 claire_paths: 새 설치 ~/SecretaryData/services/schedule,
+# 기존 설치 ~/ClaireData). 계정·캘린더·볼트 경로 같은 개인값은 저장소에 두지 않고 config.json 에만 둔다.
+# 채워야 할 키는 config.example.json 을 본다.
 
 DEFAULT_CONFIG = {
     "timezone": "Asia/Seoul",
     "ref_prefix": "CLR",
     "ref_digits": 4,
     "question_prefix": "Q",
+    # 0.9.0 — 백업 루트. 데이터 폴더 안 backups/ 대신 여기에 <시각>/ 으로 남긴다 (옛 backups/ 는 그 자리에 둔다).
+    # CLAIRE_BACKUP_ROOT 환경변수·claire_check backup --out 이 우선한다. 미러·보존 정책은 그대로다.
+    "backup_root": "~/SecretaryBackups/schedule",
     "backup_mirror": "~/Dropbox/ClaireBackup",
     "backup_retention": {"daily": 7, "weekly": 4, "monthly": 12},
 
-    # D1 — 수집 계정. 비어 있으면 doctor 가 설정을 요구한다. 실제 값은 ~/ClaireData/config.json 에 둔다
+    # D1 — 수집 계정. 비어 있으면 doctor 가 설정을 요구한다. 실제 값은 <데이터 위치>/config.json 에 둔다
     # (저장소에는 개인값을 넣지 않는다. config.example.json 참고).
     # user_addresses 는 "본인 주소" 판정용(To/Cc 확인, §6.1 사전 필터). 포워드되는 주소도 여기 넣는다.
     "gmail": {
@@ -225,7 +232,9 @@ EVIDENCE_CRITERIA_RE = re.compile(r"^criteria_evidence:(\d+)$")
 
 
 def data_dir() -> Path:
-    return Path(os.environ.get("CLAIRE_DATA_DIR", "~/ClaireData")).expanduser()
+    """현재 데이터 위치 (0.9.0: CLAIRE_DATA_DIR > 위치 기록 > 기존 ~/ClaireData > 새 기본 ~/SecretaryData/services/schedule).
+    판단 규칙은 claire_paths.resolve 한 곳에 있다. 장부를 열어도 되는지는 connect() 가 따로 확인한다."""
+    return claire_paths.resolved_dir()
 
 
 def _merge(defaults: dict, user: dict) -> dict:
@@ -664,7 +673,12 @@ def db_path() -> Path:
 
 
 def connect(create: bool = True) -> sqlite3.Connection:
-    d = data_dir()
+    # 0.9.0: 이전 작업 중·은퇴한 위치·두 위치 충돌·위치 기록 대상 없음이면 열지 않는다 (빈 장부를 새로 만들지 않는다)
+    try:
+        loc = claire_paths.require_usable()
+    except claire_paths.LocationError as e:
+        raise ClaireError(e.code, e.message, fix=e.fix, **e.extra) from None
+    d = loc.path
     db = d / DB_NAME
     if not db.exists() and not create:
         raise ClaireError("db_missing", f"데이터베이스가 없습니다: {db}. "
@@ -828,14 +842,14 @@ def content_hash(conn: sqlite3.Connection, tables: list[str] | None = None) -> s
         h.update(f"#{t}:{','.join(cols)}\n".encode("utf-8"))
         order = "rowid" if "id" not in cols else "id"
         for row in conn.execute(f"SELECT {', '.join(cols)} FROM {t} ORDER BY {order}"):
-            h.update(json.dumps([row[c] for c in cols], ensure_ascii=False,
+            h.update(json.dumps(list(row), ensure_ascii=False,
                                 default=str).encode("utf-8"))
             h.update(b"\n")
     return h.hexdigest()
 
 
 def table_counts(conn: sqlite3.Connection, tables: list[str] | None = None) -> dict:
-    return {t: conn.execute(f"SELECT COUNT(*) c FROM {t}").fetchone()["c"] if _has_table(conn, t) else 0
+    return {t: conn.execute(f"SELECT COUNT(*) c FROM {t}").fetchone()[0] if _has_table(conn, t) else 0
             for t in (tables or COUNT_TABLES)}
 
 
