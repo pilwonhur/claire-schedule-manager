@@ -3,6 +3,49 @@
 형식은 [Keep a Changelog](https://keepachangelog.com/ko/1.1.0/)를 따르고 버전은 SemVer다.
 데이터 형식 버전(`SCHEMA_VERSION`)은 따로 관리한다.
 
+## [0.10.0] — 2026-11-15
+
+개발 이슈 2026-11-15 "정기 일정 종료 후 추적 제외"(`issues/Issue_정기일정_종료후_추적제외-20261115.md`, PRD v2.2 D24).
+**스키마 v6 — 추가만(열 2개·표 1개), 기존 값 변경 없음.** 정책을 정하기 전에는 0.9.x 와 똑같이 추적한다.
+이 버전을 설치해도 기존 정기 일정은 빠지지 않는다 — 기존 회차 정리는 `claire_series preview` → 교수님 확인 → `apply --confirm`.
+
+### 종료·추적 제외 (`scripts/claire_policy.py`)
+- 참석형 정기 회의(수업·개인 미팅·프로젝트 회의) 시리즈에 `after_end` 정책을 두면, 각 회차가 끝나는 시각이 지나면 **상태를 바꾸지 않고**
+  활성 업무에서 빠진다. 조회할 때 계산하는 파생 상태라 회차가 미래로 옮겨지거나 정책을 지우면 다음 조회부터 다시 활성이다.
+- 조건(모두): `kind=meeting` · 시리즈 회차 · 상태 captured/needs_info/todo/in_progress(교수님이 정한 대기·보류·처리 불필요 등은 그대로) ·
+  정책 after_end(회차 예외 > 시리즈 정책 > 미정=until_done) · Calendar 연결이 있고 모두 정상 · 확정된 종료 시각이 지남
+  (시각 있는 종료는 그 순간, 종일은 배타적 종료일 0시. 끝 시각이 없거나 시작 이전·Calendar 없음/충돌/반영 대기면 빼지 않는다).
+- 아침 보고(상세·키워드·accounting·빠짐 검사)·업무 현황·진행 확인·질문(보고·`--due-now`)·승인 대기 건수·누락 감지·중요도 검토·
+  `today/week/overdue/find`·문구로 찾기·`complete --past-meetings`·겹침 표시가 같은 기준(SQL `ended_sql` = Python `occurrence_state`).
+- 하지 않는 것: Calendar 일정 변경, Obsidian Tasks 체크, Daily `완료한 일` 기록, 완료 건수 집계, 원천 기록·이력 삭제.
+- 준비·회신·제출·결제 같은 실제 할 일과 단발 회의, 회의에 연결된 준비·후속 업무는 계속 추적한다.
+
+### 시리즈 정책 (`scripts/claire_series`, 새 표 `series_policy`)
+- `preview`(아무것도 바꾸지 않음): 시리즈별 분류(적용 후보·확인 필요·적용됨·유지), 빠질 회차 수, 남는 연결 업무·보류 회차·질문·승인 대기,
+  적용 전후 아침 보고·업무 현황·질문·승인 대기·빠짐 건수(가정 정책을 넣고 계산한 뒤 ROLLBACK — 실제 적용 결과와 같은지 테스트).
+  결제·납부·제출·회신 같은 말이 든 시리즈와 회의가 아닌 항목이 섞인 시리즈는 '확인 필요'로 따로 보인다.
+- `apply --series … | --candidates --reason … --confirm [--backup]`: `--confirm` 없으면 dry-run. 적용 묶음 `TP-…` 하나로 `activity_log`
+  (`action='policy'`, 이전 값 포함)에 남고 `revert --batch TP-…`로 한 번에 되돌린다. 다시 적용해도 바뀌는 것이 없다(멱등).
+- `set`/`clear`(시리즈 또는 회차 하나 — `--item … --occurrence`), `list`, `explain --item`(빠지거나 남는 이유), `history`.
+- 교수님이 정한 정책(`source: user`)은 Claire 가 바꿀 수 없다(`user_decided`). 회의가 없는 시리즈에 after_end 는 `not_eligible`.
+- 등록: 반복 시리즈 제안에 `track_policy`·`track_policy_reason`(`series: true`일 때만, after_end 는 회의만). 이미 정책이 있는 시리즈의
+  새 회차는 따로 묻지 않고 시리즈 정책을 따른다(`claire_sync pending`의 `series.known`). 반복 일정의 새 회차가 하나만 와도
+  시리즈 키를 붙인다(전에는 하나면 시리즈 밖 단발로 남아 정책이 닿지 않았다).
+
+### 보이는 것
+- 항목 카드: "종료·추적 제외 — 정기 일정이 끝나 확인 없이 추적에서 뺐습니다(완료 기록 아님)", 버튼은 `상세`·`계속 추적`(그 회차만 until_done).
+- `claire_search occurrences`·`find --status ended`·`show`의 `occurrence`(정책·근거·막힌 이유). 아침 보고 `지난 일정 보기` 아래
+  `일정 이력 보기`(`--view history`): 회차마다 종료·추적 제외 / 완료(보고됨) / 취소 / 추적 중.
+
+### 기타
+- `claire_data.DELETABLE_TABLES`에 `series_policy`(정책 지우기·되돌리기는 행을 지운다 — 이전 검사에서 유실로 보지 않음).
+- 스키마 v6 변환: `item.track_policy`·`track_policy_reason` 열과 `series_policy` 표를 추가만 한다(무결성 건수·해시 대상에 포함).
+
+### 테스트 (168개)
+- 끝난 수업 회차가 상태 변경 없이 모든 보고·질문·승인 대기·검색에서 빠지는지(종료 1초 전/정각 경계), 결제 시리즈·단발 회의·연결 업무·
+  끝 시각 없는 회차는 남는지, 교수님이 정한 상태·회차 이동·Calendar 없음·회차 예외, 종일 일정의 배타적 종료일, 미리보기 = 실제 적용 결과·
+  멱등·되돌리기, 재동기화·새 회차의 정책 상속, 카드·질문·승인·지난 일정, 교수님 정책 우선과 SQL·Python 판정 일치, v5→v6 변환.
+
 ## [0.9.1] — 2026-10-25
 
 설치·업데이트 버그 수정. **스키마·데이터 변경 없음(v5).** 데이터 위치(0.9.0)와 무관하다.

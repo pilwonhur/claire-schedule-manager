@@ -21,8 +21,9 @@
           아침 보고(0.7.0, ISSUE 2026-09-29): 1쪽 오늘(달력 일정·달력 밖 오늘 마감) · 기한 지남 한 쪽(전체 건수, 상위 10~15건
           버튼, 나머지 키워드) · 진행 확인 최대 두 쪽 · 확인·상태 한 쪽(질문 최대 3, 완료 반영 N건, 문서 위치 질문, 운영 요약,
           전체 보기 버튼). 전체 업무는 계속 추적하고 보고에는 필요한 만큼만 싣는다.
-  agenda --view overdue|progress|past|waiting|done|questions [--no-record]
+  agenda --view overdue|progress|past|waiting|done|questions|history [--no-record]
           "전체 보기" 버튼·요청의 전체 목록 (구역 하나를 빠짐없이, 여러 쪽 가능). --view 없이 쓰면 업무 현황 전체(0.6.1 그대로).
+          history(0.10.0, "일정 이력 보기"): 최근 30일 지난 정기 회차의 결과 — 종료·추적 제외 / 완료(보고됨) / 취소 / 추적 중.
   resend  전송 실패·확인 없는 페이지만 다시 보낼 페이로드 (같은 보고의 다른 페이지는 다시 보내지 않는다)
   memos   [--status open|reference|resolved|not_needed|closed|all] [--q 검색어] [--topic T] [--offset N]
           메모 목록 (0.8.0, 요청할 때만): MEM 번호 버튼, 넘치면 "메모 더 보기 N". 업무 보고·전달 기록과 무관.
@@ -49,6 +50,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from claire_core import ClaireError, connect, get_item, normalize_ref, now_dt, now_iso, parse_iso, run_cli, tx, tz_of  # noqa: E402
 import claire_memos as memos  # noqa: E402
 import claire_ops as ops  # noqa: E402
+import claire_policy as policy  # noqa: E402
 import claire_track as track  # noqa: E402
 
 NUMBER_RE = re.compile(r"(?<![A-Za-z0-9-])((?:CLR|Q|MEM)-\d{3,6})(?!\d)")   # 한글이 바로 붙어도(CLR-0031로) 잡는다. MEM: 0.8.0 메모
@@ -327,9 +329,12 @@ def _row(labels: list[tuple[str, str]]) -> dict:
     return {"type": "actions", "buttons": [{"label": l, "style": s} for l, s in labels][:5]}
 
 
-def _state_rows(ref: str, status: str) -> list[dict]:
+def _state_rows(ref: str, status: str, ended: bool = False) -> list[dict]:
     """R5 — 동작마다 뜻이 다르다: 보류(재확인일에 다시 질문)·답변 대기(상대·다음 확인일)·처리 불필요/내 할 일 아님
-    (활성 목록에서 빠지고 이력 보관)·취소(업무 자체 취소). 달력·Tasks 표시 제외는 아래 승인 행에서 따로."""
+    (활성 목록에서 빠지고 이력 보관)·취소(업무 자체 취소). 달력·Tasks 표시 제외는 아래 승인 행에서 따로.
+    0.10.0: 끝나서 추적에서 빠진 정기 회차는 완료 답을 요구하지 않는다 — 상세·이 회차 계속 추적만(완료는 말로 하면 받는다)."""
+    if ended:
+        return [_row([(f"{ref} 상세", "secondary"), (f"{ref} 계속 추적", "secondary")])]
     if status in ("captured", "needs_info", "todo", "in_progress"):
         return [_row([(f"{ref} 완료", "success"), (f"{ref} 진행 중", "primary"), (f"{ref} 보류", "secondary"),
                       (f"{ref} 답변 대기", "secondary"), (f"{ref} 상세", "secondary")]),
@@ -356,9 +361,14 @@ def cmd_actions_item(conn, cfg, ref: str, detail: bool = False) -> dict:
     if it.get("waiting_on"):
         meta.append(f"{it['waiting_on']} 답 대기")
     lines = [head, " · ".join(m for m in meta if m), ops.describe_state(conn, cfg, row)]
+    occ = policy.occurrence_state(conn, cfg, row, now_dt(cfg)) if it.get("series_key") and it.get("kind") == "meeting" else None
+    ended = bool(occ and occ["ended"])
+    if ended:
+        # 0.10.0: 종료는 완료가 아니다. 참석 여부를 단정하지 않고, 완료 답도 묻지 않는다.
+        lines[2] = f"{policy.ENDED_LABEL} — 정기 일정이 끝나 확인 없이 추적에서 뺐습니다(완료 기록 아님)"
     if it.get("next_action"):
         lines.append(f"다음 행동: {it['next_action']}")
-    if status not in ("done", "cancelled"):
+    if status not in ("done", "cancelled") and not ended:
         plan = track.check_plan(cfg, row, now_dt(cfg), track.tracking_since(conn, cfg))
         why = f" ({it['priority_reason']})" if it.get("priority_reason") else ""
         nxt = f" · 다음 확인 {track.md(plan['next_on'])}" if plan.get("next_on") and not plan["due"] else ""
@@ -388,12 +398,24 @@ def cmd_actions_item(conn, cfg, ref: str, detail: bool = False) -> dict:
                                               + (f" {h['field']}" if h["field"] and h["field"] != "status" else "")
                                               for h in hist))
 
-    rows: list[dict] = _state_rows(ref, status)
+    if occ and occ["policy"] and (detail or ended):
+        lines.append(f"추적 정책: {occ['policy_label']}" + (" (이 회차 예외)" if occ["policy_from"] == "occurrence" else "")
+                     + (f" · 종료 {ops.fmt_when(cfg, occ['end'])}" if occ["end"] else ""))
+    linked = [] if not ended else conn.execute(
+        "SELECT i.ref, i.title, i.status FROM relation rl JOIN item i ON i.id=rl.from_item_id WHERE rl.to_item_id=? "
+        "AND rl.rel_type IN ('prep_for','follow_up_of') AND i.deleted_at IS NULL AND i.status NOT IN ('done','cancelled')",
+        (it["id"],)).fetchall()
+    if linked:
+        lines.append("연결 업무는 계속 추적: " + ", ".join(f"{x['title']}({x['ref']})" for x in linked))
+    rows: list[dict] = _state_rows(ref, status, ended)
+    if ended:
+        pending = []                       # 지난 회차의 승인 대기는 독촉하지 않는다 (기록은 그대로)
+        questions = []
     if pending:
         kinds = sorted({("달력" if p["op"].startswith("calendar") else "Tasks") for p in pending})
         lines.append(f"승인 대기: {'·'.join(kinds)} 등록 (표시 안 함을 골라도 업무 추적은 계속됩니다)")
         rows.append(_row([(f"{ref} 등록", "success")] + [(f"{ref} {k}에 표시 안 함", "secondary") for k in kinds]))
-    elif status not in ("done", "cancelled") and sync["calendar"] in (None, "declined") and ops.calendar_eligible(cfg, row):
+    elif status not in ("done", "cancelled") and not ended and sync["calendar"] in (None, "declined") and ops.calendar_eligible(cfg, row):
         rows.append(_row([(f"{ref} 달력 등록", "primary")]))
     for q in questions[:2]:
         opts = json.loads(q["options"]) if q["options"] else []
@@ -404,7 +426,7 @@ def cmd_actions_item(conn, cfg, ref: str, detail: bool = False) -> dict:
             "버튼이 만료되면 번호와 함께 적으면 됩니다(예: 31 완료).")
     lines.append(hint)
     text = "\n".join(lines)
-    return {"ref": ref, "status": status, "sync": sync, "message": text,
+    return {"ref": ref, "status": status, "ended": ended, "sync": sync, "message": text,
             "components": {"reusable": True, "text": "\n".join(lines[:-1]), "blocks": rows + [{"type": "text", "text": hint}]},
             "buttons": [b["label"] for r in rows for b in r["buttons"]]}
 
@@ -845,16 +867,34 @@ def cmd_report(args, cfg):
 
 
 VIEW_TITLES = {"overdue": "기한 지남 전체", "progress": "진행 확인 전체", "past": "지난 일정 (완료 체크 목록에서 뺀 것 · 기록 유지)",
-               "waiting": "답변 대기·보류", "done": "완료 내역", "questions": "열린 질문 전체"}
+               "waiting": "답변 대기·보류", "done": "완료 내역", "questions": "열린 질문 전체",
+               "history": "일정 이력 — 지난 정기 회차 (최근 30일)"}
 
 
 def view_rows(conn, cfg, now, view: str) -> tuple[list[dict], int]:
     """전체 보기: 한 구역의 업무를 빠짐없이 번호 버튼과 함께 (여러 쪽 가능)."""
     today = now.astimezone(tz_of(cfg)).date()
     rows: list[dict] = []
+    if view == "history":
+        # 0.10.0: 종료·추적 제외된 회차를 확인하는 곳. '종료'와 '실제 완료'를 나눠 적는다. 버튼 없음(활성 업무가 아니다).
+        hs = policy.series_history(conn, cfg, now, days=30)
+        rows.append({"heading": f"**{VIEW_TITLES[view]} ({len(hs)})** — 종료·추적 제외는 완료가 아닙니다(참석 여부를 단정하지 않음)"})
+        by: dict[str, list] = {}
+        for h in hs:
+            by.setdefault(h["series_key"], []).append(h)
+        for key, hh in by.items():
+            counts: dict[str, int] = {}
+            for h in hh:
+                counts[h["outcome"]] = counts.get(h["outcome"], 0) + 1
+            rows.append({"text": f"  {hh[0]['title']} — " + " · ".join(f"{k} {v}" for k, v in counts.items())})
+            for h in hh[:8]:
+                rows.append({"text": f"    {ops.fmt_when(cfg, h['start_at'], h['end_at'], bool(h['all_day']))} {h['outcome']} ({h['ref']})"})
+            if len(hh) > 8:
+                rows.append({"text": f"    그 전 {len(hh) - 8}회 — 'CLR 번호 일정 이력'으로 시리즈 전체"})
+        return rows, len(hs)
     if view == "questions":
         qs = conn.execute("SELECT q.*, i.ref AS item_ref, i.title AS item_title FROM question q LEFT JOIN item i ON i.id=q.item_id "
-                          "WHERE q.status='open' ORDER BY q.id").fetchall()
+                          f"WHERE q.status='open' AND (i.id IS NULL OR NOT {policy.ended_sql(now, 'i')}) ORDER BY q.id").fetchall()
         rows.append({"heading": f"**{VIEW_TITLES[view]} ({len(qs)})**"})
         for q in qs:
             opts = json.loads(q["options"]) if q["options"] else None
@@ -884,6 +924,11 @@ def view_rows(conn, cfg, now, view: str) -> tuple[list[dict], int]:
         rows.append({"heading": f"**{VIEW_TITLES[view]} ({len(es)})** — 끝난 것은 '지난 일정 다 끝났어' 또는 번호로 완료"})
         rows += [{"text": f"  {ops.fmt_when(cfg, e['start_at'], e['end_at'], bool(e['all_day']))}  {e['title']} ({e['ref']})",
                   "ref": e["ref"], "section": "3"} for e in es]
+        # 0.10.0: 종료 후 추적 제외로 정한 정기 회차는 여기 없다 — 일정 이력에서 본다
+        if not es:
+            rows.append({"text": "  없음"})
+        rows.append({"nav": [track.REPORT_NAV["history"]]})
+        return rows, len(es)
     elif view == "waiting":
         es = sorted(d["parked"], key=lambda e: (e["next_check_at"] or "9999", e["id"]))
         rows.append({"heading": f"**{VIEW_TITLES[view]} ({len(es)})** — 재확인일 전에는 묻지 않습니다"})
@@ -969,7 +1014,7 @@ def build_parser():
     ap.add_argument("--record", action="store_true", help="전달 기록에 남긴다 (0.6.0)")
     ag = sub.add_parser("agenda", help="업무 현황 — 활성 미완료 업무 전체 (0.6.0)")
     ag.add_argument("--no-record", action="store_true", help="전달 기록 없이 미리 보기")
-    ag.add_argument("--view", choices=["overdue", "progress", "past", "waiting", "done", "questions"],
+    ag.add_argument("--view", choices=["overdue", "progress", "past", "waiting", "done", "questions", "history"],
                     help="구역 하나의 전체 보기 (0.7.0 '전체 보기' 버튼)")
     rp = sub.add_parser("report", help="아침 보고 — 필요한 만큼만 (0.7.0)")
     rp.add_argument("--no-record", action="store_true", help="전달 기록 없이 미리 보기")

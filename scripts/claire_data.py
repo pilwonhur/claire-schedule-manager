@@ -28,8 +28,9 @@ REDACTION_MANIFEST = "redaction_manifest.json"
 # 운영 상태 문제(장부 손상이 아님). 이전·백업 판정에서 "기존 작업 상태"로 따로 보고한다.
 OPERATIONAL_CHECKS = {"outbox_failed", "memo_sync_failed", "delivery_failed", "sync_stale", "sync_full_needed", "run_lock"}
 
-# 코드가 행을 지우는 표 (0.8.0 기준: 메모 연결 해제·보고 재생성·관계 해제). 그 밖의 표에서 행이 사라지면 데이터 유실이다.
-DELETABLE_TABLES = {"memo_link", "delivery", "relation"}
+# 코드가 행을 지우는 표 (메모 연결 해제·보고 재생성·관계 해제, 0.10.0 정기 일정 정책 지우기·되돌리기).
+# 그 밖의 표에서 행이 사라지면 데이터 유실이다.
+DELETABLE_TABLES = {"memo_link", "delivery", "relation", "series_policy"}
 
 # 데이터 폴더 맨 위에서 복사하지 않는 것. secrets/ 는 따로(보호 복사), 장부는 백업 API 로.
 EXCLUDE_TOP = {DB_NAME, f"{DB_NAME}-wal", f"{DB_NAME}-shm", claire_paths.MARKER_NAME, "backups", "skill-prev",

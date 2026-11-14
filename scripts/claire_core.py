@@ -30,7 +30,7 @@ import claire_paths  # noqa: E402  (0.9.0 데이터 위치 해석 — 모든 CLI
 #
 # 스킬 전체의 배포 버전 (SemVer). 동작이나 문서가 바뀌면 반드시 올리고
 # CHANGELOG.md에 항목을 남긴다. tests/test_claire.py가 둘의 일치를 검사한다.
-CLAIRE_VERSION = "0.9.1"
+CLAIRE_VERSION = "0.10.0"
 
 # 데이터 파일 형식의 버전. 스키마가 바뀌면 올리고 MIGRATIONS 에 기존 DB 변환을 적는다.
 # v2 (0.5.0): item.due_precision·window_auto·attendance·daily_logged_on, outbox.selected_at, checkin 표.
@@ -38,7 +38,9 @@ CLAIRE_VERSION = "0.9.1"
 #             last_exposed_at·last_asked_at·last_reported_at, delivery 표 (완료까지 추적·전달 기록).
 # v4 (0.7.0): item.short_label·last_detailed_at, delivery.mention_refs, note_map 표 (아침 보고 간소화·Tasks 주제 문서).
 # v5 (0.8.0): memo·memo_log·memo_link·memo_fts 표 (메모함 — 업무와 분리된 기록, ISSUE 2026-10-11). 기존 표는 그대로.
-SCHEMA_VERSION = 5
+# v6 (0.10.0): item.track_policy·track_policy_reason, series_policy 표 (정기 일정 종료 후 추적 제외, ISSUE 2026-11-15).
+#             기존 값은 바꾸지 않는다 — 정책이 없는 시리즈는 이전과 똑같이 추적한다.
+SCHEMA_VERSION = 6
 
 # --------------------------------------------------------------------------
 # 설정 (PRD §12, §15)
@@ -295,6 +297,47 @@ def parse_iso(ts: str) -> datetime:
     return datetime.fromisoformat(ts)
 
 
+def occurrence_end(end_at: str | None, all_day, tz: str | None, start_at: str | None = None) -> datetime | None:
+    """일정 회차의 확정된 종료 순간 (0.10.0). 임의의 종료 시각을 만들지 않는다 — 모르면 None.
+    - 시각이 있는 종료(오프셋 포함 ISO): 그 순간.
+    - 종일 일정: Google 의 종료일은 배타적이다(11/15 하루 종일 → end.date 11/16). 그 날짜의 0시(항목 시간대)가 끝.
+      'YYYY-MM-DD' 든 'YYYY-MM-DDT00:00:00+09:00'(제안 저장 형식) 이든 같은 순간이 된다.
+    - 시각 일정인데 종료가 날짜뿐이거나, 종료가 시작보다 이르거나 같으면(포함형으로 잘못 적힌 종일 등) None — 판단 필요."""
+    if not end_at:
+        return None
+    zone = ZoneInfo(tz or "Asia/Seoul")
+    try:
+        if len(end_at) == 10:
+            if not all_day:
+                return None
+            end = datetime.fromisoformat(end_at + "T00:00:00").replace(tzinfo=zone)
+        else:
+            end = datetime.fromisoformat(end_at.replace("Z", "+00:00"))
+            if end.tzinfo is None:
+                return None
+        if start_at:
+            start = (datetime.fromisoformat(start_at + "T00:00:00").replace(tzinfo=zone) if len(start_at) == 10
+                     else datetime.fromisoformat(start_at.replace("Z", "+00:00")))
+            if start.tzinfo is not None and end <= start:
+                return None
+    except ValueError:
+        return None
+    return end
+
+
+def _sql_occurrence_ended(start_at, end_at, all_day, tz, now_s) -> int | None:
+    end = occurrence_end(end_at, all_day, tz, start_at)
+    if end is None:
+        return None
+    return 1 if end <= datetime.fromisoformat(now_s) else 0
+
+
+def register_functions(conn: sqlite3.Connection) -> None:
+    """SQL 에서 쓰는 도구 함수. claire_occurrence_ended(start, end, all_day, tz, now) = 1(끝남)/0/NULL(종료 시각 모름).
+    추적 제외 판정(claire_policy.ended_sql)이 조회마다 같은 규칙을 쓰게 한다."""
+    conn.create_function("claire_occurrence_ended", 5, _sql_occurrence_ended, deterministic=True)
+
+
 def hours_between(a: str, b: str) -> float:
     return (parse_iso(b) - parse_iso(a)).total_seconds() / 3600.0
 
@@ -356,6 +399,8 @@ CREATE TABLE IF NOT EXISTS item (
   last_reported_at TEXT,
   short_label    TEXT,
   last_detailed_at TEXT,
+  track_policy   TEXT CHECK (track_policy IN ('after_end','until_done')),
+  track_policy_reason TEXT,
   created_at     TEXT NOT NULL,
   updated_at     TEXT NOT NULL,
   completed_at   TEXT,
@@ -649,6 +694,21 @@ CREATE VIRTUAL TABLE IF NOT EXISTS memo_fts USING fts5(
   tokenize='unicode61 remove_diacritics 2'
 );
 
+-- 정기 일정 시리즈의 추적 정책 (v6, 0.10.0). 회차(item)마다가 아니라 시리즈마다 한 번 정한다.
+--   after_end  : 참석형 정기 일정 — 회차가 끝나면(원본 종료 시각) 확인 없이 추적에서 뺀다. 완료가 아니다.
+--   until_done : 완료 확인까지 추적 (정책이 없을 때와 같다)
+-- 회차 예외는 item.track_policy 가 이긴다. 행이 없으면 정책 미정 = until_done. 바뀐 이력은 activity_log(action='policy').
+CREATE TABLE IF NOT EXISTS series_policy (
+  series_key  TEXT PRIMARY KEY,
+  policy      TEXT NOT NULL CHECK (policy IN ('after_end','until_done')),
+  source      TEXT NOT NULL CHECK (source IN ('claire','user')),
+  reason      TEXT,
+  title       TEXT,
+  batch       TEXT,
+  created_at  TEXT NOT NULL,
+  updated_at  TEXT NOT NULL
+);
+
 -- 한국어 검색 (Clio의 어간 근사 처리 재사용)
 CREATE VIRTUAL TABLE IF NOT EXISTS search_fts USING fts5(
   ref, title, project, next_action, waiting_on, excerpts,
@@ -659,11 +719,11 @@ CREATE VIRTUAL TABLE IF NOT EXISTS search_fts USING fts5(
 # 백업·복구 대조와 무결성 집계에 쓰는 표 목록 (TC20)
 COUNT_TABLES = ["item", "source_event", "item_source", "attachment", "question",
                 "activity_log", "relation", "link", "sync_state", "run", "outbox",
-                "briefing", "checkin", "delivery", "note_map", "memo", "memo_log", "memo_link"]
+                "briefing", "checkin", "delivery", "note_map", "memo", "memo_log", "memo_link", "series_policy"]
 
 # 내용 해시에 참여하는 표. 복구 후 "건수·해시 일치"의 해시가 이것이다 (TC20).
 HASH_TABLES = ["item", "source_event", "item_source", "question", "activity_log",
-               "relation", "link", "memo", "memo_log", "memo_link"]
+               "relation", "link", "memo", "memo_log", "memo_link", "series_policy"]
 
 DB_NAME = "claire.db"
 
@@ -686,6 +746,7 @@ def connect(create: bool = True) -> sqlite3.Connection:
     d.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(db, isolation_level=None, timeout=10.0)
     conn.row_factory = sqlite3.Row
+    register_functions(conn)
     fresh = not _has_table(conn, "item")
     if not fresh:
         migrate(conn)                      # 기존 DB 는 먼저 열을 맞춘 뒤 DDL(인덱스·새 표)을 적용한다
@@ -743,6 +804,9 @@ MIGRATION_COLUMNS = {
         # v4 (0.7.0)
         ("short_label", "TEXT"),
         ("last_detailed_at", "TEXT"),
+        # v6 (0.10.0) — 회차 예외 정책. 비어 있으면 시리즈 정책(series_policy)을 따른다.
+        ("track_policy", "TEXT CHECK (track_policy IN ('after_end','until_done'))"),
+        ("track_policy_reason", "TEXT"),
     ],
     "outbox": [("selected_at", "TEXT")],
     "delivery": [("mention_refs", "TEXT")],

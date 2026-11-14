@@ -3259,7 +3259,7 @@ class V080Test(FixtureBase):
         conn.execute("UPDATE meta SET value='4' WHERE key='schema_version'"); conn.commit()
         self.assertEqual(claire_core.table_counts(conn, ["memo"]), {"memo": 0})     # 없는 표는 0 (옛 백업 대조)
         r = self.sh("claire_check", "init")
-        self.assertEqual(r["schema_version"], 5)
+        self.assertEqual(r["schema_version"], claire_core.SCHEMA_VERSION)
         conn = self.db()
         self.assertEqual(claire_core.content_hash(conn, tables), before)
         self.assertEqual(claire_core.table_counts(conn, tables + ["outbox", "delivery", "note_map"]), counts)
@@ -4393,6 +4393,308 @@ class InstallTest(unittest.TestCase):
         self.assertIn("내리지 않습니다", p.stdout)
         self.assertIn(f'CLAIRE_VERSION = "{cur}"', (self.tmp / "skill" / "scripts" / "claire_core.py").read_text(encoding="utf-8"))
         self.assertFalse((home / "ClaireData").exists())
+
+
+
+class V0100Test(FixtureBase):
+    """0.10.0 (ISSUE 2026-11-15 정기 일정 종료 후 추적 제외): 일정 종료와 업무 완료를 나눈다. 수용·회귀 기준 §7 을 하나씩.
+    기준 시각 2026-09-11(금) 06:00. MC2103 수업(rec1): 9/8·9/10 지난 회차, 9/11 09:00–10:15 오늘, 9/15 앞으로."""
+
+    def setUp(self):
+        super().setUp()
+        V050Test.v050_setup(self)
+
+    store, item, outbox, ingest = V050Test.store, V050Test.item, V050Test.outbox, V050Test.ingest
+    at, ag_data, agenda, discord_task = V060Test.at, V060Test.ag_data, V060Test.agenda, V060Test.discord_task
+
+    def report_data(self):
+        return self.sh("claire_search", "report")
+
+    def series(self, *args, expect_ok=True):
+        return self.sh("claire_series", *args, expect_ok=expect_ok)
+
+    def _cal(self, eid, summary, start, end, rec=None, **extra):
+        ev = {"id": eid, "etag": f"e-{eid}", "status": "confirmed", "summary": summary,
+              "updated": "2026-09-10T01:00:00.000Z", "organizer": {"email": "prof@example.com", "self": True}, **extra}
+        ev["start"] = {"date": start} if len(start) == 10 else {"dateTime": start}
+        if end is not None:
+            ev["end"] = {"date": end} if len(end) == 10 else {"dateTime": end}
+        if rec:
+            ev["recurringEventId"] = rec
+        return ev
+
+    def class_events(self):
+        return [self._cal(f"rec1_{d}", "MC2103 수업", f"2026-09-{d}T09:00:00+09:00", f"2026-09-{d}T10:15:00+09:00", "rec1")
+                for d in ("08", "10", "11", "15")]
+
+    def setup_calendar(self, extra=(), *, policy="after_end", single=True, payment=True):
+        evs = self.class_events() + list(extra)
+        if single:
+            evs.append(self._cal("one", "학과 회의", "2026-09-10T16:00:00+09:00", "2026-09-10T17:00:00+09:00"))
+        if payment:
+            evs += [self._cal(f"pay_{d}", "연구실 서버 정기 결제", f"2026-09-{d}T10:00:00+09:00", f"2026-09-{d}T10:30:00+09:00", "pay")
+                    for d in ("05", "12")]
+        self.fixture(f"cal_events_{PROF}", {"items": evs, "nextSyncToken": "tokA"})
+        self.sh("claire_sync", "calendar", "--calendar", "Prof. Hur")
+        groups = self.sh("claire_sync", "pending", "--platform", "calendar")["groups"]
+        props = []
+        for g in groups:
+            if g.get("series"):
+                key = g["series"]["recurring_event_id"]
+                p = {"op": "create", "series": True, "source_event_ids": g["series"]["source_event_ids"],
+                     "title": g["events"][0]["summary"], "confidence": 1.0, "evidence": ["cal"]}
+                if key == "pay":
+                    p["kind"] = "task"                       # 수행 결과를 확인해야 하는 반복 업무
+                else:
+                    p["kind"] = "meeting"
+                    if policy:
+                        p["track_policy"] = policy
+                        p["track_policy_reason"] = "참석형 정기 수업"
+                props.append(p)
+            else:
+                e = g["events"][0]
+                props.append({"op": "create", "source_event_ids": [e["source_event_id"]], "kind": "meeting",
+                              "title": e["summary"], "confidence": 1.0, "evidence": ["cal"]})
+        return self.propose(props)
+
+    def refs(self, title):
+        return [r["ref"] for r in self.db().execute("SELECT ref FROM item WHERE title=? ORDER BY start_at", (title,))]
+
+    def active_refs(self, d=None):
+        d = d or self.ag_data()
+        return ({e["ref"] for e in d["today"] + d["check"] + d["upcoming"]}
+                | {e["ref"] for g in list(d["open"].values()) + list(d["parked"].values()) for e in g}
+                | {r for sl in d["series"] for r in sl["refs"]})
+
+    # -- §7-1·3·4: 종료되면 입력 없이 추적 제외, 활성·지난 미처리·진행 확인·누락 감지·accounting 모두 같은 기준 --------------
+    def test_ended_class_occurrences_leave_every_active_view_without_status_change(self):
+        r = self.setup_calendar()
+        ser = next(c for c in r["created"] if c.get("series") == "rec1")
+        self.assertEqual(ser["track_policy"]["policy"], "after_end")
+        c08, c10, c11, c15 = self.refs("MC2103 수업")
+        single = self.refs("학과 회의")[0]
+        rd = self.report_data()
+        self.assertEqual([e["ref"] for e in rd["past_meetings"]], [single])          # 단발 일정은 그대로(이번 변경 대상 아님)
+        self.assertTrue(rd["accounting"]["ok"])
+        d = self.ag_data()
+        act = self.active_refs(d)
+        self.assertNotIn(c08, act); self.assertNotIn(c10, act)
+        self.assertIn(c11, [e["ref"] for e in d["today"]]); self.assertIn(c15, act)
+        self.assertEqual(d["coverage"]["missing"], []); self.assertEqual(d["coverage"]["active"], len(act))
+        self.assertNotIn(c08, [e["ref"] for e in d["check"]])
+        self.assertFalse({c08, c10} & {g["ref"] for g in d["health"]["exposure_gaps"]})
+        # 상태·완료 기록·외부 반영은 그대로다 (Calendar·Tasks·Daily 를 바꾸지 않는다)
+        for ref in (c08, c10):
+            it = self.item(ref)
+            self.assertEqual((it["status"], it["completed_at"]), ("todo", None))
+        self.assertFalse([o for o in self.outbox() if o["op"] in ("obsidian.check_task", "obsidian.daily_done",
+                                                                     "calendar.update")])
+        self.assertFalse(self.db().execute("SELECT 1 FROM activity_log WHERE action='complete'").fetchone())
+        # 종료 직전은 안내 대상, 종료 순간부터 제외 (오늘 회차 9/11 10:15 종료)
+        self.at("2026-09-11T10:14:59+09:00")
+        self.assertIn(c11, self.active_refs())
+        self.assertIn(c11, [m["ref"] for m in self.sh("claire_search", "today")["meetings"]])
+        self.at("2026-09-11T10:15:00+09:00")
+        self.assertNotIn(c11, self.active_refs())
+        self.assertNotIn(c11, [m["ref"] for m in self.sh("claire_search", "today")["meetings"]])
+        self.assertIn(c15, self.active_refs())                                        # 다음 회차 안내는 그대로
+        # 검색·일정 이력에서는 찾을 수 있고 '종료'와 '완료'가 구분된다
+        f = self.sh("claire_search", "find", "--q", "MC2103", "--status", "ended")
+        self.assertEqual({x["ref"] for x in f["results"]}, {c08, c10, c11})
+        self.assertTrue(all(x["status_label"] == "종료·추적 제외" and x["status"] == "todo" for x in f["results"]))
+        self.assertEqual(self.sh("claire_search", "find", "--q", "MC2103")["results"][0]["ref"], c15)
+        self.store("complete", "--item", c10, "--evidence", "user_report")        # 교수님이 직접 보고하는 기존 경로
+        h = self.sh("claire_search", "occurrences", "--item", c15)
+        self.assertEqual({x["ref"]: x["outcome"] for x in h["occurrences"]},
+                         {c08: "종료·추적 제외", c10: "완료(보고됨)", c11: "종료·추적 제외"})
+        v = self.sh("claire_buttons", "agenda", "--view", "history", "--no-record")
+        self.assertIn("종료·추적 제외 2", v["text"]); self.assertIn("완료(보고됨) 1", v["text"])
+
+    # -- §7-6·7·8: 결제·단발 일정은 자동 제외 안 함, 연결 업무는 계속, 종료 시각 없으면 종료 처리 안 함 -------------------------
+    def test_payments_singles_linked_work_and_missing_end_keep_tracking(self):
+        noend = self._cal("rec1_09", "MC2103 수업", "2026-09-09T09:00:00+09:00", None, "rec1")
+        self.setup_calendar([noend])
+        c08 = self.refs("MC2103 수업")[0]
+        c09 = self.refs("MC2103 수업")[1]
+        self.assertIsNone(self.item(c09)["end_at"])
+        prep = self.store("link-task", "--item", c08, "--role", "followup", "--title", "수업 과제 채점")["ref"]
+        act = self.active_refs()
+        self.assertIn(c09, act)                                                       # 종료 시각을 지어내지 않는다
+        self.assertIn(prep, act)                                                      # 후속 업무는 계속 추적
+        self.assertNotIn(c08, act)
+        self.assertTrue(set(self.refs("연구실 서버 정기 결제")) <= act)
+        self.assertIn(self.refs("학과 회의")[0], act)
+        ex = self.series("explain", "--item", c09)
+        self.assertEqual((ex["ended"], ex["blockers"]), (False, ["no_end_time"]))
+        self.assertEqual(self.item(prep)["status"], "todo")
+        # 업무형 시리즈에는 종료 후 제외를 걸 수 없다
+        e = self.series("set", "--series", "pay", "--policy", "after_end", "--reason", "x", expect_ok=False)
+        self.assertEqual(e["error"]["code"], "not_eligible")
+        a = self.ingest("dx", "등록: 매주 회의")                                       # 단발 원문에는 정책을 쓰지 않는다
+        bad = self.propose([{"op": "create", "kind": "meeting", "title": "x", "track_policy": "after_end",
+                             "start_at": "2026-09-14T10:00:00+09:00", "end_at": "2026-09-14T11:00:00+09:00",
+                             "source_event_ids": [a["source_event_id"]], "confidence": 1.0, "evidence": ["x"]}], expect_ok=False)
+        self.assertIn("series:true", bad["error"]["message"])
+
+    # -- §7-11: 수동 완료·대기·보류·취소 존중, 미래로 옮긴 회차는 다시 안내, Calendar 에서 사라진 회차는 기존 확인 -------------
+    def test_manual_states_moves_and_calendar_exceptions(self):
+        self.setup_calendar([self._cal("rec1_04", "MC2103 수업", "2026-09-04T09:00:00+09:00", "2026-09-04T10:15:00+09:00", "rec1")])
+        c04, c08, c10, c11, c15 = self.refs("MC2103 수업")
+        self.store("wait", "--item", c04, "--waiting-on", "조교", "--until", "2026-09-14")
+        self.store("complete", "--item", c08, "--evidence", "user_report")
+        d = self.ag_data()
+        self.assertIn(c04, [e["ref"] for e in d["parked"]["waiting"]])               # 교수님이 정한 대기가 이긴다
+        self.assertEqual(self.item(c08)["status"], "done")
+        # 9/10 회차가 9/20 로 옮겨지고 9/11 회차는 Calendar 에서 취소(사라짐)
+        moved = self._cal("rec1_10", "MC2103 수업", "2026-09-20T09:00:00+09:00", "2026-09-20T10:15:00+09:00", "rec1", etag="m2")
+        gone = dict(self._cal("rec1_11", "MC2103 수업", "2026-09-11T09:00:00+09:00", "2026-09-11T10:15:00+09:00", "rec1"),
+                    status="cancelled", etag="c2")
+        self.fixture(f"cal_events_{PROF}_tokA", {"items": [moved, gone], "nextSyncToken": "tokB"})
+        self.sh("claire_sync", "calendar", "--calendar", "Prof. Hur")
+        self.at("2026-09-12T06:00:00+09:00")
+        act = self.active_refs()
+        self.assertIn(c10, act)                                                       # 미래로 옮김 → 다시 안내 대상
+        self.assertIn(c11, act)                                                       # 사라짐(missing)은 자동 종료 아님
+        self.assertEqual(self.series("explain", "--item", c11)["blockers"], ["calendar_missing"])
+        # 회차 예외: 이 회차만 완료 확인까지
+        self.at("2026-09-21T06:00:00+09:00")
+        self.assertNotIn(c10, self.active_refs())
+        self.series("set", "--item", c10, "--occurrence", "--policy", "until_done", "--reason", "보강 수업 보고서 필요")
+        self.assertIn(c10, self.active_refs())
+        self.assertEqual(self.series("explain", "--item", c10)["policy_from"], "occurrence")
+
+    # -- §7-2: 종일 일정의 배타적 종료일·시간대 -------------------------------------------------------------------------
+    def test_all_day_occurrence_ends_at_exclusive_end_date_midnight(self):
+        allday = [self._cal(f"ws_{d}", "주간 연구실 워크숍", f"2026-09-{d}", f"2026-09-{int(d) + 1:02d}", "ws") for d in ("10", "17")]
+        self.setup_calendar(allday, single=False, payment=False)
+        w10 = self.refs("주간 연구실 워크숍")[0]
+        self.at("2026-09-10T23:59:59+09:00")
+        self.assertIn(w10, self.active_refs())
+        self.at("2026-09-11T00:00:00+09:00")
+        self.assertNotIn(w10, self.active_refs())
+        end = claire_core.occurrence_end("2026-09-11", 1, "Asia/Seoul", "2026-09-10")
+        self.assertEqual(end.isoformat(), "2026-09-11T00:00:00+09:00")
+        self.assertIsNone(claire_core.occurrence_end("2026-09-10", 1, "Asia/Seoul", "2026-09-10"))   # 포함형으로 잘못 적힘 → 판단 필요
+        self.assertIsNone(claire_core.occurrence_end("2026-09-10", 0, "Asia/Seoul", "2026-09-10T09:00:00+09:00"))
+        utc = claire_core.occurrence_end("2026-09-11T01:15:00Z", 0, "Asia/Seoul", "2026-09-11T09:00:00+09:00")
+        self.assertEqual(utc.isoformat(), "2026-09-11T01:15:00+00:00")
+
+    # -- §6·§7-13: 기존 누적분 — 미리보기(변경 없음) → 적용(멱등) → 되돌리기 ---------------------------------------------
+    def test_backlog_preview_apply_idempotent_and_revert(self):
+        talk = [self._cal(f"tk_{d}", "학과 세미나 결제 확인", f"2026-09-{d}T15:00:00+09:00", f"2026-09-{d}T16:00:00+09:00", "tk")
+                for d in ("03", "10")]
+        self.setup_calendar(talk, policy=None)
+        hashes = claire_core.content_hash(self.db())
+        pv = self.series("preview")
+        cat = {r["series_key"]: r["category"] for r in pv["series"]}
+        self.assertEqual(cat, {"rec1": "candidate", "pay": "keep", "tk": "review"})
+        rec1 = next(r for r in pv["series"] if r["series_key"] == "rec1")
+        self.assertEqual(rec1["would_end_count"], 2)
+        b, a = pv["projection"]["before"], pv["projection"]["after_candidates"]
+        self.assertEqual((b["past_meetings"] - a["past_meetings"], b["active"] - a["active"]), (2, 2))
+        self.assertTrue(a["accounting_ok"]); self.assertEqual(a["coverage_missing"], 0)
+        self.assertEqual(pv["single_meetings_past_open"], 1)
+        self.assertIn("후보 1개 시리즈(지난 회차 2건 제외 예정)", pv["text"])
+        self.assertEqual(claire_core.content_hash(self.db()), hashes)                 # 미리보기는 장부를 바꾸지 않는다
+        dry = self.series("apply", "--candidates")
+        self.assertTrue(dry["dry_run"]); self.assertEqual(dry["after"]["past_meetings"], a["past_meetings"])
+        self.assertEqual(self.db().execute("SELECT COUNT(*) FROM series_policy").fetchone()[0], 0)
+        ap = self.series("apply", "--candidates", "--confirm", "--reason", "교수님 확인: 수업")
+        self.assertEqual(ap["changed"], ["rec1"]); self.assertTrue(ap["batch"].startswith("TP-"))
+        self.assertEqual(ap["after"], a)                                              # 미리보기와 실제 처리 결과가 일치
+        self.assertEqual(self.series("apply", "--series", "rec1", "--confirm", "--reason", "다시")["changed"], [])   # 멱등
+        self.assertEqual(self.series("list")["policies"][0]["excluded_now"], 2)
+        e = self.series("apply", "--series", "pay", "--confirm", "--reason", "x", expect_ok=False)
+        self.assertEqual(e["error"]["code"], "not_eligible")
+        rv = self.series("revert", "--batch", ap["batch"])
+        self.assertEqual(rv["after"], b)                                              # 되돌리면 집계가 원래대로
+        self.assertEqual(self.db().execute("SELECT COUNT(*) FROM series_policy").fetchone()[0], 0)
+        self.assertEqual(self.series("revert", "--batch", ap["batch"], expect_ok=False)["error"]["code"], "batch_not_found")
+        hist = self.series("history", "--series", "rec1")["history"]
+        self.assertEqual([h["new"] for h in hist], [None, "after_end"])
+        self.assertTrue(self.sh("claire_check", "integrity")["healthy"])
+
+    # -- §7-10: 재수집·반복 실행 뒤 재활성화·중복 없음, 따로 들어온 새 회차도 시리즈 정책을 따른다 ----------------------------
+    def test_resync_and_new_occurrence_inherit_policy_without_duplicates(self):
+        self.setup_calendar()
+        n_items = self.db().execute("SELECT COUNT(*) FROM item").fetchone()[0]
+        again = [dict(e, etag=e["etag"] + "-2") for e in self.class_events()]
+        newer = self._cal("rec1_17", "MC2103 수업", "2026-09-17T09:00:00+09:00", "2026-09-17T10:15:00+09:00", "rec1")
+        self.fixture(f"cal_events_{PROF}_tokA", {"items": again + [newer], "nextSyncToken": "tokB"})
+        self.sh("claire_sync", "calendar", "--calendar", "Prof. Hur")
+        self.assertEqual(self.db().execute("SELECT COUNT(*) FROM item").fetchone()[0], n_items)
+        g = next(g for g in self.sh("claire_sync", "pending", "--platform", "calendar")["groups"])
+        self.assertEqual(g["series"]["known"]["track_policy"], "after_end")
+        # Claire 가 series 표시 없이 단발처럼 만들어도 recurringEventId 를 잃지 않는다
+        r = self.propose([{"op": "create", "source_event_ids": g["series"]["source_event_ids"], "kind": "meeting",
+                           "title": "MC2103 수업", "confidence": 1.0, "evidence": ["cal"]}])
+        new_ref = r["created"][0]["ref"]
+        self.assertEqual(self.item(new_ref)["series_key"], "rec1")
+        self.at("2026-09-17T10:16:00+09:00")
+        act = self.active_refs()
+        self.assertNotIn(new_ref, act)
+        self.assertEqual(sum(1 for ref in self.refs("MC2103 수업") if ref in act), 0)
+        self.sh("claire_sync", "calendar", "--calendar", "Prof. Hur", "--full")
+        self.assertNotIn(new_ref, self.active_refs())
+
+    # -- 카드·질문·승인: 완료로 오인시키지 않고 반복 독촉하지 않는다 -------------------------------------------------------
+    def test_card_questions_and_approvals_for_ended_occurrence(self):
+        self.setup_calendar()
+        c08 = self.refs("MC2103 수업")[0]
+        conn = self.db()
+        iid = self.item(c08)["id"]
+        conn.execute("INSERT INTO question(ref,item_id,field,question,status,created_at) VALUES('Q-0901',?,'scope',"
+                     "'준비 자료가 있나요?','open','2026-09-07T09:00:00+09:00')", (iid,))
+        conn.commit()
+        card = self.sh("claire_buttons", "actions", "--item", c08)
+        self.assertTrue(card["ended"])
+        self.assertEqual(card["buttons"], [f"{c08} 상세", f"{c08} 계속 추적"])
+        self.assertIn("완료 기록 아님", card["message"]); self.assertNotIn("Q-0901", card["message"])
+        self.assertNotIn("Q-0901", [q["ref"] for q in self.report_data()["questions"]["shown"]])
+        self.assertNotIn("Q-0901", [q["ref"] for q in self.sh("claire_search", "questions", "--due-now")["questions"]])
+        allq = self.sh("claire_search", "questions")["questions"]
+        self.assertTrue(next(q for q in allq if q["ref"] == "Q-0901")["item_ended"])   # 기록은 그대로
+        # '지난 일정 다 끝났어'는 이미 빠진 회차를 완료로 기록하지 않는다
+        done = self.store("complete", "--past-meetings", "--evidence", "user_report")
+        self.assertNotIn(c08, done.get("completed", []))
+        self.assertEqual(self.item(c08)["status"], "todo")
+        # 계속 추적 버튼 = 이 회차 예외
+        self.series("set", "--item", c08, "--occurrence", "--policy", "until_done", "--reason", "교수님: 이 회차 보고 필요")
+        self.assertIn(f"{c08} 완료", self.sh("claire_buttons", "actions", "--item", c08)["buttons"])
+
+    # -- Claire 는 교수님이 정한 정책을 덮지 못한다 · SQL 판정과 파이썬 판정이 같다 ----------------------------------------
+    def test_user_policy_wins_and_sql_matches_python(self):
+        self.setup_calendar(policy=None)
+        self.series("set", "--series", "rec1", "--policy", "until_done", "--reason", "교수님: 출석 확인 필요")
+        e = self.series("set", "--series", "rec1", "--policy", "after_end", "--actor", "claire", "--reason", "x", expect_ok=False)
+        self.assertEqual(e["error"]["code"], "user_decided")
+        self.assertIn(self.refs("MC2103 수업")[0], self.active_refs())
+        self.series("set", "--series", "rec1", "--policy", "after_end", "--reason", "교수님: 이제 빼도 됨")
+        import claire_policy
+        cfg = claire_core.load_config()
+        for now in ("2026-09-08T10:15:00+09:00", "2026-09-11T06:00:00+09:00", "2026-09-30T00:00:00+09:00"):
+            conn = claire_core.connect()
+            try:
+                dt = claire_core.parse_iso(now)
+                py = {r["id"] for r in conn.execute("SELECT * FROM item")
+                      if claire_policy.occurrence_state(conn, cfg, r, dt)["ended"]}
+                self.assertEqual(claire_policy.ended_ids(conn, dt), py)
+            finally:
+                conn.close()
+
+    # -- 스키마 v5 → v6 은 추가만 (기존 값·번호 그대로) --------------------------------------------------------------
+    def test_migration_v5_to_v6_is_additive(self):
+        self.setup_calendar(policy=None)
+        conn = self.db()
+        rows_before = [tuple(r) for r in conn.execute("SELECT ref, status, start_at, end_at, series_key FROM item ORDER BY id")]
+        conn.execute("DROP TABLE series_policy")
+        conn.execute("UPDATE meta SET value='5' WHERE key='schema_version'"); conn.commit()
+        self.assertEqual(self.sh("claire_check", "init")["schema_version"], 6)
+        conn = self.db()
+        self.assertEqual([tuple(r) for r in conn.execute("SELECT ref, status, start_at, end_at, series_key FROM item ORDER BY id")],
+                         rows_before)
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM series_policy").fetchone()[0], 0)
+        self.assertIn(self.refs("MC2103 수업")[0], self.active_refs())               # 정책이 없으면 이전과 같다
 
 
 if __name__ == "__main__":

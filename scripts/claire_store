@@ -46,13 +46,14 @@ from claire_core import (  # noqa: E402
     tx, tz_of,
 )
 import claire_ops as ops  # noqa: E402
+import claire_policy as policy  # noqa: E402
 import claire_track as track  # noqa: E402
 
 ALLOWED_OPS = {"create", "ignore", "update", "complete", "cancel", "relate"}
 CREATE_FIELDS = {"kind", "title", "project", "priority", "owner", "next_action", "done_criteria",
                  "start_at", "end_at", "all_day", "due_at", "scheduled_on", "tentative", "confidence",
                  "waiting_on", "next_check_at", "canonical_note", "ledger_note", "series_key", "occurrence_at",
-                 "attendance", "request_scope", "priority_reason", "short_label"}
+                 "attendance", "request_scope", "priority_reason", "short_label", "track_policy", "track_policy_reason"}
 ISO_DT = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2})?([+-]\d{2}:\d{2}|Z)$")
 ISO_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 DEFAULT_CRITERIA = {"deadline": "제출·발송 완료", "reply": "회신 발송", "prep": "자료 준비 완료",
@@ -134,6 +135,11 @@ def _validate_create(p: dict, idx: int, cfg, evs=None) -> dict:
             fields["all_day"] = 1 if h.get("all_day") else 0
         if p.get("tentative") is None:
             fields["tentative"] = 0
+        if not fields["series_key"] and cal_evs[0]["thread_id"] and len(cal_evs) == 1:
+            # 0.10.0: 반복 일정의 회차 하나만 따로 들어와도 시리즈 정보(recurringEventId)를 잃지 않는다 —
+            # 그래야 시리즈 추적 정책을 따르고, 끝난 뒤 지난 일정으로 다시 쌓이지 않는다.
+            fields["series_key"] = cal_evs[0]["thread_id"]
+            fields["occurrence_at"] = fields["occurrence_at"] or fields["start_at"]
         if fields["attendance"] is None and h.get("user_response"):
             fields["attendance"] = ops.RESPONSE_TO_ATTENDANCE.get(h["user_response"])
     # 0.5.0 마감 규칙: 마감 시각만 있으면 달력 표시 구간은 마감 1시간 전~마감. 시작·기간을 따로 주면 그것이 우선.
@@ -309,6 +315,17 @@ def cmd_propose(args, cfg):
             continue
         v = _validate_create(p, idx, cfg, evs)
         v["series"] = bool(p.get("series"))
+        tp = p.get("track_policy")
+        if tp is not None:
+            # 0.10.0: 시리즈의 추적 정책 (참석형 정기 일정 = after_end, 수행형 = until_done). 의미 판단은 Claire 가 원문으로.
+            if not v["series"]:
+                _bad(f"제안 {idx}: track_policy 는 series:true 인 반복 시리즈에만 씁니다 (단발 일정은 정책 대상이 아님)")
+            if tp not in policy.POLICIES:
+                _bad(f"제안 {idx}: track_policy 는 {list(policy.POLICIES)} 중 하나", track_policy=tp)
+            if tp == "after_end" and v["fields"]["kind"] != "meeting":
+                _bad(f"제안 {idx}: after_end(종료 후 추적 제외)는 참석형 일정(kind=meeting)에만 — 결제·제출·회신은 완료 확인까지 추적")
+            v["track_policy"] = tp
+            v["track_policy_reason"] = (p.get("track_policy_reason") or "").strip() or None
         if v["series"]:
             if any(e["platform"] != "calendar" or not e["thread_id"] for e in evs):
                 _bad(f"제안 {idx}: series:true 는 같은 반복 시리즈의 calendar 원문에만 쓸 수 있습니다")
@@ -371,10 +388,26 @@ def cmd_propose(args, cfg):
                 continue
             if plan.get("series"):
                 refs = _create_series(conn, cfg, plan, now_s, run_id, min_conf)
-                created.append({"series": plan["events"][0]["thread_id"], "title": plan["fields"]["title"],
-                                "kind": plan["fields"]["kind"], "occurrences": len(refs), "refs": refs,
-                                "first_ref": refs[0], "last_ref": refs[-1],
-                                "source_event_ids": [e["id"] for e in plan["events"]]})
+                key = plan["events"][0]["thread_id"]
+                entry = {"series": key, "title": plan["fields"]["title"],
+                         "kind": plan["fields"]["kind"], "occurrences": len(refs), "refs": refs,
+                         "first_ref": refs[0], "last_ref": refs[-1],
+                         "source_event_ids": [e["id"] for e in plan["events"]]}
+                changed = False
+                if plan.get("track_policy"):
+                    try:
+                        changed = policy.set_series_policy(conn, key, plan["track_policy"], actor="claire", ts=now_s,
+                                                           reason=plan.get("track_policy_reason"),
+                                                           title=plan["fields"]["title"])["changed"]
+                    except ClaireError as e:
+                        if e.code != "user_decided":
+                            raise
+                        warnings.append({"code": "user_decided", "series": key, "message": e.message})
+                sp = policy.series_row(conn, key)          # 이미 정한 시리즈의 새 회차는 그 정책을 그대로 따른다
+                if sp is not None:
+                    entry["track_policy"] = {"policy": sp["policy"], "label": policy.POLICY_KO[sp["policy"]],
+                                             "source": sp["source"], "changed": changed}
+                created.append(entry)
                 continue
             f = plan["fields"]
             conf = f["confidence"]
@@ -497,7 +530,8 @@ def _item_by_ref_or_find(conn, cfg, ref: str | None, find: str | None, open_only
         _bad("--item 또는 --find 가 필요합니다")
     toks = tokenize(find)
     cands = []
-    sql = "SELECT * FROM item WHERE deleted_at IS NULL" + (" AND status IN (%s)" % ",".join(f"'{x}'" for x in OPEN_STATUSES) if open_only else "")
+    # 0.10.0: '열린 항목' = 활성 업무 (끝나서 추적에서 빠진 정기 회차는 문구 찾기 후보가 아님 — 번호로는 여전히 처리된다)
+    sql = "SELECT * FROM item WHERE deleted_at IS NULL" + (f" AND {policy.tracked_sql(now_dt(cfg))}" if open_only else "")
     for r in conn.execute(sql + " ORDER BY id DESC"):
         hay = " ".join(x for x in (r["title"], r["project"], r["next_action"]) if x)
         n = sum(1 for t in toks if hits(t, hay))
@@ -561,11 +595,13 @@ def _refs(value: str | None) -> list[str]:
 
 
 def _past_meeting_refs(conn, cfg, before: str | None) -> list[str]:
-    """끝난 일정(회의·수업) 중 아직 열린 것. before(YYYY-MM-DD)를 주면 그날 전에 시작한 것만."""
+    """끝난 일정(회의·수업) 중 아직 열린 것. before(YYYY-MM-DD)를 주면 그날 전에 시작한 것만.
+    0.10.0: 이미 종료·추적 제외된 정기 회차는 넣지 않는다 ('지난 일정 보기'에 없는 것을 완료로 기록하지 않는다)."""
     now = now_dt(cfg)
     out = []
     for r in conn.execute("SELECT * FROM item WHERE deleted_at IS NULL AND kind='meeting' AND start_at IS NOT NULL "
-                          "AND status IN ('todo','in_progress','waiting','on_hold') ORDER BY start_at"):
+                          f"AND status IN ('todo','in_progress','waiting','on_hold') AND NOT {policy.ended_sql(now)} "
+                          "ORDER BY start_at"):
         start = datetime.fromisoformat(r["start_at"]) if len(r["start_at"]) > 10 else \
             datetime.fromisoformat(r["start_at"] + "T00:00:00").replace(tzinfo=tz_of(cfg))
         end = datetime.fromisoformat(r["end_at"]) if r["end_at"] and len(r["end_at"]) > 10 else start + timedelta(hours=1)

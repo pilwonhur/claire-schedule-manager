@@ -961,12 +961,26 @@ def cmd_pending(args, cfg):
             entries.append(entry)
         group = {"group": k, "platform": first["platform"], "thread_id": first["thread_id"],
                  "related_items": related, "events": entries}
-        if first["platform"] == "calendar" and first["thread_id"] and len(evs) > 1:
+        known = None
+        if first["platform"] == "calendar" and first["thread_id"]:
+            # 0.10.0: 이미 추적 중인 시리즈의 새 회차 — 정책(series_policy)을 알려 같은 판단을 반복하지 않게
+            n_items = conn.execute("SELECT COUNT(*) FROM item WHERE series_key=? AND deleted_at IS NULL",
+                                   (first["thread_id"],)).fetchone()[0]
+            sp = conn.execute("SELECT policy, source FROM series_policy WHERE series_key=?", (first["thread_id"],)).fetchone()
+            if n_items or sp is not None:
+                known = {"existing_items": n_items, "track_policy": sp["policy"] if sp is not None else None,
+                         "track_policy_source": sp["source"] if sp is not None else None}
+        if first["platform"] == "calendar" and first["thread_id"] and (len(evs) > 1 or known):
+            hint = ("시리즈를 한 번만 판단한다. 항목으로 만들려면 create 에 series:true 와 위 source_event_ids 전부를 넣는다. "
+                    "회차별 항목은 도구가 만든다. 참석형 정기 일정(수업·개인미팅·과제미팅)이면 track_policy:\"after_end\", "
+                    "결제·제출·회신처럼 수행 결과를 확인해야 하면 \"until_done\" (제목의 '미팅'·'매주'만으로 정하지 않는다).")
+            if known:
+                hint = (f"이미 추적 중인 시리즈의 새 회차(기존 {known['existing_items']}건). series:true 로 만들면 "
+                        + (f"정해진 정책({known['track_policy']})을 그대로 따른다 — track_policy 를 다시 적지 않는다."
+                           if known["track_policy"] else "회차가 생긴다. 정책이 아직 없다 — 참석형이면 track_policy:\"after_end\"."))
             group["series"] = {"recurring_event_id": first["thread_id"], "occurrences": len(evs),
                                "source_event_ids": [e["id"] for e in evs],
-                               "starts": [e["hdr"].get("start") for e in evs],
-                               "hint": "시리즈를 한 번만 판단한다. 항목으로 만들려면 create 에 series:true 와 "
-                                       "위 source_event_ids 전부를 넣는다. 회차별 항목은 도구가 만든다."}
+                               "starts": [e["hdr"].get("start") for e in evs], "known": known, "hint": hint}
             group["events"] = entries[:1]   # 본문은 첫 회차만
         out_groups.append(group)
     result = {"groups": out_groups, "group_count": len(out_groups), "total_pending_groups": total_groups,

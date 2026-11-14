@@ -2,7 +2,7 @@
 
 | 표 | 역할 | 유니크·핵심 제약 |
 |---|---|---|
-| `item` | 관리 항목의 현재 상태 | `ref` 유니크(`CLR-0001`, 재사용 금지). `kind` 6종, `status` 8종, `priority`, `owner` CHECK. v2: `due_precision`(date/time), `window_auto`(달력 구간을 마감에서 계산), `attendance`(undecided/attending/declined), `daily_logged_on`(완료 기록이 있는 Daily 날짜). v3: `request_scope`(direct/group/self/none), `priority_source`(rule/claire/user/unreviewed)·`priority_reason`(분류 근거), `check_every_days`·`review_after`(교수님 지정 주기·다음 확인일), `close_reason`(cancelled/not_needed/not_mine), `last_exposed_at`·`last_asked_at`(전송 성공 기준)·`last_reported_at`(교수님 보고). v4: `short_label`(보고 키워드 1~3단어)·`last_detailed_at`(아침 보고에 상세·버튼으로 전달된 시각 — 돌려 가며 고르기) |
+| `item` | 관리 항목의 현재 상태 | `ref` 유니크(`CLR-0001`, 재사용 금지). `kind` 6종, `status` 8종, `priority`, `owner` CHECK. v2: `due_precision`(date/time), `window_auto`(달력 구간을 마감에서 계산), `attendance`(undecided/attending/declined), `daily_logged_on`(완료 기록이 있는 Daily 날짜). v3: `request_scope`(direct/group/self/none), `priority_source`(rule/claire/user/unreviewed)·`priority_reason`(분류 근거), `check_every_days`·`review_after`(교수님 지정 주기·다음 확인일), `close_reason`(cancelled/not_needed/not_mine), `last_exposed_at`·`last_asked_at`(전송 성공 기준)·`last_reported_at`(교수님 보고). v4: `short_label`(보고 키워드 1~3단어)·`last_detailed_at`(아침 보고에 상세·버튼으로 전달된 시각 — 돌려 가며 고르기). v6: `track_policy`(after_end/until_done — 정기 회차 하나의 예외, 비면 시리즈 정책)·`track_policy_reason` |
 | `source_event` | 수집 원문 단위 = 미처리 큐 + 근거 | `(platform, account, external_id, version)` 유니크. `triage` new→proposed/ignored |
 | `item_source` | 항목↔원문 (origin/update/cancel/evidence/mention) | PK `(item_id, source_event_id, role)` |
 | `attachment` | Discord 이미지 원본 | `(source_event_id, sha256)` 유니크. 파일은 `attachments/<2자>/<sha256>.<ext>` |
@@ -20,6 +20,7 @@
 | `memo` | 메모함 (v5, 0.8.0) — 업무가 아니다 | `ref` 유니크(`MEM-0001`, 재사용 금지). `original_text`(처음 받은 원문, 바꾸지 않음)·`body`(현재 내용)·`title`·`topic`. `status` open/reference/resolved/not_needed(+ `status_reason`·`status_changed_at`). 출처 `source_platform`·`source_channel`·`source_message_id`·`source_part`·`source_url`, `source_key`=`platform:message:part` 유니크(재처리 중복 방지). `recorded_at`(메시지 시각). Obsidian `obsidian_note`·`obsidian_hash`(마지막으로 쓴 블록 — 다르면 고친 것)·`sync_status` pending/ok/failed/conflict. 기한·중요도·재확인일 없음 |
 | `memo_log` | 메모 이력 (v5) | `action` create/status/edit/link/unlink/to_task/sync, `old_value`·`new_value`·`reason`, `source_message_id`(같은 지시 재처리 방지) |
 | `memo_link` | 메모 → 관련 업무(`task`: item.id)·관련 메모(`memo`) (v5) | `(memo_id, kind, target_id)` 유니크. 상태를 서로 바꾸지 않는다. 업무 쪽 이력은 `activity_log.action='memo_link'`(브리핑 "변경"에 안 셈) |
+| `series_policy` | 정기 일정 시리즈의 추적 정책 (v6, 0.10.0) | `series_key` 기본 키(Calendar recurringEventId). `policy` after_end(종료 후 추적 제외)/until_done(완료 확인까지), `source` claire/user(교수님 결정은 Claire 가 못 바꿈), `reason`, `title`, `batch`(apply 묶음 `TP-…` — revert 단위). 행이 없으면 정책 미정 = until_done. 바뀐 이력은 `activity_log.action='policy'`(item_id 없음, payload.before 로 되돌림) |
 | `meta` | `schema_version`, `created_by_version`, `daily_done_since`(Daily 완료 기록 시작 시각), `migrated_v2`·`migrated_v3`, `tracking_since`(노출 추적 시작), `importance_backfilled`(소급 분류 1회) | |
 | `search_fts` | FTS5 (ref, title, project, next_action, waiting_on, excerpts) | rowid = item.id |
 | `memo_fts` | FTS5 (ref, title, body, topic) — 메모 검색 (v5) | rowid = memo.id. 업무 검색과 섞지 않는다 |
@@ -61,7 +62,7 @@ done ─("다시 열어")─▶ todo  (reopen 이력)
 
 닫힌 업무 제외. 오늘 보고받았으면 묻지 않음. 대기·보류는 `next_check_at`(재확인일)이 되면 `recheck`(답이 없어도 매일), 재확인일이 마감보다
 늦으면 마감 전날·당일에 `wait_due`(0.7.0). 재확인일이 없는 옛 대기·보류는 upkeep 이 기본 3일 뒤로 채운다. `captured`는 목록만.
-`review_after`(교수님 지정) 전에는 묻지 않음. 지난 회의 → `meeting_passed`, 기한 경과 → `overdue`, 당일 → `d_day`, 전날 → `d_minus_1`.
+`review_after`(교수님 지정) 전에는 묻지 않음. 끝난 정기 회차(아래 '종료·추적 제외') → `ended`(묻지 않음, 0.10.0). 지난 회의 → `meeting_passed`, 기한 경과 → `overdue`, 당일 → `d_day`, 전날 → `d_minus_1`.
 그 밖에는 마지막 확인·보고·생성일에서 `check_every_days` 또는 중요도별 주기(high 1 · normal 2 · low 7일, normal·low 는 주말 제외).
 오늘 이미 물은 업무는 그날 내내 오늘의 확인 목록에 남는다(재실행해도 같은 보고). 추적 시작(`meta.tracking_since`) 전부터 있던 업무의
 첫 확인은 주기 안에서 번호 순으로 나눈다(0.6.1 — 업그레이드 첫날 밀린 업무가 한꺼번에 몰리지 않게).
@@ -74,6 +75,17 @@ done ─("다시 열어")─▶ todo  (reopen 이력)
 기한 지남은 상세 10건(높음이 많으면 15건), 진행 확인은 쪽마다 15건 × 최대 2쪽. 상세 점수(`detail_score`): 중요도(300/200/100) +
 직접 요청 60 + 내일·마감 임박 120·재확인 90 + 최근에 지난 기한(최대 60) + 상세로 안 보인 날수×8(최대 80). 나머지는 `keyword_block`
 (분야별, `report.keyword_chars` 상한, 넘으면 "외 N건").
+
+## 종료·추적 제외 (v6, 0.10.0, `claire_policy`)
+
+활성 업무 = 열린 상태(`OPEN_STATUSES`) − 끝난 정기 회차. 끝난 정기 회차는 상태를 바꾸지 않고 **조회할 때마다** 계산한다(`claire_policy.ended_sql`
+= `occurrence_state()["ended"]`, 테스트가 대조): `kind='meeting'` · `series_key` 있음 · 상태 captured/needs_info/todo/in_progress ·
+정책(회차 예외 > `series_policy` > 미정=until_done)이 after_end · Calendar 연결이 있고 모두 `ok` · 확정된 종료 시각
+(`claire_core.occurrence_end`: 시각 있는 종료는 그 순간, 종일은 배타적 종료일의 0시(항목 시간대), 날짜뿐인 시각 일정·종료≤시작은 없음)이
+지금 이전. SQL 함수 `claire_occurrence_ended(start,end,all_day,tz,now)`는 `connect()`가 등록한다.
+아침 보고·업무 현황(빠짐 검사)·accounting·누락 감지·중요도 검토·질문(보고·`--due-now`)·승인 대기 건수·`today/week/overdue/find(open)`·
+문구로 찾기(`--find`)·`complete --past-meetings`가 같은 기준이다. 일정 이력(`claire_search occurrences`, `--view history`)과
+`find --status ended|all`에서 찾는다. 미래로 옮겨지면 다음 조회부터 다시 활성이고, 정책을 지우면 이전 집계로 돌아온다.
 
 ## 시간 종류 (v3, `time_kind`)
 
@@ -88,7 +100,7 @@ Calendar 동기화는 시각을 순간(instant)으로 비교한다(표기만 다
 
 ## 스키마 변환
 
-`SCHEMA_VERSION` 4(0.7.0: 열 3개·`note_map` 표 추가, 값 변경 없음 — upkeep 이 재확인일 채우기·승인 대기 Tasks 자동 전환). 3(0.6.0). 기존 DB는 `connect()`가 열 때 `claire_core.migrate()`로 열만 추가한다(앞으로만, 멱등).
+`SCHEMA_VERSION` 6(0.10.0: `item.track_policy`·`track_policy_reason` 열, `series_policy` 표 추가 — 값 변경 없음, 정책이 없으면 이전과 똑같이 추적). 5(0.8.0 메모함). 4(0.7.0: 열 3개·`note_map` 표 추가, 값 변경 없음 — upkeep 이 재확인일 채우기·승인 대기 Tasks 자동 전환). 3(0.6.0). 기존 DB는 `connect()`가 열 때 `claire_core.migrate()`로 열만 추가한다(앞으로만, 멱등).
 v2→v3 은 값을 바꾸지 않는다(원본 ID·상태·완료 이력·"등록 안 함" 기록 보존). 기존 활성 업무의 중요도 소급 분류는 설정(본인 주소)이
 필요해서 `claire_track.upkeep`이 한다 — 설치(`claire_check init`)·`maintain`·업무 현황 앞에서, 분류 없는 활성 업무만 골라 멱등하게
 (Discord 등록 → 높음, 메일 → 잠정값 + 검토 필요, 캘린더·Obsidian → 보통, 이미 높음은 유지).

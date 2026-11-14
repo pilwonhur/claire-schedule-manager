@@ -1,0 +1,257 @@
+#!/usr/bin/env python3
+"""claire_series — 정기 일정 시리즈의 추적 정책 (0.10.0, ISSUE 2026-11-15 정기 일정 종료 후 추적 제외).
+
+일정의 종료와 업무의 완료를 나눈다. 참석형 정기 일정(수업·개인미팅·과제미팅)은 회차가 끝나면 확인 없이 추적에서 빠지고
+(종료·추적 제외 — 완료가 아님), 준비·회신·제출 같은 실제 할 일은 계속 추적한다. 판정 규칙은 claire_policy.py 한 곳.
+
+  preview  [--series KEY[,KEY…]] [--format text]
+           변경 없이 대상 목록과 전후 집계: 후보(candidate) / 판단 필요(review) / 이미 적용(applied) / 계속 추적(keep).
+           시리즈마다 회차 수·지난 미처리 회차·종료 시각 없는 회차·연결된 준비·후속 업무·대기·보류 회차·분류 근거.
+  apply    (--series KEY[,KEY…] | --candidates) --reason "…" [--actor user|claire] [--confirm] [--backup]
+           시리즈 정책을 '종료 후 추적 제외'로. --confirm 없이는 무엇이 바뀔지만 보인다(미리보기). 한 묶음(TP-…)으로 기록하고
+           전후 집계를 결과에 남긴다. 같은 것을 다시 적용해도 바뀌지 않는다(멱등). --backup: 먼저 claire_check backup.
+  set      (--series KEY | --item CLR [--occurrence]) --policy after_end|until_done --reason "…" [--actor user|claire] [--force]
+           시리즈 정책(또는 --occurrence 면 그 회차만의 예외). Claire 는 교수님이 정한 시리즈 정책을 덮지 못한다.
+  clear    (--series KEY | --item CLR [--occurrence]) [--reason "…"] [--actor …]   정책을 지운다(= 완료 확인까지 추적)
+  revert   --batch TP-…                         apply 묶음 되돌리기 (그 뒤에 다시 바뀐 시리즈는 그대로 두고 알린다)
+  list     [--format text]                      정한 정책과 시리즈별 회차·현재 제외 건수
+  explain  --item CLR                           회차 하나의 판정과 근거 (왜 제외인지 / 왜 아닌지)
+  history  [--series KEY] [--limit 50]          정책 변경 이력
+
+원본(Calendar 이벤트)·Obsidian Tasks·Daily 완료 기록·업무 상태(status)는 어느 명령도 바꾸지 않는다.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from claire_core import ClaireError, connect, get_item, now_dt, now_iso, run_cli, tx  # noqa: E402
+import claire_policy as P  # noqa: E402
+
+
+def _keys(value: str | None) -> list[str]:
+    return [k.strip() for k in (value or "").split(",") if k.strip()]
+
+
+def _series_of(conn, args) -> str:
+    if getattr(args, "series", None):
+        return args.series
+    if getattr(args, "item", None):
+        it = get_item(conn, args.item)
+        if not it["series_key"]:
+            raise ClaireError("not_series", f"{it['ref']} 는 정기 일정 회차가 아닙니다 (단발 일정·업무는 정책 대상이 아님)",
+                              ref=it["ref"])
+        return it["series_key"]
+    raise ClaireError("missing_target", "--series 또는 --item 이 필요합니다")
+
+
+def _title_of(conn, key: str) -> str | None:
+    r = conn.execute("SELECT title FROM item WHERE series_key=? AND deleted_at IS NULL ORDER BY start_at DESC, id DESC LIMIT 1",
+                     (key,)).fetchone()
+    return r["title"] if r else None
+
+
+def cmd_preview(args, cfg):
+    conn = connect(create=False)
+    pv = P.preview(conn, cfg, now_dt(cfg), _keys(args.series) or None)
+    pv["text"] = P.preview_text(pv)
+    return pv
+
+
+def _batch_id(conn, now) -> str:
+    base = f"TP-{now:%Y%m%dT%H%M%S}"
+    n, out = 1, base
+    while conn.execute("SELECT 1 FROM series_policy WHERE batch=?", (out,)).fetchone() or conn.execute(
+            "SELECT 1 FROM activity_log WHERE action='policy' AND payload LIKE ?", (f'%"batch": "{out}"%',)).fetchone():
+        n += 1
+        out = f"{base}-{n}"
+    return out
+
+
+def cmd_apply(args, cfg):
+    conn = connect(create=False)
+    now = now_dt(cfg)
+    if not args.candidates and not args.series:
+        raise ClaireError("missing_target", "--series 또는 --candidates 가 필요합니다")
+    pv = P.preview(conn, cfg, now)
+    by_key = {r["series_key"]: r for r in pv["series"]}
+    if args.candidates:
+        keys = [r["series_key"] for r in pv["series"] if r["category"] == "candidate"]
+    else:
+        keys = _keys(args.series)
+        unknown = [k for k in keys if k not in by_key]
+        if unknown:
+            raise ClaireError("series_not_found", f"시리즈를 찾지 못했습니다: {unknown}", series=unknown)
+        bad = [k for k in keys if "meeting" not in by_key[k]["kinds"]]
+        if bad:
+            raise ClaireError("not_eligible", "일정이 아닌 업무 시리즈는 종료 후 제외 대상이 아닙니다(완료 확인까지 추적)",
+                              series=bad)
+    plan = [{"series_key": k, "title": by_key[k]["title"], "category": by_key[k]["category"],
+             "review": by_key[k]["review"], "would_end": by_key[k]["would_end_count"],
+             "already": by_key[k]["policy"] == "after_end"} for k in keys]
+    todo = [x for x in plan if not x["already"]]
+    if not args.confirm:
+        after = P.projected_counts(conn, cfg, now, {x["series_key"]: "after_end" for x in todo}) if todo else \
+            pv["projection"]["before"]
+        return {"dry_run": True, "plan": plan, "to_change": len(todo), "before": pv["projection"]["before"], "after": after,
+                "message": f"시리즈 {len(todo)}개를 '종료 후 추적 제외'로 바꿀 예정입니다(지난 회차 "
+                           f"{sum(x['would_end'] for x in todo)}건이 활성 목록에서 빠짐). 교수님 확인 뒤 --confirm 으로 적용하세요."}
+    if not (args.reason or "").strip():
+        raise ClaireError("missing_reason", "--reason 이 필요합니다 (예: '교수님 확인 11/15: 수업·개인미팅·과제미팅')")
+    backup = None
+    if args.backup:
+        proc = subprocess.run([sys.executable, str(Path(__file__).resolve().parent / "claire_check"), "backup"],
+                              capture_output=True, text=True, env=dict(os.environ))
+        try:
+            backup = json.loads(proc.stdout)
+        except json.JSONDecodeError:
+            backup = {"ok": False, "error": (proc.stderr or proc.stdout)[-300:]}
+        if not backup.get("ok"):
+            raise ClaireError("backup_failed", "적용 전 백업에 실패해 정책을 바꾸지 않았습니다", backup=backup)
+    before = P._counts(conn, cfg, now)
+    ts = now_iso(cfg)
+    batch = _batch_id(conn, now)
+    changed = []
+    with tx(conn):
+        for x in todo:
+            r = P.set_series_policy(conn, x["series_key"], "after_end", actor=args.actor, ts=ts, reason=args.reason.strip(),
+                                    title=x["title"], batch=batch, force=args.actor == "user")
+            if r["changed"]:
+                changed.append(x["series_key"])
+    after = P._counts(conn, cfg, now)
+    return {"batch": batch if changed else None, "changed": changed, "unchanged": [x["series_key"] for x in plan
+                                                                                    if x["series_key"] not in changed],
+            "plan": plan, "before": before, "after": after, "backup": backup,
+            "message": (f"시리즈 {len(changed)}개를 '종료 후 추적 제외'로 바꿨습니다(묶음 {batch}). 활성 {before['active']}→"
+                        f"{after['active']}, 지난 일정(미처리) {before['past_meetings']}→{after['past_meetings']}. "
+                        f"되돌리기: claire_series revert --batch {batch}") if changed else "바뀐 정책이 없습니다(이미 적용됨)."}
+
+
+def cmd_set(args, cfg):
+    conn = connect(create=False)
+    ts = now_iso(cfg)
+    with tx(conn):
+        if args.occurrence:
+            if not args.item:
+                raise ClaireError("missing_target", "--occurrence 에는 --item 이 필요합니다")
+            r = P.set_occurrence_policy(conn, get_item(conn, args.item), args.policy, actor=args.actor, ts=ts,
+                                        reason=args.reason)
+        else:
+            key = _series_of(conn, args)
+            r = P.set_series_policy(conn, key, args.policy, actor=args.actor, ts=ts, reason=args.reason,
+                                    title=_title_of(conn, key), force=args.force)
+    r["message"] = ("바뀐 것이 없습니다." if not r["changed"] else
+                    f"{'회차 ' + r['ref'] if args.occurrence else '시리즈'} 정책: {P.POLICY_KO[r['policy']]}")
+    return r
+
+
+def cmd_clear(args, cfg):
+    conn = connect(create=False)
+    ts = now_iso(cfg)
+    with tx(conn):
+        if args.occurrence:
+            if not args.item:
+                raise ClaireError("missing_target", "--occurrence 에는 --item 이 필요합니다")
+            r = P.set_occurrence_policy(conn, get_item(conn, args.item), None, actor=args.actor, ts=ts, reason=args.reason)
+        else:
+            key = _series_of(conn, args)
+            r = P.set_series_policy(conn, key, None, actor=args.actor, ts=ts, reason=args.reason, force=args.force)
+    r["message"] = "정책을 지웠습니다(완료 확인까지 추적)." if r["changed"] else "지울 정책이 없습니다."
+    return r
+
+
+def cmd_revert(args, cfg):
+    conn = connect(create=False)
+    now = now_dt(cfg)
+    before = P._counts(conn, cfg, now)
+    with tx(conn):
+        r = P.revert_batch(conn, args.batch, ts=now_iso(cfg), actor=args.actor)
+    r.update(before=before, after=P._counts(conn, cfg, now),
+             message=f"묶음 {args.batch}: 시리즈 {len(r['restored'])}개 되돌림" + (f", {len(r['skipped'])}개는 이후 바뀌어 그대로 둠"
+                                                                          if r["skipped"] else ""))
+    return r
+
+
+def cmd_list(args, cfg):
+    conn = connect(create=False)
+    now = now_dt(cfg)
+    gone = P.ended_ids(conn, now)
+    out = []
+    for sp in conn.execute("SELECT * FROM series_policy ORDER BY updated_at DESC"):
+        ids = [r[0] for r in conn.execute("SELECT id FROM item WHERE series_key=? AND deleted_at IS NULL", (sp["series_key"],))]
+        out.append({**dict(sp), "label": P.POLICY_KO[sp["policy"]], "occurrences": len(ids),
+                    "excluded_now": sum(1 for i in ids if i in gone),
+                    "occurrence_exceptions": conn.execute("SELECT COUNT(*) FROM item WHERE series_key=? AND track_policy IS NOT NULL",
+                                                          (sp["series_key"],)).fetchone()[0]})
+    text = "\n".join([f"[정기 일정 추적 정책] {len(out)}개 시리즈"] + [
+        f"  {x['title'] or x['series_key']} · {x['label']} ({'교수님' if x['source'] == 'user' else 'Claire'}) · "
+        f"회차 {x['occurrences']} · 지금 제외 {x['excluded_now']}" + (f" · 회차 예외 {x['occurrence_exceptions']}"
+                                                                  if x["occurrence_exceptions"] else "") for x in out])
+    return {"count": len(out), "policies": out, "text": text}
+
+
+def cmd_explain(args, cfg):
+    conn = connect(create=False)
+    it = get_item(conn, args.item, allow_deleted=True)
+    st = P.occurrence_state(conn, cfg, it, now_dt(cfg))
+    st["blockers_ko"] = [P.BLOCKER_KO.get(b, b) for b in st["blockers"]]
+    st.update(ref=it["ref"], title=it["title"], status=it["status"], series_key=it["series_key"])
+    why = ("끝나서 추적에서 뺐습니다(완료 기록 아님)" if st["ended"] else
+           "정책이 '종료 후 추적 제외'가 아닙니다 — 완료 확인까지 추적" if st["policy"] != "after_end" else
+           "조건 부족: " + ", ".join(st["blockers_ko"]) if st["blockers"] else
+           f"상태 '{it['status']}' — 교수님이 정한 상태가 이깁니다" if it["status"] not in P.ENDABLE_STATUSES else
+           "아직 끝나지 않았습니다")
+    st["message"] = f"{it['ref']}: {why}"
+    return st
+
+
+def cmd_history(args, cfg):
+    conn = connect(create=False)
+    out = []
+    for a in conn.execute("SELECT a.*, i.ref FROM activity_log a LEFT JOIN item i ON i.id=a.item_id "
+                          "WHERE a.action='policy' ORDER BY a.id DESC LIMIT ?", (args.limit,)):
+        p = json.loads(a["payload"] or "{}")
+        if args.series and p.get("series_key") != args.series:
+            continue
+        out.append({"id": a["id"], "at": a["created_at"], "actor": a["actor"], "scope": p.get("scope"),
+                    "series_key": p.get("series_key"), "item_ref": a["ref"], "old": a["old_value"], "new": a["new_value"],
+                    "reason": a["reason"], "batch": p.get("batch") or p.get("revert_of"), "undone_at": a["undone_at"]})
+    return {"count": len(out), "history": out}
+
+
+def build_parser():
+    p = argparse.ArgumentParser(prog="claire_series", description="정기 일정 시리즈 추적 정책 (0.10.0)")
+    sub = p.add_subparsers(dest="cmd")
+    pv = sub.add_parser("preview", help="변경 없이 대상 목록·전후 집계")
+    pv.add_argument("--series"); pv.add_argument("--format", choices=["json", "text"], default="json")
+    pv.set_defaults(fn=cmd_preview)
+    ap = sub.add_parser("apply", help="시리즈를 '종료 후 추적 제외'로 (--confirm 없으면 미리보기)")
+    ap.add_argument("--series"); ap.add_argument("--candidates", action="store_true"); ap.add_argument("--reason")
+    ap.add_argument("--actor", choices=["user", "claire"], default="user"); ap.add_argument("--confirm", action="store_true")
+    ap.add_argument("--backup", action="store_true", help="적용 전에 claire_check backup")
+    ap.set_defaults(fn=cmd_apply)
+    for name, fn in (("set", cmd_set), ("clear", cmd_clear)):
+        s = sub.add_parser(name)
+        s.add_argument("--series"); s.add_argument("--item"); s.add_argument("--occurrence", action="store_true")
+        if name == "set":
+            s.add_argument("--policy", required=True, choices=list(P.POLICIES))
+        s.add_argument("--reason"); s.add_argument("--actor", choices=["user", "claire"], default="user")
+        s.add_argument("--force", action="store_true", help="교수님 지시로 기존 교수님 결정을 바꿀 때")
+        s.set_defaults(fn=fn)
+    rv = sub.add_parser("revert", help="apply 묶음 되돌리기"); rv.add_argument("--batch", required=True)
+    rv.add_argument("--actor", choices=["user", "claire"], default="user"); rv.set_defaults(fn=cmd_revert)
+    ls = sub.add_parser("list"); ls.add_argument("--format", choices=["json", "text"], default="json"); ls.set_defaults(fn=cmd_list)
+    ex = sub.add_parser("explain"); ex.add_argument("--item", required=True); ex.set_defaults(fn=cmd_explain)
+    hs = sub.add_parser("history"); hs.add_argument("--series"); hs.add_argument("--limit", type=int, default=50)
+    hs.set_defaults(fn=cmd_history)
+    return p
+
+
+if __name__ == "__main__":
+    run_cli(build_parser, lambda args, cfg: args.fn(args, cfg))

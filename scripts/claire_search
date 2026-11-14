@@ -17,6 +17,12 @@
   importance-review                      중요도 검토 필요(소급 분류·요청 범위 미분류) 업무와 판단 근거 (0.6.0)
   report                                 아침 보고 재료 (0.7.0: 구역별 상세·키워드·숨김 건수·accounting). 보낼 때는 claire_buttons report
   labels-missing [--limit 40]            키워드 이름(short_label)이 없는 활성 업무 — 보고의 키워드 요약용 (0.7.0)
+  occurrences [--series KEY | --item CLR] [--days 30]   일정 이력 (0.10.0): 지난 정기 회차의 결과
+                                         (종료·추적 제외 / 완료(보고됨) / 취소 / 추적 중). '종료'와 '실제 완료'를 나눠 보인다.
+
+0.10.0 (정기 일정 종료 후 추적 제외): '열린'(open) 조회는 활성 업무 = 열린 상태 − 끝난 정기 회차(claire_policy)다.
+       today·week·overdue·find(open)·labels-missing·importance-review 가 같은 기준. find --status ended 는 끝나서 빠진 회차,
+       --status all 은 전부(항목마다 tracking.ended·status_label 로 구분). 상태(status)는 바꾸지 않는다.
 
 0.5.0: 항목마다 업무 상태(status)와 별개로 외부 반영 상태(sync: calendar·tasks·daily)와 한 줄 요약(state_line)을 낸다.
 0.6.0: 항목마다 중요도·근거·진행 확인 계획(tracking)과 시간 종류(time_kind: appointment|work|deadline_marker).
@@ -39,11 +45,17 @@ from claire_core import (  # noqa: E402
     run_cli, tokenize, tz_of,
 )
 import claire_ops as ops  # noqa: E402
+import claire_policy as policy  # noqa: E402
 import claire_track as track  # noqa: E402
 
 _CTX: dict = {}          # 명령 하나 동안의 conn·cfg (항목마다 반영 상태를 붙이기 위해)
 
-OPEN_SQL = "status IN (" + ",".join(f"'{s}'" for s in OPEN_STATUSES) + ")"
+OPEN_SQL = "status IN (" + ",".join(f"'{s}'" for s in OPEN_STATUSES) + ")"   # 상태만 (종료 회차 포함)
+
+
+def _open(cfg) -> str:
+    """활성 업무 조건 (0.10.0): 열린 상태이면서 끝나서 추적에서 빠진 정기 회차가 아님."""
+    return policy.tracked_sql(now_dt(cfg))
 
 
 def _item(r) -> dict:
@@ -61,8 +73,14 @@ def _item(r) -> dict:
         out["state_line"] = ops.describe_state(conn, cfg, r)
         out["status_label"] = ops.status_label(r)
         out["time_kind"] = track.time_kind(r, cfg)
+        occ = None
+        if d.get("kind") == "meeting" and d.get("series_key"):
+            occ = policy.occurrence_state(conn, cfg, r, now_dt(cfg))
+            out["occurrence"] = {k: occ[k] for k in ("policy", "policy_label", "policy_from", "ended", "end", "label")}
+            if occ["ended"]:
+                out["status_label"] = policy.ENDED_LABEL      # 완료가 아니다 — 상태(status)는 그대로
         if "close_reason" in d:
-            plan = track.check_plan(cfg, r, now_dt(cfg), track.tracking_since(conn, cfg))
+            plan = track.check_plan(cfg, r, now_dt(cfg), track.tracking_since(conn, cfg), ended=bool(occ and occ["ended"]))
             out["tracking"] = {"priority": track.PRIORITY_KO.get(d["priority"]), "reason": d.get("priority_reason"),
                                "source": d.get("priority_source"), "check_due": plan["due"], "check_reason": plan["reason"],
                                "check_label": plan["label"],
@@ -93,7 +111,7 @@ def _local_day(ts: str | None, cfg) -> str | None:
 
 def _meetings_on(conn, cfg, day: str) -> list[dict]:
     out = []
-    for r in conn.execute(f"SELECT * FROM item WHERE deleted_at IS NULL AND kind='meeting' AND {OPEN_SQL} "
+    for r in conn.execute(f"SELECT * FROM item WHERE deleted_at IS NULL AND kind='meeting' AND {_open(cfg)} "
                           "AND start_at IS NOT NULL"):
         if _local_day(r["start_at"], cfg) == day:
             d = _item(r)
@@ -115,24 +133,30 @@ def _overlay_on(conn, cfg, day: str) -> list[dict]:
 
 def _due_between(conn, cfg, start: str, end: str) -> list[dict]:
     rows = [_item(r) for r in conn.execute(
-        f"SELECT * FROM item WHERE deleted_at IS NULL AND {OPEN_SQL} AND due_at IS NOT NULL "
+        f"SELECT * FROM item WHERE deleted_at IS NULL AND {_open(cfg)} AND due_at IS NOT NULL "
         "AND due_at >= ? AND due_at <= ? ORDER BY due_at", (start, end))]
     return rows
 
 
 def _overdue(conn, cfg, now_s: str) -> list[dict]:
     return [_item(r) for r in conn.execute(
-        f"SELECT * FROM item WHERE deleted_at IS NULL AND {OPEN_SQL} AND due_at IS NOT NULL AND due_at < ? "
+        f"SELECT * FROM item WHERE deleted_at IS NULL AND {_open(cfg)} AND due_at IS NOT NULL AND due_at < ? "
         "ORDER BY due_at", (now_s,))]
 
 
 def _open_questions(conn, now_s: str, due_now: bool) -> list[dict]:
+    """열린 질문. 0.10.0: 끝나서 추적에서 빠진 정기 회차의 질문은 item_ended 로 표시하고, --due-now(지금 물을 것)에서는 뺀다
+    (반복 독촉 금지 — 질문 기록은 그대로, 번호로 답하면 받는다)."""
     out = []
-    for q in conn.execute("SELECT q.*, i.ref AS item_ref, i.title AS item_title FROM question q "
+    for q in conn.execute("SELECT q.*, i.ref AS item_ref, i.title AS item_title, "
+                          f"(i.id IS NOT NULL AND {policy.ended_sql(now_s, 'i')}) AS item_ended FROM question q "
                           "LEFT JOIN item i ON i.id=q.item_id WHERE q.status='open' ORDER BY q.id"):
         if due_now and q["next_ask_at"] and q["next_ask_at"] > now_s:
             continue
+        if due_now and q["item_ended"]:
+            continue
         out.append({"ref": q["ref"], "item_ref": q["item_ref"], "item_title": q["item_title"], "field": q["field"],
+                    "item_ended": bool(q["item_ended"]),
                     "question": q["question"], "options": json.loads(q["options"]) if q["options"] else None,
                     "reason": q["reason"], "asked_count": q["asked_count"], "last_asked_at": q["last_asked_at"],
                     "next_ask_at": q["next_ask_at"]})
@@ -150,7 +174,7 @@ def cmd_review(args, cfg):
 
     meetings = _meetings_on(conn, cfg, today)
     overlays = _overlay_on(conn, cfg, today)
-    day = track.day_conflicts(conn, cfg, now.date(), overlays)
+    day = track.day_conflicts(conn, cfg, now.date(), overlays, now)
     new_items, changed = [], []
     for r in conn.execute(
         "SELECT a.action, a.field, a.old_value, a.new_value, a.reason, a.created_at, i.* FROM activity_log a "
@@ -290,7 +314,7 @@ def cmd_labels_missing(args, cfg):
             seen.add(e["ref"])
             out.append({"ref": e["ref"], "title": e["title"], "project": e.get("project"),
                         "auto": track.auto_label(e["title"], track.label_stopwords(cfg))})
-    total = conn.execute(f"SELECT COUNT(*) c FROM item WHERE deleted_at IS NULL AND {OPEN_SQL} AND "
+    total = conn.execute(f"SELECT COUNT(*) c FROM item WHERE deleted_at IS NULL AND {_open(cfg)} AND "
                          "(short_label IS NULL OR short_label='')").fetchone()["c"]
     return {"items": out[:args.limit], "total_missing": total,
             "note": "제목·원문을 보고 업무를 알아볼 수 있는 1~3단어(20자 이내)로. 예: 'RiTA 회신', 'IROS 명단'. "
@@ -305,7 +329,7 @@ def cmd_importance_review(args, cfg):
     out = []
     # 직접 요청일 가능성이 큰 것부터: 회신 요청 → 잠정 높음 → 최근 (0.6.1). 소급 분류 전(NULL)도 포함.
     unrev = "(priority_source='unreviewed' OR priority_source IS NULL)"
-    for r in conn.execute(f"SELECT * FROM item WHERE deleted_at IS NULL AND {unrev} AND {OPEN_SQL} "
+    for r in conn.execute(f"SELECT * FROM item WHERE deleted_at IS NULL AND {unrev} AND {_open(cfg)} "
                           "ORDER BY (kind='reply') DESC, (priority='high') DESC, id DESC LIMIT ?", (args.limit,)):
         d = _item(r)
         d["sources"] = []
@@ -315,7 +339,7 @@ def cmd_importance_review(args, cfg):
             d["sources"].append({"platform": e["platform"], "from": h.get("from"), "to": h.get("to"), "cc": h.get("cc"),
                                  "subject": h.get("subject"), "excerpt": (e["excerpt"] or "")[:300]})
         out.append(d)
-    total = conn.execute(f"SELECT COUNT(*) c FROM item WHERE deleted_at IS NULL AND {unrev} AND {OPEN_SQL}").fetchone()["c"]
+    total = conn.execute(f"SELECT COUNT(*) c FROM item WHERE deleted_at IS NULL AND {unrev} AND {_open(cfg)}").fetchone()["c"]
     return {"count": total, "items": out,
             "rule": "직접 요청(교수님을 특정한 회신·행동 요청) → high, 단체 공통 요청 → normal, 단체라도 개인 의무(결재·필수 제출) → high. "
                     "수신자 수만으로 정하지 않는다. 근거를 priority_reason 에."}
@@ -331,7 +355,7 @@ def cmd_today(args, cfg):
             out["items"] = _due_between(conn, cfg, d0, d1)
         elif args.basis == "scheduled":
             out["items"] = [_item(r) for r in conn.execute(
-                f"SELECT * FROM item WHERE deleted_at IS NULL AND {OPEN_SQL} AND scheduled_on=? ORDER BY id", (day,))]
+                f"SELECT * FROM item WHERE deleted_at IS NULL AND {_open(cfg)} AND scheduled_on=? ORDER BY id", (day,))]
         elif args.basis == "completed":
             out["items"] = [_item(r) for r in conn.execute(
                 "SELECT * FROM item WHERE deleted_at IS NULL AND status='done' AND completed_at >= ? AND completed_at <= ?", (d0, d1))]
@@ -342,7 +366,7 @@ def cmd_today(args, cfg):
             out["note"] = f"완료 이력 보존 범위({limit_days}일) 밖입니다. 결과가 불완전할 수 있습니다 (D2)"
         return out
     scheduled = [_item(r) for r in conn.execute(
-        f"SELECT * FROM item WHERE deleted_at IS NULL AND {OPEN_SQL} AND scheduled_on=? ORDER BY id", (day,))]
+        f"SELECT * FROM item WHERE deleted_at IS NULL AND {_open(cfg)} AND scheduled_on=? ORDER BY id", (day,))]
     completed = [_item(r) for r in conn.execute(
         "SELECT * FROM item WHERE deleted_at IS NULL AND status='done' AND completed_at >= ? AND completed_at <= ?", (d0, d1))]
     meetings = _meetings_on(conn, cfg, day)
@@ -394,7 +418,36 @@ def cmd_show(args, cfg):
     d["relations"] = [dict(r) for r in conn.execute(
         "SELECT rl.rel_type, a.ref AS from_ref, b.ref AS to_ref FROM relation rl JOIN item a ON a.id=rl.from_item_id "
         "JOIN item b ON b.id=rl.to_item_id WHERE rl.from_item_id=? OR rl.to_item_id=?", (it["id"], it["id"]))]
+    if it["series_key"] or it["kind"] == "meeting":
+        # 0.10.0: 추적 정책과 판정 근거 (종료·추적 제외인지, 왜 아닌지)
+        st = policy.occurrence_state(conn, cfg, it, now_dt(cfg))
+        st["blockers_ko"] = [policy.BLOCKER_KO.get(b, b) for b in st["blockers"]]
+        d["occurrence"] = st
+        if st["ended"]:
+            d["status_label"] = policy.ENDED_LABEL
     return d
+
+
+def cmd_occurrences(args, cfg):
+    """일정 이력 (0.10.0): 지난 정기 회차의 결과. 종료·추적 제외된 회차도 여기와 find --status ended|all 에서 찾는다."""
+    conn = _ctx(connect(create=False), cfg)
+    now = now_dt(cfg)
+    key = args.series
+    if args.item:
+        it = get_item(conn, args.item, allow_deleted=True)
+        if not it["series_key"]:
+            raise ClaireError("not_series", f"{it['ref']} 는 정기 일정 회차가 아닙니다")
+        key = it["series_key"]
+    rows = policy.series_history(conn, cfg, now, series_key=key, days=args.days)
+    for r in rows:
+        r["when"] = ops.fmt_when(cfg, r["start_at"], r["end_at"], bool(r["all_day"]))
+    sp = policy.series_row(conn, key) if key else None
+    counts: dict[str, int] = {}
+    for r in rows:
+        counts[r["outcome"]] = counts.get(r["outcome"], 0) + 1
+    return {"series_key": key, "policy": dict(sp) if sp is not None else None, "days": args.days,
+            "count": len(rows), "by_outcome": counts, "occurrences": rows,
+            "note": "종료·추적 제외는 완료가 아닙니다(참석 여부를 단정하지 않음). 실제 완료는 '완료(보고됨)'."}
 
 
 # --------------------------------------------------------------------------
@@ -422,7 +475,9 @@ def cmd_find(args, cfg):
     sql = "SELECT * FROM item WHERE deleted_at IS NULL"
     params = []
     if status_filter == "open":
-        sql += f" AND {OPEN_SQL}"
+        sql += f" AND {_open(cfg)}"
+    elif status_filter == "ended":
+        sql += f" AND {policy.ended_sql(now)}"        # 끝나서 추적에서 빠진 정기 회차 (0.10.0)
     elif status_filter != "all":
         sql += " AND status=?"; params.append(status_filter)
     if args.project:
@@ -575,6 +630,9 @@ def build_parser():
     rp = sub.add_parser("report", help="아침 보고 재료 (0.7.0)"); rp.set_defaults(fn=cmd_report)
     lm = sub.add_parser("labels-missing", help="키워드 이름 없는 활성 업무 (0.7.0)")
     lm.add_argument("--limit", type=int, default=40); lm.set_defaults(fn=cmd_labels_missing)
+    oc = sub.add_parser("occurrences", help="일정 이력: 지난 정기 회차의 결과 (0.10.0)")
+    oc.add_argument("--series"); oc.add_argument("--item"); oc.add_argument("--days", type=int, default=30)
+    oc.set_defaults(fn=cmd_occurrences)
     return p
 
 

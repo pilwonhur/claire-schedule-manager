@@ -12,6 +12,9 @@
   - 아침 보고(report, 0.7.0 ISSUE 2026-09-29): 전체 업무는 계속 추적하되 보고에는 필요한 만큼만 — 오늘 · 기한 지남(한 쪽) ·
     진행 확인(최대 두 쪽) · 확인·상태. 버튼과 함께 보일 업무는 점수로 고르고 나머지는 1~3단어 키워드(번호 포함)로 줄인다.
     표시를 줄여도 업무 상태·마감·추적 정보는 그대로다. 전체는 요청하면 본다(업무 현황 agenda / --view).
+  - 정기 일정 종료 후 추적 제외(0.10.0, ISSUE 2026-11-15): 활성 업무 = 열린 상태 − 종료·추적 제외 회차(claire_policy).
+    아침 보고·업무 현황·빠짐 검사·accounting·누락 감지·질문이 모두 같은 집합을 쓴다(보고에서 숨기고 누락 경고에 다시
+    나타나는 일이 없게). 종료는 완료가 아니다 — 상태를 바꾸지 않고 조회 때 계산한다.
 
 판단하지 않는 규칙만 둔다. 요청 범위(직접/단체)의 판단은 Claire 가 제안에 적는다(request_scope).
 """
@@ -26,6 +29,7 @@ from claire_core import (
     OPEN_STATUSES, log_activity, meta_get, next_item_ref, parse_iso, reindex_item, sha256_text, tz_of,
 )
 import claire_ops as ops
+import claire_policy as policy
 
 PRIORITY_KO = {"high": "높음", "normal": "보통", "low": "낮음"}
 SCOPE_KO = {"direct": "직접 요청", "group": "단체 요청", "self": "본인 할 일", "none": "요청 아님"}
@@ -353,11 +357,12 @@ def deadline_clusters(cfg, items: list) -> list[dict]:
              "count": len(g)} for g in out]
 
 
-def day_conflicts(conn, cfg, day: date, overlays: list[dict] | None = None) -> dict:
-    """그날의 실제 충돌(약속·작업 예약·overlay)과 마감 몰림(작업량 안내)."""
+def day_conflicts(conn, cfg, day: date, overlays: list[dict] | None = None, now: datetime | None = None) -> dict:
+    """그날의 실제 충돌(약속·작업 예약·overlay)과 마감 몰림(작업량 안내). now 를 주면 이미 끝나 추적에서 빠진 정기 회차는 뺀다."""
+    gone = policy.ended_ids(conn, now) if now is not None else set()
     rows = [r for r in conn.execute(
         "SELECT * FROM item WHERE deleted_at IS NULL AND start_at IS NOT NULL AND status IN (%s)"
-        % ",".join("?" * len(OPEN_STATUSES)), OPEN_STATUSES) if local_date(cfg, r["start_at"]) == day]
+        % ",".join("?" * len(OPEN_STATUSES)), OPEN_STATUSES) if local_date(cfg, r["start_at"]) == day and r["id"] not in gone]
     blocks = [{"ref": r["ref"], "title": r["title"], "kind": time_kind(r, cfg), "span": _span(r["start_at"], r["end_at"])}
               for r in rows if time_kind(r, cfg) in ("appointment", "work")]
     for o in overlays or []:
@@ -381,7 +386,7 @@ def tracking_since(conn, cfg) -> date | None:
     return local_date(cfg, meta_get(conn, "tracking_since"))
 
 
-def check_plan(cfg, item, now: datetime, since: date | None = None) -> dict:
+def check_plan(cfg, item, now: datetime, since: date | None = None, ended: bool = False) -> dict:
     """오늘 이 업무의 진행을 물어야 하는가. {due, reason, label, next_on}.
     답이 없다고 완료·취소·중요도 하향하지 않는다. 같은 날 보고받았으면 그날 다시 묻지 않는다.
     since(추적 시작일)를 주면, 그 전부터 있던 업무의 첫 확인을 주기 안에서 번호 순으로 나눈다(0.6.1) —
@@ -393,6 +398,9 @@ def check_plan(cfg, item, now: datetime, since: date | None = None) -> dict:
     st = item["status"]
     if st in ("done", "cancelled"):
         return {**out, "reason": "closed"}
+    if ended:
+        # 0.10.0: 참석형 정기 회차가 끝났다 — 확인 없이 추적에서 뺀다(완료가 아님, 완료 답을 묻지 않는다)
+        return {**out, "reason": "ended", "label": policy.ENDED_LABEL}
     if local_date(cfg, _get(item, "last_reported_at")) == today:
         return {**out, "reason": "reported_today", "label": "오늘 보고받음"}
     if st in ("waiting", "on_hold"):
@@ -502,8 +510,7 @@ def agenda_data(conn, cfg, now: datetime, overlays: list[dict] | None = None) ->
     tz = tz_of(cfg)
     today = now.astimezone(tz).date()
     since = tracking_since(conn, cfg)
-    rows = conn.execute("SELECT * FROM item WHERE deleted_at IS NULL AND status IN (%s) ORDER BY id"
-                        % ",".join("?" * len(OPEN_STATUSES)), OPEN_STATUSES).fetchall()
+    rows = policy.tracked_rows(conn, now)          # 0.10.0: 끝난 정기 회차(종료·추적 제외)는 활성 업무가 아니다
     entries = {r["id"]: _entry(conn, cfg, r, check_plan(cfg, r, now, since)) for r in rows}
     by_id = {r["id"]: r for r in rows}
 
@@ -589,7 +596,7 @@ def agenda_data(conn, cfg, now: datetime, overlays: list[dict] | None = None) ->
     coverage = {"active": len(rows), "listed": len(set(listed)), "in_series_lines": sum(sl["count"] for sl in series),
                 "missing": [by_id[i]["ref"] for i in missing], "duplicated": [by_id[i]["ref"] for i in dup]}
 
-    day = day_conflicts(conn, cfg, today, overlays)
+    day = day_conflicts(conn, cfg, today, overlays, now)
     check_refs = [e["ref"] for e in today_list if e["check"]["due"]] + [e["ref"] for e in check_list]
     counts = {"active": len(rows), "today": len(today_list), "check": len(check_refs),
               "open": sum(len(g) for g in groups.values()), "upcoming": len(upcoming), "series": len(series),
@@ -772,7 +779,7 @@ def agenda_text(cfg, data: dict) -> str:
 PRI_SCORE = {"high": 300, "normal": 200, "low": 100}
 REPORT_NAV = {"overdue": "기한 지남 전체 보기", "progress": "진행 확인 전체 보기", "past": "지난 일정 보기",
               "waiting": "대기·보류 보기", "done": "완료 내역 보기", "questions": "질문 전체 보기",
-              "approvals": "승인 대기 보기", "full": "전체 목록"}
+              "approvals": "승인 대기 보기", "full": "전체 목록", "history": "일정 이력 보기"}
 
 
 def short_num(ref: str) -> str:
@@ -943,8 +950,7 @@ def report_data(conn, cfg, now: datetime, overlays: list[dict] | None = None) ->
              "keyword_chars": 1100, "questions_max": 3, "done_hours": 24}, **(cfg.get("report") or {})}
     today = now.astimezone(tz).date()
     since = tracking_since(conn, cfg)
-    rows = conn.execute("SELECT * FROM item WHERE deleted_at IS NULL AND status IN (%s) ORDER BY id"
-                        % ",".join("?" * len(OPEN_STATUSES)), OPEN_STATUSES).fetchall()
+    rows = policy.tracked_rows(conn, now)          # 0.10.0: accounting 의 활성 수도 같은 기준
     b = {k: [] for k in ("today_cal", "today_due", "overdue", "progress", "past_meetings", "parked", "upcoming",
                          "scheduled", "snoozed", "captured")}
     by_id = {}
@@ -1010,8 +1016,10 @@ def report_data(conn, cfg, now: datetime, overlays: list[dict] | None = None) ->
 
     # 질문: 기본 3건 (나머지는 계속 추적). 마감이 가까운 업무의 질문 먼저.
     qs = []
+    # 0.10.0: 끝나서 추적에서 빠진 정기 회차의 질문은 독촉하지 않는다 (질문 기록은 그대로 — 번호로 답하면 받는다)
     for q in conn.execute("SELECT q.*, i.ref AS item_ref, i.title AS item_title, i.due_at AS item_due FROM question q "
                           "LEFT JOIN item i ON i.id=q.item_id WHERE q.status='open' AND (q.next_ask_at IS NULL OR q.next_ask_at <= ?) "
+                          f"AND (i.id IS NULL OR NOT {policy.ended_sql(now, 'i')}) "
                           "ORDER BY (i.due_at IS NULL), i.due_at, q.id", (now.isoformat(),)):
         qs.append({"ref": q["ref"], "item_ref": q["item_ref"], "item_title": q["item_title"], "question": q["question"],
                    "options": json.loads(q["options"]) if q["options"] else None})
@@ -1021,7 +1029,7 @@ def report_data(conn, cfg, now: datetime, overlays: list[dict] | None = None) ->
     done_refs = [r["ref"] for r in conn.execute(
         "SELECT DISTINCT i.ref FROM activity_log a JOIN item i ON i.id=a.item_id WHERE a.action='complete' "
         "AND a.undone_at IS NULL AND a.created_at >= ? AND i.status='done' AND i.deleted_at IS NULL ORDER BY i.id", (done_since,))]
-    day = day_conflicts(conn, cfg, today, overlays)
+    day = day_conflicts(conn, cfg, today, overlays, now)
     check_refs = ([e["ref"] for e in b["today_cal"] + b["today_due"] if e["check"]["due"]]
                   + [e["ref"] for e in overdue["detail"] + progress["detail"]])
     accounting = {k: len(v) for k, v in b.items()}
@@ -1245,8 +1253,8 @@ def exposure_gaps(conn, cfg, now: datetime) -> list[dict]:
     since_d = local_date(cfg, since)
     today = now.astimezone(tz_of(cfg)).date()
     gaps = []
-    for it in conn.execute("SELECT * FROM item WHERE deleted_at IS NULL AND status IN ('todo','in_progress','needs_info',"
-                           "'waiting','on_hold') ORDER BY id"):
+    # 0.10.0: 끝난 정기 회차는 누락 감지 대상이 아니다 (보고에서 빼고 누락 경고에 다시 나타나지 않게 — 같은 활성 기준)
+    for it in policy.tracked_rows(conn, now, "item.status IN ('todo','in_progress','needs_info','waiting','on_hold')"):
         plan = check_plan(cfg, it, now, since_d)
         # 0.7.0: 기본 보고에서 일부러 빼는 것(재확인일 전 대기·보류, 다시 물을 날 전, 지난 일정, 앞으로의 일정)은 누락이 아니다
         if it["priority"] == "high" and plan["reason"] not in ("waiting", "on_hold", "snoozed", "meeting_passed",
@@ -1282,9 +1290,8 @@ def health(conn, cfg, now: datetime, exclude_kind_today: str | None = None) -> d
                 for r in conn.execute("SELECT o.op, o.attempts, i.ref, i.title FROM outbox o LEFT JOIN item i "
                                       "ON i.id=o.item_id WHERE o.status='pending' AND o.attempts > 0 "
                                       "AND o.op <> 'obsidian.memo' ORDER BY o.id")]
-    unreviewed = [r["ref"] for r in conn.execute(
-        "SELECT ref FROM item WHERE deleted_at IS NULL AND (priority_source='unreviewed' OR priority_source IS NULL) "
-        "AND status IN (%s) ORDER BY id" % ",".join("?" * len(OPEN_STATUSES)), OPEN_STATUSES)]
+    unreviewed = [r["ref"] for r in policy.tracked_rows(
+        conn, now, "item.priority_source='unreviewed' OR item.priority_source IS NULL")]
     import claire_memos
     return {"failed_ops": failed_ops, "retrying_ops": retrying, "memo_sync": claire_memos.sync_issues(conn),
             "delivery": delivery_issues(conn, cfg, now, exclude_kind_today=exclude_kind_today),

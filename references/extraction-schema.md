@@ -45,7 +45,7 @@ Claire는 자유 텍스트로 DB를 바꾸지 않는다. 해석 결과를 이 �
 
 | op | 필수 | 선택 | 2단계 |
 |---|---|---|---|
-| `create` | `source_event_ids`, `kind`, `title`, `evidence`(1개 이상). 메일 원문이면 `request_scope`(0.6.0) | `request_scope`(direct/group/self/none), `priority_reason`(분류 근거), `short_label`(0.7.0, 1~3단어 키워드), `project`, `priority`(high/normal/low), `owner`(user/claire/other), `next_action`, `done_criteria`, `start_at`, `end_at`, `all_day`, `due_at`, `scheduled_on`, `tentative`, `confidence`(0~1), `waiting_on`, `next_check_at`, `canonical_note`, `ledger_note`, `series_key`, `occurrence_at`, `attendance`(undecided/attending/declined), `unknown_fields`, `questions`, `note` | ✅ |
+| `create` | `source_event_ids`, `kind`, `title`, `evidence`(1개 이상). 메일 원문이면 `request_scope`(0.6.0) | `request_scope`(direct/group/self/none), `priority_reason`(분류 근거), `short_label`(0.7.0, 1~3단어 키워드), `project`, `priority`(high/normal/low), `owner`(user/claire/other), `next_action`, `done_criteria`, `start_at`, `end_at`, `all_day`, `due_at`, `scheduled_on`, `tentative`, `confidence`(0~1), `waiting_on`, `next_check_at`, `canonical_note`, `ledger_note`, `series_key`, `occurrence_at`, `attendance`(undecided/attending/declined), `series`(반복 시리즈 확장), `track_policy`(0.10.0, `series: true`일 때만: after_end/until_done)·`track_policy_reason`, `unknown_fields`, `questions`, `note` | ✅ |
 | `ignore` | `source_event_ids`, `reason` | `note` | ✅ |
 | `update` | `item_ref`, `source_event_ids`, `changes`(필드→값), `evidence` | `reason` | ✅ 같은 스레드·시리즈·연결 원문만. 아니면 `--force-cross-thread` |
 | `complete` | `item_ref`, `source_event_ids`, `evidence` | `reason`, `evidence_code`(기본 `criteria_evidence:<첫 source_event_id>`) | ✅ 보낸 메일·제출 확인 등 완료 증거 |
@@ -75,6 +75,11 @@ Claire는 자유 텍스트로 DB를 바꾸지 않는다. 해석 결과를 이 �
 13. **키워드·자리 (0.7.0)**: `short_label`은 아침 보고에서 키워드로 줄일 때의 이름(1~3단어, 24자 이내, 예: "RiTA 회신"). 없으면 도구가
     제목 앞부분을 쓴다. `project`는 같은 프로젝트면 늘 같은 이름으로 — Tasks 줄의 문서 위치(`note_map`)가 이 이름으로 이어진다.
     `canonical_note`는 볼트에 실제로 있는 노트 이름만(있으면 그 노트의 `## Tasks`에 줄이 들어간다).
+14. **정기 일정 추적 정책 (0.10.0)**: 반복 시리즈(`series: true`)를 만들 때, 참석 자체가 일인 정기 회의(수업·개인 미팅·프로젝트 회의)면
+    `track_policy: "after_end"`(+ `track_policy_reason`)를 준다 — 각 회차가 끝나면 상태를 바꾸지 않고 추적에서 빠진다(완료 기록 아님).
+    결제·납부·제출·회신·준비물이 따르는 반복 일정은 주지 않거나 `until_done`. `after_end`는 `kind: meeting`만 받는다.
+    회의 준비·후속 작업은 회의와 **따로** task 로 등록한다(회차가 빠져도 남는다). `cmd_pending`의 `series.known`에 정책이 이미 있으면
+    다시 주지 않는다(새 회차는 시리즈 정책을 따른다). 교수님이 정한 정책(`source: user`)은 바꿀 수 없다.
 11. `update`의 `changes` 값은 `claire_store update`와 같은 형식 검증을 받는다. `status`는 바꿀 수 없다(전이는 `complete`/`cancel`로).
     Calendar 연결 항목의 `start_at`/`end_at`은 Calendar가 원본이라 거부된다(4단계 outbox).
 

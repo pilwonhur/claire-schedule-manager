@@ -36,15 +36,17 @@ scripts/              결정론적 도구 (Python 3.11+, 표준 라이브러리�
   claire_track.py     완료까지 추적: 중요도 기본값·진행 확인 계획·시간 종류(약속/작업/마감 표시)·아침 보고(상세 선정·키워드)·
                       업무 현황·대기 재확인일·전달 기록·누락 감시
   claire_store        저장: propose | update | complete | answer | wait | hold | dismiss | link-task | prep-template | note-map | labels | undo | ...
-  claire_search       조회: review | today | week | overdue | find | history | trace | waiting | dupcheck | agenda | report | importance-review | labels-missing
+  claire_search       조회: review | today | week | overdue | find | history | trace | waiting | dupcheck | agenda | report | importance-review | labels-missing | occurrences
   claire_apply        외부 반영: outbox 실행·승인·선택 (Obsidian 주제 문서·수집함 Tasks 줄·🆔·체크/해제·줄 옮기기·Daily 완료 기록, Calendar 등록·변경)
   claire_run          실행 관리: begin | step | brief | deliver (전송 결과) | end | status | missed | checkin (12·18시 미등록 일정 확인)
   claire_check        init | doctor | integrity | backup | restore-test | version | channel-target
   claire_memo         메모함 (0.8.0, 업무와 분리): add | list | show | edit | status | link | to-task | sync | export
+  claire_series       정기 일정 추적 정책 (0.10.0): preview | apply | set | clear | revert | list | explain | history
+  claire_policy.py    '종료·추적 제외' 판정 (끝난 정기 회차 — 상태를 바꾸지 않고 조회할 때 계산, 모든 보고·검사가 같은 기준)
   claire_export       json | md
 connectors/           Google OAuth·REST(읽기/쓰기 토큰 분리), Obsidian Tasks 파서·원자적 쓰기, Obsidian 메모함 블록, Discord 첨부
 references/           브리핑 형식, 제안 JSON 규격, 스키마, 진단, 복구 정책, 활용 시나리오(usage-guide.md)
-tests/                159개 테스트 (Google API 는 기록된 fixture 로 대체, 설치·업그레이드 경로 포함)
+tests/                168개 테스트 (Google API 는 기록된 fixture 로 대체, 설치·업그레이드 경로 포함)
 docs/manual.md        사용 안내
 VERSION               배포 버전 (claire_core.CLAIRE_VERSION·SKILL.md·CHANGELOG 와 같아야 한다 — 테스트·CI 가 검사)
 get.sh                설치·업그레이드 (GitHub 릴리스 태그) · install.sh 실제 설치 · release.sh 릴리스(관리자)

@@ -851,16 +851,25 @@ def _op_is_past(cfg, op: str, p: dict, now) -> bool:
 
 
 def approval_queue(conn, cfg, now, include_past: bool = False) -> dict:
-    """승인 대기(awaiting_confirm) 목록. 지난 일정은 목록에서 빼되 기록은 지우거나 바꾸지 않는다."""
+    """승인 대기(awaiting_confirm) 목록. 지난 일정은 목록에서 빼되 기록은 지우거나 바꾸지 않는다.
+    0.10.0: 끝나서 추적에서 빠진 정기 회차의 승인 대기는 '지난 일정 N건' 건수에도 넣지 않는다(반복 독촉 금지).
+    기록은 그대로다(완료·취소로 바꾸지 않는다). --include-past 면 함께 보인다."""
+    import claire_policy
     groups = {"calendar": [], "tasks": []}
     past = {"calendar": 0, "tasks": 0}
     past_refs = {"calendar": [], "tasks": []}
+    ended_refs: list[str] = []
+    claire_policy.register_functions(conn)
     rows = conn.execute("SELECT o.*, i.ref, i.title AS item_title, i.status AS item_status, i.kind, i.attendance, "
-                        "i.due_at, i.due_precision FROM outbox o LEFT JOIN item i ON i.id=o.item_id "
+                        f"i.due_at, i.due_precision, (i.id IS NOT NULL AND {claire_policy.ended_sql(now, 'i')}) AS item_ended "
+                        "FROM outbox o LEFT JOIN item i ON i.id=o.item_id "
                         "WHERE o.status='awaiting_confirm' ORDER BY o.id").fetchall()
     for r in rows:
         key = "calendar" if r["op"].startswith("calendar.") else "tasks" if r["op"] == "obsidian.add_task" else None
         if key is None:
+            continue
+        if r["item_ended"] and not include_past:
+            ended_refs.append(r["ref"])
             continue
         p = json.loads(r["payload"])
         is_past = _op_is_past(cfg, r["op"], p, now)
@@ -884,6 +893,7 @@ def approval_queue(conn, cfg, now, include_past: bool = False) -> dict:
     return {"calendar": groups["calendar"], "tasks": groups["tasks"],
             "past_hidden": {} if include_past else {k: v for k, v in past.items() if v},
             "past_hidden_refs": {} if include_past else {k: v for k, v in past_refs.items() if v},
+            "ended_hidden_refs": ended_refs,
             "selected": [x["item_ref"] for k in groups for x in groups[k] if x["selected"]],
             "counts": {"calendar": len(groups["calendar"]), "tasks": len(groups["tasks"])}}
 
