@@ -178,7 +178,8 @@ def wants_window(item_like) -> bool:
 
 
 def apply_update(conn, cfg, item, changes: dict, *, actor: str, ts: str, reason: str | None,
-                 evidence_sid: int | None = None, run_id=None, allow_calendar_owned: bool = False) -> list[dict]:
+                 evidence_sid: int | None = None, run_id=None, allow_calendar_owned: bool = False,
+                 settle_questions: bool = True) -> list[dict]:
     """필드 변경. 필드마다 이력 1건. Calendar 연결 항목의 시각 필드는 거부한다(교수님 지시는 outbox 로).
 
     0.5.0 마감 규칙:
@@ -274,10 +275,57 @@ def apply_update(conn, cfg, item, changes: dict, *, actor: str, ts: str, reason:
         refresh_pending_create(conn, cfg, item["id"])
         if actor == "user":
             touch_reported(conn, item["id"], ts)
+        settled = settle_questions and settle_questions_by_update(conn, cfg, item["id"], actor=actor, ts=ts, reason=reason, run_id=run_id)
+        if settled:
+            applied.append(settled)
     if evidence_sid:
         conn.execute("INSERT OR IGNORE INTO item_source(item_id,source_event_id,role) VALUES(?,?,'update')",
                      (item["id"], evidence_sid))
     return applied
+
+
+# 질문 필드 → 그 질문이 묻던 값이 항목에 확정됐는지 (0.10.3). 여기 없는 필드(scope 등)는 답변으로만 닫는다.
+QUESTION_SETTLED_BY = {
+    "due_time": lambda it: bool(it["due_at"]) and it["due_precision"] == "time",
+    "due_at": lambda it: bool(it["due_at"]),
+    "start_at": lambda it: bool(it["start_at"]),
+    "end_at": lambda it: bool(it["end_at"]),
+}
+
+
+def settle_questions_by_update(conn, cfg, item_id: int, *, actor: str, ts: str, reason: str | None,
+                               run_id=None) -> dict | None:
+    """후속 원문·지시로 질문이 묻던 값이 확정되면 그 질문을 거두고(withdrawn), 열린 질문이 더 없으면 needs_info → todo (0.10.3).
+
+    전에는 마감 시각이 후속 메일로 확정돼도 질문이 열린 채 남아 계속 묻다가, 마감 7일 뒤 만료되면 'needs_info 인데 열린 질문 없음'
+    무결성 경고가 됐다(CLR-0784). 되돌리기: 이 처리의 마지막 이력(상태 전이 또는 필드 변경)에 questions_withdrawn 을 남겨,
+    그 이력을 되돌리면 질문도 다시 열린다(undo_action)."""
+    item = conn.execute("SELECT * FROM item WHERE id=?", (item_id,)).fetchone()
+    if item is None or item["status"] != "needs_info":
+        return None
+    settled = [q for q in conn.execute("SELECT * FROM question WHERE item_id=? AND status='open' ORDER BY id", (item_id,))
+               if q["field"] in QUESTION_SETTLED_BY and QUESTION_SETTLED_BY[q["field"]](item)]
+    if not settled:
+        return None
+    refs = [q["ref"] for q in settled]
+    for q in settled:
+        conn.execute("UPDATE question SET status='withdrawn', resolution=? WHERE id=?",
+                     (json.dumps({"withdrawn": "묻던 값이 후속 반영으로 확정", "at": ts, "reason": reason},
+                                 ensure_ascii=False), q["id"]))
+    out = {"field": "questions", "questions_withdrawn": refs}
+    open_left = conn.execute("SELECT COUNT(*) c FROM question WHERE item_id=? AND status='open'", (item_id,)).fetchone()["c"]
+    if open_left == 0:
+        set_status(conn, cfg, item, "todo", actor=actor, ts=ts, run_id=run_id,
+                   reason=f"{', '.join(refs)} 가 묻던 값이 확정되어 확인 필요 해제")
+        out["transition"] = "needs_info → todo"
+    aid = conn.execute("SELECT MAX(id) m FROM activity_log WHERE item_id=?", (item_id,)).fetchone()["m"]
+    act = conn.execute("SELECT payload FROM activity_log WHERE id=?", (aid,)).fetchone()
+    payload = json.loads(act["payload"]) if act and act["payload"] else {}
+    payload["questions_withdrawn"] = payload.get("questions_withdrawn", []) + refs
+    conn.execute("UPDATE activity_log SET payload=? WHERE id=?", (json.dumps(payload, ensure_ascii=False), aid))
+    if open_left == 0:
+        out["planned"] = plan_external(conn, cfg, conn.execute("SELECT * FROM item WHERE id=?", (item_id,)).fetchone(), ts)
+    return out
 
 
 def set_status(conn, cfg, item, new_status: str, *, actor: str, ts: str, reason: str | None,
@@ -465,7 +513,7 @@ def answer_question(conn, cfg, q, answer: str, resolve: dict | None, *, actor: s
     if resolve and item is not None:
         applied = apply_update(conn, cfg, item, resolve, actor=actor, ts=ts,
                                reason=f"{q['ref']} 답변: {answer[:80]}", run_id=run_id,
-                               allow_calendar_owned=item["status"] == "needs_info")
+                               allow_calendar_owned=item["status"] == "needs_info", settle_questions=False)
         item = conn.execute("SELECT * FROM item WHERE id=?", (item["id"],)).fetchone()
     conn.execute("UPDATE question SET status='answered', answered_at=?, answer=?, resolution=? WHERE id=?",
                  (ts, answer, json.dumps(resolve or {}, ensure_ascii=False), q["id"]))

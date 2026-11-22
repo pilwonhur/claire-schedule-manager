@@ -1080,6 +1080,44 @@ class Phase3Test(FixtureBase):
         t = self.sh("claire_search", "today", "--date", "2026-09-12", "--basis", "start")
         self.assertEqual(t["items"][0]["ref"], "CLR-0001")
 
+    def test_update_that_fixes_due_time_settles_question(self):
+        """0.10.3 (CLR-0784): '퇴근시까지'라 시각을 물은 마감이 후속 메일로 시각까지 확정되면 질문을 거두고 needs_info → todo.
+        되돌리면 상태와 질문이 함께 돌아온다. 답이 필요한 다른 질문(scope)이 남아 있으면 그 질문만 남고 needs_info 유지."""
+        def src(n, text):
+            return self.sh("claire_sync", "ingest-discord", "--message-id", f"g{n}", "--text", text,
+                           "--captured-at", "2026-09-11T09:00:00+09:00")["source_event_id"]
+        m1 = src(1, "연차자료 9/20 퇴근시까지 제출")
+        self.propose([{"op": "create", "source_event_ids": [m1], "kind": "deadline", "title": "연차자료 제출", "due_at": "2026-09-20",
+                       "confidence": 0.95, "evidence": ["9/20 퇴근시까지"], "unknown_fields": ["due_time"],
+                       "questions": [{"field": "due_time", "question": "퇴근시는 몇 시인가요?"}]}])
+        self.assertEqual(self.item("CLR-0001")["status"], "needs_info")
+        r = self.store("update", "--item", "CLR-0001", "--set", "due_at=2026-09-22T11:00:00+09:00", "--reason", "보완 재제출 기한 확정")
+        changes = r["changes"]
+        self.assertIn({"field": "questions", "questions_withdrawn": ["Q-0001"], "transition": "needs_info → todo",
+                       "planned": changes[-1]["planned"]}, changes)
+        self.assertEqual(self.item("CLR-0001")["status"], "todo")
+        q = self.db().execute("SELECT status, resolution FROM question WHERE ref='Q-0001'").fetchone()
+        self.assertEqual(q[0], "withdrawn"); self.assertIn("확정", q[1])
+        self.assertTrue(self.sh("claire_check", "integrity")["healthy"])
+        # 상태 전이 되돌리기 → needs_info, 질문 다시 열림
+        u = self.store("undo")
+        self.assertEqual(u["action"], "status")
+        self.assertEqual(self.item("CLR-0001")["status"], "needs_info")
+        self.assertEqual(self.db().execute("SELECT status FROM question WHERE ref='Q-0001'").fetchone()[0], "open")
+        # 다른 질문이 남은 경우: 마감 질문만 거두고 needs_info 유지
+        m2 = src(3, "보고서 9/25 제출")
+        self.propose([{"op": "create", "source_event_ids": [m2], "kind": "deadline", "title": "보고서", "due_at": "2026-09-25",
+                       "confidence": 0.9, "evidence": ["x"], "unknown_fields": ["due_time", "scope"],
+                       "questions": [{"field": "due_time", "question": "몇 시?"}, {"field": "scope", "question": "누가 제출?"}]}])
+        self.store("update", "--item", "CLR-0002", "--set", "due_at=2026-09-25T18:00:00+09:00", "--reason", "시각 확정")
+        st = dict(self.db().execute("SELECT field, status FROM question WHERE item_id=(SELECT id FROM item WHERE ref='CLR-0002')").fetchall())
+        self.assertEqual(st, {"due_time": "withdrawn", "scope": "open"})
+        self.assertEqual(self.item("CLR-0002")["status"], "needs_info")
+        # 날짜만 바뀐 후속(시각 미확정)은 시각 질문을 거두지 않는다
+        self.store("update", "--item", "CLR-0001", "--set", "due_at=2026-09-23", "--set", "due_precision=date", "--reason", "날짜만 변경")
+        self.assertEqual(self.db().execute("SELECT status FROM question WHERE ref='Q-0001'").fetchone()[0], "open")
+        self.assertEqual(self.item("CLR-0001")["status"], "needs_info")
+
     def test_answer_auto_matches_single_open_question(self):
         self.sh("claire_sync", "gmail")
         m1 = self.gmail_event("m1")["id"]
@@ -1395,6 +1433,34 @@ class Phase4Test(FixtureBase):
         self.apply("--confirm", "CLR-0002", expect_ok=False)
 
     # -- TC18: Claire 가 만든 Daily 줄 ------------------------------------------
+    def test_check_task_on_edited_line_that_is_already_checked(self):
+        """0.10.3 (CLR-0989): 연결된 Tasks 줄의 문구를 고치고 직접 체크해 두면 키로 못 찾아 5번 실패하던 것 →
+        같은 노트에 원래 문구로 시작하는 줄이 하나이고 이미 [x] 이면 완료로 처리하고 연결을 그 줄로 옮긴다. 줄은 바꾸지 않는다."""
+        self.legacy_tasks()
+        a = self.sh("claire_sync", "ingest-discord", "--message-id", "d2", "--text", "할일: 심사 의견 9/12까지 정리",
+                    "--captured-at", "2026-09-11T09:00:00+09:00")
+        self.propose([{"op": "create", "source_event_ids": [a["source_event_id"]], "kind": "task", "title": "심사 의견 정리",
+                       "due_at": "2026-09-12", "confidence": 0.95, "evidence": ["할일: 심사 의견"], "canonical_note": "20260911 논문 심사"}])
+        self.apply()
+        self.sh("claire_sync", "obsidian")
+        daily = self.vault / "50 Daily" / "2026-09-12.md"
+        text = daily.read_text(encoding="utf-8")
+        old = "- [ ] #tasks [[20260911 논문 심사]]: 심사 의견 정리 📅 2026-09-12 🆔 clr0001"
+        edited = "- [x] #tasks [[20260911 논문 심사]]: 심사 의견 정리 — 직접 마무리함 📅 2026-09-12 ✅ 2026-09-11"
+        self.assertIn(old, text)
+        daily.write_text(text.replace(old, edited), encoding="utf-8")          # 🆔 이 빠지고 문구가 바뀐 줄, 이미 체크됨
+        self.store("complete", "--item", "CLR-0001", "--evidence", "user_report")
+        self.env["CLAIRE_NOW"] = "2026-09-11T06:02:00+09:00"
+        res = self.apply()
+        done = [d for d in res["done"] if d["op"] == "obsidian.check_task"]
+        self.assertEqual(len(done), 1, res)
+        self.assertTrue(done[0]["result"]["already_checked"])
+        self.assertEqual(done[0]["result"]["matched"], "edited_line")
+        self.assertEqual(daily.read_text(encoding="utf-8").count(edited), 1)          # 줄은 그대로
+        key = self.db().execute("SELECT external_key FROM link WHERE system='obsidian_task'").fetchone()[0]
+        self.assertTrue(key.startswith("50 Daily/2026-09-12.md#") and key != "50 Daily/2026-09-12.md#clr0001", key)
+        self.assertFalse([o for o in self.outbox() if o["status"] == "failed"])
+
     def test_TC18_daily_line_with_id_relinks_on_rescan(self):
         self.legacy_tasks()
         a = self.sh("claire_sync", "ingest-discord", "--message-id", "d2", "--text", "할일: 심사 의견 9/12까지 정리",
