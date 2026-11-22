@@ -3,6 +3,22 @@
 형식은 [Keep a Changelog](https://keepachangelog.com/ko/1.1.0/)를 따르고 버전은 SemVer다.
 데이터 형식 버전(`SCHEMA_VERSION`)은 따로 관리한다.
 
+## [0.10.2] — 2026-11-22
+
+doctor 가 응답 없는 Obsidian 볼트에서 끝없이 멈추던 것을 고쳤다. 스키마·데이터 변경 없음.
+
+### 원인 (2026-11-22 실측)
+- SSH 접속에서 띄운 tmux 세션 안에서는 iCloud Drive 폴더 열기(`opendir`)가 응답 없이 멈춘다(`stat` 은 된다).
+  doctor 의 `tasks_scan`(볼트 전체 `#tasks` 검사)이 볼트 루트를 여는 데서 10분 넘게 멈췄다. 같은 Mac 의 새 터미널에서는 바로 된다.
+  Claire 정기 실행(OpenClaw)은 이 영향이 없었다.
+
+### 바뀐 것 (`scripts/claire_check`)
+- 볼트 검사를 시간 제한(기본 60초, `CLAIRE_DOCTOR_VAULT_TIMEOUT=<초>`) 안에서 돌린다. 넘으면 `tasks_scan` warn
+  ("볼트 읽기가 N초 안에 끝나지 않아 건너뜀", 고치는 법: 맥 화면의 터미널에서 다시)을 남기고 discord·openclaw 점검으로 넘어간다.
+  멈춘 읽기는 daemon 스레드에 두고 기다리지 않으므로 doctor 가 끝나고 프로세스도 정상 종료한다.
+- 볼트가 정상이면 결과는 지금과 같다(`write_access` 포함).
+- 테스트 1건: 읽는 쪽이 없는 FIFO(`stuck.md`)로 멈추는 볼트를 만들어 0.5초 제한 → warn, 다음 점검 진행, 종료 확인. FIFO 를 지우면 ok.
+
 ## [0.10.1] — 2026-11-22
 
 G2 음성 중계 글 처리 규칙을 Claire 채널 systemPrompt 원문에 넣었다(교수님 승인 2026-11-22). 코드·스키마 변경 없음.

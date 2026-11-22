@@ -23,6 +23,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import threading
 from datetime import datetime
 from pathlib import Path
 
@@ -46,6 +47,12 @@ INSTALL_INFO = Path(__file__).resolve().parent.parent / "INSTALL_INFO.json"    #
 CHECKIN_EXPR = "0 12,18 * * *"
 CHANNEL_PROMPT_FILE = Path(__file__).resolve().parent.parent / "references" / "discord-channel-prompt.txt"
 CHANNEL_PROMPT_MARKER = "message(action=send)"
+# doctor 의 Obsidian 볼트 읽기 시간 제한(초, 0.10.2). 응답 없는 폴더(예: SSH 로 띄운 tmux 안에서 iCloud 볼트)에서
+# opendir 가 끝없이 멈춰 doctor 전체가 멈추던 것을 막는다. 넘으면 warn 하고 다음 점검으로 넘어간다.
+try:
+    VAULT_SCAN_TIMEOUT = float(os.environ.get("CLAIRE_DOCTOR_VAULT_TIMEOUT") or 60)
+except ValueError:
+    VAULT_SCAN_TIMEOUT = 60.0
 
 
 def channel_prompt_text() -> str:
@@ -475,6 +482,26 @@ def cmd_restore(args, cfg):
 # doctor (§4.3 확인 사항 실측, §11)
 # --------------------------------------------------------------------------
 
+def run_with_timeout(fn, timeout: float):
+    """fn() 을 daemon 스레드에서 돌려 (끝남, 결과, 예외)를 돌려준다. 시간 안에 안 끝나면 (False, None, None).
+    멈춘 스레드는 시스템 호출에서 풀려나지 않을 수 있어 기다리지 않고 버린다(daemon 이라 프로세스 종료를 막지 않는다).
+    그 스레드는 결과를 지역 상자에만 쓰므로 나중에 깨어나도 doctor 결과를 건드리지 않는다."""
+    box: dict = {}
+
+    def work():
+        try:
+            box["result"] = fn()
+        except BaseException as e:  # noqa: BLE001 — 호출한 쪽에서 다시 판단
+            box["error"] = e
+
+    t = threading.Thread(target=work, name="claire-doctor-scan", daemon=True)
+    t.start()
+    t.join(timeout)
+    if t.is_alive():
+        return False, None, None
+    return True, box.get("result"), box.get("error")
+
+
 class Doctor:
     def __init__(self, cfg, offline: bool):
         self.cfg = cfg
@@ -715,8 +742,16 @@ class Doctor:
             if not ex.startswith("."):
                 self.add("obsidian", f"exclude:{ex}", "ok" if p.is_dir() else "warn",
                          "제외 대상 존재" if p.is_dir() else "폴더 없음 (제외 규칙만 유지)")
+        done, res, err = run_with_timeout(lambda: obsidian_tasks.scan_vault(self.cfg), VAULT_SCAN_TIMEOUT)
+        if not done:
+            self.add("obsidian", "tasks_scan", "warn",
+                     f"볼트 읽기가 {VAULT_SCAN_TIMEOUT:g}초 안에 끝나지 않아 건너뜀 — 폴더나 파일 열기가 응답하지 않습니다 "
+                     "(iCloud 볼트를 SSH 로 띄운 tmux·원격 세션에서 읽으면 이렇게 멈춘다)",
+                     "맥 화면의 터미널(tmux 밖)에서 다시 실행하세요. 볼트가 커서 느린 것이면 CLAIRE_DOCTOR_VAULT_TIMEOUT=<초>")
+            return
         try:
-            res = obsidian_tasks.scan_vault(self.cfg)
+            if err is not None:
+                raise err
             self.add("obsidian", "tasks_scan", "ok" if res["tasks"] else "warn",
                      f"파일 {res['files_seen']}개, {self.cfg['obsidian']['tag']} 줄 {res['tasks']}건 "
                      f"{res['by_state']}, 🆔 있음 {res['with_id']}건",

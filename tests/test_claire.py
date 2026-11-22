@@ -386,6 +386,32 @@ class ClaireTest(BaseTest):
         by = {c["name"]: c for c in d["checks"]}
         self.assertEqual(by["token:prof@example.com:read"]["status"], "ok")
 
+    def test_doctor_vault_scan_times_out_instead_of_hanging(self):
+        """0.10.2: 볼트 읽기가 응답하지 않으면(SSH tmux 안의 iCloud 볼트처럼) doctor 가 멈추지 않고 warn 후 다음 점검으로 간다.
+        읽는 쪽이 없는 FIFO 는 여는 순간 끝없이 기다리므로 멈추는 폴더를 흉내 낸다."""
+        self.init()
+        (self.vault / "50 Daily").mkdir()
+        (self.vault / "50 Daily" / "2026-09-11.md").write_text("- [ ] #tasks 심사 📅 2026-09-12\n", encoding="utf-8")
+        os.mkfifo(self.vault / "50 Daily" / "stuck.md")
+        e = dict(self.env, CLAIRE_DOCTOR_VAULT_TIMEOUT="0.5")
+        proc = subprocess.run([sys.executable, str(SCRIPTS / "claire_check"), "doctor", "--offline"],
+                              capture_output=True, text=True, env=e, timeout=60)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        d = json.loads(proc.stdout)
+        by = {c["name"]: c for c in d["checks"]}
+        self.assertEqual(by["tasks_scan"]["status"], "warn")
+        self.assertIn("0.5초", by["tasks_scan"]["detail"])
+        self.assertIn("tmux", by["tasks_scan"]["fix"])
+        self.assertNotIn("write_access", by)
+        self.assertIn("discord", {c["area"] for c in d["checks"]})       # 다음 점검이 이어졌다
+        self.assertIn("openclaw", {c["area"] for c in d["checks"]})
+        # 멈추지 않는 볼트는 기본 시간 제한에서 지금처럼 ok
+        os.unlink(self.vault / "50 Daily" / "stuck.md")
+        d = self.sh("claire_check", "doctor", "--offline")
+        by = {c["name"]: c for c in d["checks"]}
+        self.assertEqual(by["tasks_scan"]["status"], "ok")
+        self.assertEqual(by["write_access"]["status"], "ok")
+
     # -- channel-prompt (v0.4.5) ---------------------------------------------
     def test_channel_prompt_patch_shape_and_status(self):
         import importlib.util

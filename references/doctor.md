@@ -23,7 +23,7 @@
 | google | calendar:<이름> | `calendarList.get`이 성공, write 캘린더는 owner/writer | 공유 권한 |
 | google | token:<email>:write | 4단계 전에는 warn | — |
 | obsidian | vault, daily_folder, navigation_guide, exclude:* | 경로 존재 | `config.obsidian.vault` |
-| obsidian | tasks_scan | `#tasks` 줄 1건 이상 | 태그·경로 확인 |
+| obsidian | tasks_scan | `#tasks` 줄 1건 이상. 볼트 읽기가 60초(`CLAIRE_DOCTOR_VAULT_TIMEOUT`) 안에 안 끝나면 warn 후 다음 점검으로 (0.10.2) | 태그·경로 확인. 시간 초과면 맥 화면의 터미널(tmux 밖)에서 다시 — SSH 로 띄운 tmux 에서는 iCloud 폴더 열기가 멈춘다 |
 | obsidian | write_access | 볼트 쓰기 가능 (4단계용) | — |
 | discord | inbound_media_dir | OpenClaw 첨부 폴더 읽기 가능 | `config.discord.inbound_media_dir` |
 | discord | claire_agent_token | 파일 존재만 확인 (내용 안 읽음) | OpenClaw 에이전트 설정 |
